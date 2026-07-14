@@ -3,22 +3,22 @@ meta:
   contentType: Conceptual
 ---
 
-# 对接 Hermes、Zulip 和多项目调度
+# 对接 Hermes、Zulip、飞书和多项目调度
 
-这份文档是 Hermes/Zulip adapter 的下一阶段开发依据。它说明 adapter 如何把 Hermes 或 Zulip 对话转换成 Hermes Codex Orchestrator Runner 的 HTTP API 请求，并同时处理项目路由、Token 鉴权、权限判断、多项目调度、同项目写任务串行化和任务通知。
+这份文档是 Hermes/Zulip/飞书 adapter 的下一阶段开发依据。它说明 adapter 如何把 Hermes、Zulip 或飞书对话转换成 Hermes Codex Orchestrator Runner 的 HTTP API 请求，并同时处理项目路由、Token 鉴权、权限判断、多项目调度、同项目写任务串行化和任务通知。
 
-本文只规划 adapter，不改变 Runner。当前 Runner 已提供多项目注册、任务创建、任务查询、日志查询、原始任务查询、`tmux` session 查询、任务 dispatch 和取消接口。Hermes/Zulip adapter 仍未实现，需要按本文约束开发。
+本文只约束 adapter，不改变 Runner。当前 Runner 已提供多项目注册、任务创建、任务查询、日志查询、原始任务查询、`tmux` session 查询、任务 dispatch 和取消接口。仓库内已有平台中立 adapter core 和本地 harness；真实 Zulip、飞书和 Hermes transport 仍是后续集成工作。
 
 ## 角色边界
 
 推荐边界如下：
 
 ```text
-Zulip / Hermes conversation
+Zulip / Feishu / Hermes conversation
   |
   | command parsing, user authz, project routing, notification state
   v
-Hermes/Zulip adapter
+Hermes/Zulip/Feishu adapter
   |
   | Runner HTTP API + Bearer Token
   v
@@ -31,11 +31,11 @@ Codex CLI in project directory
 
 Adapter 只负责：
 
-- 解析 Hermes/Zulip 命令。
+- 解析 Hermes、Zulip、飞书命令。
 - 校验用户是否能查看项目、创建只读任务、创建写任务、启用网络、取消任务。
-- 把 Zulip stream/topic 或 Hermes 会话映射到 `projectId`。
+- 按消息来源映射项目：Zulip 使用 stream/频道映射项目，topic 作为会话/通知目标；飞书和 Hermes 使用 conversationId 绑定、显式 `projectId` 或默认项目。
 - 调用 Runner HTTP API。
-- 保存通知路由状态，例如 `taskId -> Zulip stream/topic/messageId`。
+- 保存通知路由状态，例如 `taskId -> Zulip stream/topic/messageId` 或 `taskId -> Feishu/Hermes conversationId/messageId`。
 - 轮询任务状态并把结果通知回原对话。
 - 在 adapter 侧执行同项目写任务串行策略。
 
@@ -168,12 +168,14 @@ Adapter 至少需要这些配置：
 | `runnerBaseUrl` | `http://127.0.0.1:8731` | Runner HTTP API 地址 |
 | `runnerTokenFile` | `/Users/hula/.hco/token` | Adapter 读取的仓库外 Token 文件 |
 | `defaultProjectId` | `stockprofits` | 没有显式项目时的可选默认项目 |
-| `zulipProjectRoutes` | `dev/stockprofits -> stockprofits` | Zulip stream/topic 到项目的映射 |
+| `zulipStreamProjectRoutes` | `hermes-runner -> hermes-codex-orchestrator` | 可选的 Zulip 频道/stream 到 `projectId` 别名映射；未配置时频道名直接作为 `projectId` |
 | `pollIntervalMs` | `5000` | 正常状态轮询间隔 |
 | `pollMaxIntervalMs` | `30000` | 退避后的最大轮询间隔 |
 | `taskPollTimeoutMs` | `7200000` | 单个任务最长轮询时间 |
 | `writeTaskPolicy` | `reject_when_project_busy` | 同项目写任务并发策略 |
 | `adapterStatePath` | `/Users/hula/.hco/adapter-state.json` | 保存任务通知路由和活跃写任务状态 |
+
+旧配置键 `zulipProjectRoutes` 必须移除。它表示旧的 `stream/topic -> projectId` 语义；新规则中 Zulip topic 只表示会话/通知目标，项目只由 stream/频道决定。
 
 Token 文件必须位于仓库外，并设置为 `0600`。不要把真实 Token 写入 Hermes 配置仓库、Zulip bot 配置、日志、任务文件或命令行参数。
 
@@ -218,27 +220,60 @@ curl -X PUT http://127.0.0.1:8731/projects/project_a \
 
 如果生产环境关闭项目注册，`POST|PUT /projects/:projectId` 会返回 `project_registration_disabled`。这种情况下 adapter 只能读取现有项目配置，不能自动注册。
 
-## Zulip/Hermes 到项目的映射
+## 按消息来源选择项目
 
-Zulip stream/topic 应通过显式映射选择项目：
+项目路由必须先判断消息来源，不能把 Zulip 的频道/topic 规则套用到飞书或 Hermes 原生对话。
+
+### Zulip 专用规则
+
+Zulip 使用 stream/频道作为项目路由，topic 只作为会话和通知目标：
+
+```text
+Zulip stream/channel -> projectId
+Zulip topic          -> conversation / notification target
+```
+
+Zulip 频道到项目的对应关系可以来自两处：
+
+1. 静态配置 `~/.hco/adapter.json` 的 `zulipStreamProjectRoutes`。
+2. 运行时人工确认后写入 `adapterStatePath` 的 `zulipStreamProjectRoutes`。
+
+如果 Zulip 频道名和 Runner 里的 `projectId` 不一致，使用静态配置或运行时命令建立别名映射：
 
 ```json
 {
-  "zulipProjectRoutes": {
-    "dev/stockprofits": "stockprofits",
-    "dev/project-a": "project_a",
-    "ops/hermes-runner": "hermes-codex-orchestrator"
+  "zulipStreamProjectRoutes": {
+    "stockprofits": "stockprofits",
+    "project-a": "project_a",
+    "hermes-runner": "hermes-codex-orchestrator"
   }
 }
 ```
 
-项目选择顺序：
+Zulip 项目选择顺序：
 
-1. 命令显式包含 `projectId` 时，使用命令里的项目。
-2. 否则根据 Zulip `stream/topic` 查 `zulipProjectRoutes`。
-3. 否则使用当前 Hermes 会话已绑定的项目。
-4. 否则在配置允许时使用 `defaultProjectId`。
-5. 仍无法确定项目时，拒绝创建任务并提示用户先绑定项目。
+1. `/codex run --project <projectId> <task>` 显式覆盖时，使用命令里的项目。
+2. 如果当前 stream 已被 `/codex route none` 标记为通用对话，拒绝创建 Runner 任务，并提示该频道不关联项目。
+3. 否则先查运行时确认的 stream -> `projectId` 映射。
+4. 再查 `adapter.json` 的 `zulipStreamProjectRoutes`。
+5. 如果 stream 名称精确等于已注册 `projectId`，可以直接使用该项目。
+6. 如果没有命中，调用 `/projects` 获取已注册项目，给出相似候选，但必须等待人工 `/codex route confirm <projectId>` 或 `/codex route set <projectId>` 后才能创建任务。
+
+Zulip topic 不参与项目选择，不再使用 `stream/topic -> projectId` 绑定。Zulip topic 的职责是区分同一项目里的不同讨论和通知目标，例如：
+
+```text
+zulip:stockprofits/需求讨论
+zulip:stockprofits/发布验证
+```
+
+### 飞书、Hermes 和 harness 通用规则
+
+飞书、Hermes 原生对话和本地 harness 不使用 Zulip stream/topic 规则。它们使用通用项目选择顺序：
+
+1. 命令显式包含 `projectId` 时，使用命令里的项目，例如 `/codex run stockprofits 修复登录 bug`。
+2. 否则使用当前 `conversationId` 通过 `/codex bind <projectId>` 保存的绑定。
+3. 否则在配置允许时使用 `defaultProjectId`。
+4. 仍无法确定项目时，拒绝创建任务并提示用户先绑定项目或显式提供 `projectId`。
 
 不要根据自然语言猜项目。项目选择错误会把任务写入错误目录，也可能把 dispatch 发到错误 `tmuxSession`。
 
@@ -246,14 +281,21 @@ Zulip stream/topic 应通过显式映射选择项目：
 
 ## 推荐命令
 
-Hermes 或 Zulip bot 可以提供这些命令：
+Hermes、Zulip 或飞书 bot 可以提供这些命令：
 
 | 命令 | 行为 |
 |---|---|
 | `/codex projects` | 调用 `GET /projects`，列出可调度项目 |
-| `/codex bind <projectId>` | 把当前 Zulip stream/topic 或 Hermes 会话绑定到项目 |
-| `/codex run <projectId> <task>` | 显式指定项目并创建任务 |
-| `/codex ask <task>` | 使用当前 stream/topic 或会话绑定创建任务 |
+| `/codex bind <projectId>` | 仅用于飞书、Hermes、harness 等通用会话，把当前 `conversationId` 绑定到项目；Zulip 不需要 bind |
+| `/codex route show` | 仅用于 Zulip，查看当前频道是否已关联项目或被标记为通用对话 |
+| `/codex route set <projectId>` | 仅用于 Zulip，把当前频道关联到已注册项目 |
+| `/codex route confirm <projectId>` | 仅用于 Zulip，确认 Adapter 给出的相似项目建议并保存映射 |
+| `/codex route unset` | 仅用于 Zulip，删除当前频道的运行时映射或通用频道标记；静态配置仍可能生效 |
+| `/codex route none` | 仅用于 Zulip，把当前频道标记为通用对话/不关联项目；之后不创建 Runner 任务 |
+| `/codex run <task>` | 仅 Zulip 使用，从当前 stream/频道推断项目并创建写任务 |
+| `/codex run --project <projectId> <task>` | 仅 Zulip 使用，临时覆盖当前 stream 对应的项目 |
+| `/codex run <projectId> <task>` | 飞书、Hermes、harness 通用格式，显式指定项目并创建写任务 |
+| `/codex ask <task>` | 创建只读任务；Zulip 使用当前 stream，飞书/Hermes 使用会话绑定或默认项目 |
 | `/codex status <taskId>` | 调用 `GET /tasks/:taskId` |
 | `/codex logs <taskId>` | 调用 `GET /tasks/:taskId/logs` |
 | `/codex raw <taskId>` | 仅管理员可用，调用 `GET /tasks/:taskId/raw` |
@@ -261,7 +303,7 @@ Hermes 或 Zulip bot 可以提供这些命令：
 | `/codex dispatch <taskId>` | 调用 `POST /tasks/:taskId/dispatch` |
 | `/codex sessions` | 调用 `GET /sessions` |
 
-`/codex ask` 适合固定 topic 的日常项目工作。`/codex run <projectId>` 适合跨项目调度或临时项目操作。
+Zulip 中推荐用户进入正确的项目频道后直接写 `/codex ask <task>` 或 `/codex run <task>`。如果这是新频道，Adapter 应主动询问是否关联项目；用户可以用 `/codex route set <projectId>` 建立映射，或用 `/codex route none` 表示这是通用对话频道、不需要项目。同一个频道下的不同 topic 会作为不同会话/通知目标。飞书和 Hermes 原生对话中，推荐先 `/codex bind <projectId>` 绑定当前会话，或在写任务里使用 `/codex run <projectId> <task>`。
 
 ## 创建任务
 
@@ -285,8 +327,8 @@ Adapter 调用 `POST /tasks` 时，应把聊天来源写入 `requestedBy`：
   "requestedBy": {
     "source": "zulip",
     "userId": "hula",
-    "stream": "dev",
-    "topic": "stockprofits",
+    "stream": "stockprofits",
+    "topic": "需求讨论",
     "messageId": "1234567890123"
   }
 }
@@ -390,7 +432,7 @@ Runner 当前没有 webhook。Adapter 使用轮询：
 - 当前状态
 - `resultSummary`
 - 日志查询命令
-- 原始 Zulip stream/topic 或 Hermes 会话
+- 原始 Zulip stream/topic，或飞书/Hermes conversationId
 
 Adapter 必须保存 `taskId -> 通知目标`，不能只依赖 Runner 的 `requestedBy`。原因是 `requestedBy` 不在任务摘要中，且通知系统通常还需要 Zulip thread、bot message id、重试计数和上次通知状态。
 
@@ -423,7 +465,7 @@ Adapter 应把 Runner 错误码和 adapter 本地错误转换成用户可理解�
 | `tmux_not_found` | Runner | Runner 找不到 `tmux` |
 | `project_busy` | Adapter | 当前项目已有活跃写任务，稍后再试或排队 |
 | `permission_denied` | Adapter | 当前用户没有执行该操作的权限 |
-| `route_unbound` | Adapter | 当前 stream/topic 或会话没有绑定项目 |
+| `route_unbound` | Adapter | 当前会话没有绑定项目，且没有默认项目；Zulip 场景请检查 stream 是否对应已注册项目 |
 
 日志里不要输出 Authorization header、真实 Token、模型 API key 或完整环境变量。
 
@@ -434,9 +476,9 @@ Adapter MVP 按这个顺序实现：
 1. 从仓库外 Token 文件读取 Runner Token。
 2. 调用 `GET /health`，确认 Runner 可用。
 3. 调用 `GET /projects`，校验项目、路径和 `tmuxSession` 唯一性。
-4. 实现 Zulip stream/topic 和 Hermes 会话到 `projectId` 的显式映射。
-5. 实现 `/codex projects` 和 `/codex bind <projectId>`。
-6. 实现 `/codex ask <task>` 和 `/codex run <projectId> <task>`。
+4. 实现按消息来源分流的项目路由：Zulip stream/频道到 `projectId`，topic 到会话/通知目标；飞书/Hermes/harness 使用 conversationId 绑定、显式项目或默认项目。
+5. 实现 `/codex projects` 和通用会话的 `/codex bind <projectId>`；Zulip 场景下 bind 应提示使用频道映射。
+6. 实现 `/codex ask <task>`、Zulip 的 `/codex run <task>`、Zulip 的 `/codex run --project <projectId> <task>`，以及通用会话的 `/codex run <projectId> <task>`。
 7. 创建任务时写入 `requestedBy`。
 8. 实现用户权限判断，并按权限设置 `allowCodeChanges` 和 `allowNetwork`。
 9. 实现 adapter 侧同项目写任务排队或拒绝。
@@ -453,7 +495,8 @@ Adapter MVP 按这个顺序实现：
 - Runner 使用 `HCO_AUTH_MODE=token`。
 - Adapter 从仓库外 `0600` Token 文件读取 Token。
 - Adapter 日志不会输出 Token、Authorization header 或模型密钥。
-- Zulip stream/topic 和 Hermes 会话到 `projectId` 的映射明确。
+- Zulip stream/频道到 `projectId` 的映射明确，topic 只作为会话/通知目标。
+- 飞书和 Hermes 原生 conversationId 到项目的绑定或默认项目策略明确，不依赖 Zulip stream/topic。
 - 每个项目都有唯一 `tmuxSession`。
 - 同一配置根目录只运行一个 Runner。
 - MVP 阶段只运行一个 adapter 实例，或已配置外部项目级写锁。
@@ -461,7 +504,7 @@ Adapter MVP 按这个顺序实现：
 - `GET /tasks/:taskId/raw` 只对管理员开放。
 - Tailscale/LAN 访问已验证；跨机器访问优先 HTTPS。
 - Runner 端口没有直接暴露公网。
-- 至少一次真实任务完成创建、dispatch、Codex 回写、状态查询和 Zulip/Hermes 通知。
+- 至少一次真实任务完成创建、dispatch、Codex 回写、状态查询和 Zulip/飞书/Hermes 通知。
 - 模拟 Runner 重启后，adapter 能恢复未完成任务轮询并处理 stale `queued` 任务。
 
 ## 后续增强
@@ -474,5 +517,5 @@ MVP 之后可以考虑：
 - Runner 支持每项目或每用户 Token。
 - Runner 支持取消时联动 Codex/tmux 执行进程。
 - Hermes adapter 支持审批流，例如写任务需要项目维护者确认。
-- Zulip topic 绑定关系持久化并提供审计日志。
+- 通知状态持久化增加更细审计，包括 Zulip stream/topic、飞书/Hermes conversationId、用户和消息 ID。
 - 支持任务队列、优先级和队列位置通知。

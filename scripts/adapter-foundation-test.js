@@ -33,8 +33,9 @@ try {
     runnerBaseUrl: "http://127.0.0.1:8731",
     runnerTokenFile: tokenFile,
     defaultProjectId: "fallback",
-    zulipProjectRoutes: {
-      "dev/stockprofits": "stockprofits"
+    zulipStreamProjectRoutes: {
+      "stockprofits": "stockprofits",
+      "hermes-runner": "hermes-codex-orchestrator"
     },
     adapterStatePath: statePath
   });
@@ -47,6 +48,20 @@ try {
   assert.equal(loaded.config.taskPollTimeoutMs, 7200000);
   assert.equal(loaded.config.writeTaskPolicy, "reject_when_project_busy");
   assert(!JSON.stringify(loaded.config).includes("foundation-secret"), "token leaked into serializable config");
+
+  const oldZulipConfigPath = path.join(root, "old-zulip-adapter.json");
+  await writeJson(oldZulipConfigPath, {
+    runnerBaseUrl: "http://127.0.0.1:8731",
+    runnerTokenFile: tokenFile,
+    zulipProjectRoutes: {
+      "dev/stockprofits": "stockprofits"
+    }
+  });
+  await assert.rejects(() => loadAdapterConfig(oldZulipConfigPath), (error) => {
+    assertCode(error, "invalid_adapter_config");
+    assert.equal(error.details?.field, "zulipProjectRoutes");
+    return true;
+  });
 
   await writeFile(repoTokenFile, "bad", "utf8");
   await chmod(repoTokenFile, 0o600).catch(() => {});
@@ -117,6 +132,33 @@ try {
     projectId: "stockprofits",
     raw: "/Codex bind stockprofits"
   });
+  assert.deepEqual(parseCommand("/codex route show"), {
+    verb: "route",
+    action: "show",
+    raw: "/codex route show"
+  });
+  assert.deepEqual(parseCommand("/codex route set stockprofits"), {
+    verb: "route",
+    action: "set",
+    projectId: "stockprofits",
+    raw: "/codex route set stockprofits"
+  });
+  assert.deepEqual(parseCommand("/codex route confirm hermes-codex-orchestrator"), {
+    verb: "route",
+    action: "confirm",
+    projectId: "hermes-codex-orchestrator",
+    raw: "/codex route confirm hermes-codex-orchestrator"
+  });
+  assert.deepEqual(parseCommand("/codex route unset"), {
+    verb: "route",
+    action: "unset",
+    raw: "/codex route unset"
+  });
+  assert.deepEqual(parseCommand("/codex route none"), {
+    verb: "route",
+    action: "none",
+    raw: "/codex route none"
+  });
   assert.deepEqual(parseCommand("/codex ask 检查测试失败"), {
     verb: "ask",
     goal: "检查测试失败",
@@ -127,6 +169,17 @@ try {
     projectId: "proj-a",
     goal: "修复 bug",
     raw: "/codex run proj-a 修复 bug"
+  });
+  assert.deepEqual(parseCommand("/codex run 修复 bug", { inferProjectForRun: true }), {
+    verb: "run",
+    goal: "修复 bug",
+    raw: "/codex run 修复 bug"
+  });
+  assert.deepEqual(parseCommand("/codex run --project proj-a 修复 bug", { inferProjectForRun: true }), {
+    verb: "run",
+    projectId: "proj-a",
+    goal: "修复 bug",
+    raw: "/codex run --project proj-a 修复 bug"
   });
   assert.deepEqual(parseCommand("/codex status HERMES-20260714-X-AB3C"), {
     verb: "status",
@@ -147,28 +200,96 @@ try {
 
   const state = await loadState(statePath);
   assert.deepEqual(state.bindings, {});
+  assert.deepEqual(state.zulipStreamProjectRoutes, {});
+  assert.deepEqual(state.zulipGenericStreams, {});
   assert.deepEqual(state.tasks, {});
   assert.deepEqual(state.activeWriters, {});
 
   state.bindings["hermes:conv-1"] = "bound-project";
+  state.zulipStreamProjectRoutes["调用工作"] = "stockprofits";
+  state.zulipGenericStreams["闲聊"] = true;
   await saveState(statePath, state);
   const reloadedState = await loadState(statePath);
   assert.equal(reloadedState.bindings["hermes:conv-1"], "bound-project");
+  assert.equal(reloadedState.zulipStreamProjectRoutes["调用工作"], "stockprofits");
+  assert.equal(reloadedState.zulipGenericStreams["闲聊"], true);
   assert.match(await readFile(statePath, "utf8"), /"updatedAt"/);
 
-  assert.equal(targetKeyFromMessage({ platform: "zulip", stream: "dev", topic: "stockprofits" }), "zulip:dev/stockprofits");
+  assert.equal(targetKeyFromMessage({ platform: "zulip", stream: "stockprofits", topic: "需求讨论" }), "zulip:stockprofits/需求讨论");
   assert.equal(targetKeyFromMessage({ platform: "hermes", conversationId: "conv-1" }), "hermes:conv-1");
+  assert.equal(targetKeyFromMessage({ platform: "feishu", conversationId: "chat-1" }), "feishu:chat-1");
 
   const routingConfig = loaded.config;
   assert.equal(resolveProjectId({ command: { projectId: "explicit" }, message: {}, config: routingConfig, state: reloadedState }), "explicit");
   assert.equal(
     resolveProjectId({
       command: {},
-      message: { platform: "zulip", stream: "dev", topic: "stockprofits" },
+      message: { platform: "zulip", stream: "stockprofits", topic: "需求讨论" },
       config: routingConfig,
       state: reloadedState
     }),
     "stockprofits"
+  );
+  assert.equal(
+    resolveProjectId({
+      command: {},
+      message: { platform: "zulip", stream: "hermes-runner", topic: "发布验证" },
+      config: routingConfig,
+      state: reloadedState
+    }),
+    "hermes-codex-orchestrator"
+  );
+  assert.equal(
+    resolveProjectId({
+      command: {},
+      message: { platform: "zulip", stream: "调用工作", topic: "需求讨论" },
+      config: routingConfig,
+      state: reloadedState
+    }),
+    "stockprofits"
+  );
+  assert.throws(
+    () => resolveProjectId({
+      command: {},
+      message: { platform: "zulip", stream: "闲聊", topic: "随便聊" },
+      config: routingConfig,
+      state: reloadedState,
+      projects: [{ projectId: "stockprofits" }]
+    }),
+    (error) => {
+      assertCode(error, "route_generic");
+      assert.equal(error.details?.stream, "闲聊");
+      return true;
+    }
+  );
+  assert.throws(
+    () => resolveProjectId({
+      command: {},
+      message: { platform: "zulip", stream: "abc d", topic: "需求讨论" },
+      config: { ...routingConfig, defaultProjectId: undefined },
+      state: reloadedState,
+      projects: [{ projectId: "abcd" }, { projectId: "stockprofits" }]
+    }),
+    (error) => {
+      assertCode(error, "route_confirmation_required");
+      assert.deepEqual(error.details?.suggestions, ["abcd"]);
+      return true;
+    }
+  );
+  assert.throws(
+    () => resolveProjectId({
+      command: {},
+      message: { platform: "zulip", stream: "abc d", topic: "需求讨论" },
+      config: { ...routingConfig, defaultProjectId: undefined },
+      state: reloadedState,
+      projects: []
+    }),
+    (error) => {
+      assertCode(error, "route_confirmation_required");
+      assert.deepEqual(error.details?.suggestions, []);
+      assert.deepEqual(error.details?.projectIds, []);
+      return true;
+    }
   );
   assert.equal(
     resolveProjectId({
@@ -178,6 +299,16 @@ try {
       state: reloadedState
     }),
     "bound-project"
+  );
+  reloadedState.bindings["feishu:chat-1"] = "feishu-bound";
+  assert.equal(
+    resolveProjectId({
+      command: {},
+      message: { platform: "feishu", conversationId: "chat-1" },
+      config: { ...routingConfig, defaultProjectId: undefined },
+      state: reloadedState
+    }),
+    "feishu-bound"
   );
   assert.equal(resolveProjectId({ command: {}, message: {}, config: routingConfig, state: reloadedState }), "fallback");
   assert.throws(

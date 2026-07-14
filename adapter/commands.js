@@ -14,7 +14,7 @@ function invalidCommand(message) {
   throw adapterError("invalid_command", message);
 }
 
-export function parseCommand(text) {
+export function parseCommand(text, options = {}) {
   const normalized = cleanText(text);
   if (!/^\/codex(?:\s|$)/i.test(normalized)) return null;
   const rest = normalized.replace(/^\/codex/i, "").trim();
@@ -33,6 +33,20 @@ export function parseCommand(text) {
     return { verb, projectId: parts[0], raw };
   }
 
+  if (verb === "route") {
+    const [action, projectId, ...extra] = parts;
+    if (extra.length > 0) invalidCommand("Usage: /codex route show|set <projectId>|confirm <projectId>|unset|none.");
+    if (action === "show" || action === "unset" || action === "none") {
+      if (projectId) invalidCommand(`Usage: /codex route ${action}.`);
+      return { verb, action, raw };
+    }
+    if (action === "set" || action === "confirm") {
+      if (!projectId) invalidCommand(`Usage: /codex route ${action} <projectId>.`);
+      return { verb, action, projectId, raw };
+    }
+    invalidCommand("Usage: /codex route show|set <projectId>|confirm <projectId>|unset|none.");
+  }
+
   if (verb === "ask") {
     const goal = cleanText(parts.join(" ")).slice(0, 2000);
     if (!goal) invalidCommand("Usage: /codex ask <task>.");
@@ -40,6 +54,19 @@ export function parseCommand(text) {
   }
 
   if (verb === "run") {
+    if (options.inferProjectForRun) {
+      if (parts[0] === "--project") {
+        const [, projectId, ...goalParts] = parts;
+        const goal = cleanText(goalParts.join(" ")).slice(0, 2000);
+        if (!projectId || !goal) invalidCommand("Usage: /codex run --project <projectId> <task>.");
+        return { verb, projectId, goal, raw };
+      }
+
+      const goal = cleanText(parts.join(" ")).slice(0, 2000);
+      if (!goal) invalidCommand("Usage: /codex run <task>.");
+      return { verb, goal, raw };
+    }
+
     const [projectId, ...goalParts] = parts;
     const goal = cleanText(goalParts.join(" ")).slice(0, 2000);
     if (!projectId || !goal) invalidCommand("Usage: /codex run <projectId> <task>.");

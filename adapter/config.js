@@ -10,7 +10,7 @@ const ROOT_DIR = path.resolve(__dirname, "..");
 const DEFAULT_CONFIG = {
   runnerBaseUrl: "http://127.0.0.1:8731",
   defaultProjectId: undefined,
-  zulipProjectRoutes: {},
+  zulipStreamProjectRoutes: {},
   pollIntervalMs: 5000,
   pollMaxIntervalMs: 30000,
   taskPollTimeoutMs: 7200000,
@@ -39,6 +39,12 @@ export async function loadAdapterConfig(configPath) {
     throw error;
   }
 
+  if (Object.hasOwn(parsed, "zulipProjectRoutes")) {
+    throw adapterError("invalid_adapter_config", "zulipProjectRoutes has been replaced by zulipStreamProjectRoutes. Zulip topics are conversation targets, not project routes.", {
+      field: "zulipProjectRoutes"
+    });
+  }
+
   const config = {
     ...DEFAULT_CONFIG,
     ...parsed,
@@ -47,8 +53,8 @@ export async function loadAdapterConfig(configPath) {
     adapterStatePath: parsed.adapterStatePath
       ? path.resolve(requireString(parsed.adapterStatePath, "adapterStatePath"))
       : path.resolve(path.dirname(resolvedConfigPath), "adapter-state.json"),
-    zulipProjectRoutes: parsed.zulipProjectRoutes && typeof parsed.zulipProjectRoutes === "object"
-      ? parsed.zulipProjectRoutes
+    zulipStreamProjectRoutes: parsed.zulipStreamProjectRoutes && typeof parsed.zulipStreamProjectRoutes === "object"
+      ? parsed.zulipStreamProjectRoutes
       : {}
   };
 

@@ -60,7 +60,7 @@ await writeFile(
     runnerBaseUrl: `http://127.0.0.1:${port}`,
     runnerTokenFile: tokenFile,
     adapterStatePath: statePath,
-    zulipProjectRoutes: { "dev/stockprofits": "stockprofits" }
+    zulipStreamProjectRoutes: { stockprofits: "stockprofits" }
   }, null, 2)}\n`,
   "utf8"
 );
@@ -88,8 +88,8 @@ function runCli(args) {
 try {
   const messageResult = await runCli(["--config", configPath, "--message", JSON.stringify({
     platform: "zulip",
-    stream: "dev",
-    topic: "stockprofits",
+    stream: "stockprofits",
+    topic: "需求讨论",
     text: "/codex projects",
     user: { id: "u1", role: "member" },
     receivedAt: "2026-07-14T12:00:00.000Z"
@@ -99,8 +99,8 @@ try {
 
   const askResult = await runCli(["--config", configPath, "--message", JSON.stringify({
     platform: "zulip",
-    stream: "dev",
-    topic: "stockprofits",
+    stream: "stockprofits",
+    topic: "需求讨论",
     text: "/codex ask 检查测试失败",
     user: { id: "u1", role: "member" },
     receivedAt: "2026-07-14T12:00:00.000Z"
@@ -120,7 +120,7 @@ try {
           pollState: "polling",
           createdAt: "2026-07-14T12:00:00.000Z",
           updatedAt: "2026-07-14T12:00:00.000Z",
-          targetKey: "zulip:dev/stockprofits"
+          targetKey: "zulip:stockprofits/需求讨论"
         }
       },
       activeWriters: {},

@@ -12,8 +12,8 @@ const statePath = path.join(root, "adapter-state.json");
 function message(text, overrides = {}) {
   return {
     platform: "zulip",
-    stream: "dev",
-    topic: "stockprofits",
+    stream: "stockprofits",
+    topic: "需求讨论",
     text,
     user: { id: "u1", role: "member" },
     messageId: "m1",
@@ -22,28 +22,39 @@ function message(text, overrides = {}) {
   };
 }
 
-function createMockClient() {
+function createMockClient(options = {}) {
   const calls = [];
+  const projects = options.projects ?? [
+    {
+      projectId: "stockprofits",
+      name: "Stock Profits",
+      path: "/Users/hula/Projects/stockprofits",
+      tmuxSession: "codex-stockprofits"
+    },
+    {
+      projectId: "other",
+      name: "Other",
+      path: "/Users/hula/Projects/other",
+      tmuxSession: "codex-other"
+    },
+    {
+      projectId: "abcd",
+      name: "ABC D",
+      path: "/Users/hula/Projects/abcd",
+      tmuxSession: "codex-abcd"
+    },
+    {
+      projectId: "abc",
+      name: "ABC",
+      path: "/Users/hula/Projects/abc",
+      tmuxSession: "codex-abc"
+    }
+  ];
   const client = {
     calls,
     projects: async () => {
       calls.push({ method: "projects" });
-      return {
-        projects: [
-          {
-            projectId: "stockprofits",
-            name: "Stock Profits",
-            path: "/Users/hula/Projects/stockprofits",
-            tmuxSession: "codex-stockprofits"
-          },
-          {
-            projectId: "other",
-            name: "Other",
-            path: "/Users/hula/Projects/other",
-            tmuxSession: "codex-other"
-          }
-        ]
-      };
+      return { projects };
     },
     createTask: async (body) => {
       calls.push({ method: "createTask", body });
@@ -88,7 +99,7 @@ function context(client = createMockClient()) {
     statePath,
     config: {
       defaultProjectId: undefined,
-      zulipProjectRoutes: { "dev/stockprofits": "stockprofits" },
+      zulipStreamProjectRoutes: { stockprofits: "stockprofits" },
       writeTaskPolicy: "reject_when_project_busy"
     },
     now: () => "2026-07-14T12:00:00.000Z"
@@ -106,8 +117,55 @@ try {
 
   client = createMockClient();
   replies = await handleMessage(message("/codex bind stockprofits"), context(client));
+  assert.match(replies[0].text, /频道映射项目|无需.*bind/);
+  assert.equal((await loadState(statePath)).bindings["zulip:stockprofits/需求讨论"], undefined);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex ask 检查新频道", { stream: "abc d" }), context(client));
+  assert.equal(client.calls.at(-1).method, "projects");
+  assert.equal(client.calls.some((call) => call.method === "createTask"), false);
+  assert.match(replies[0].text, /没有关联到已注册项目/);
+  assert.match(replies[0].text, /abcd/);
+  assert.match(replies[0].text, /\/codex route confirm abcd/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex route confirm abcd", { stream: "abc d" }), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /权限不足/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex route confirm abcd", { stream: "abc d", user: { id: "maintainer-1", role: "maintainer" } }), context(client));
+  assert.match(replies[0].text, /已将 Zulip 频道.*abc d.*关联到 projectId=abcd/);
+  assert.equal((await loadState(statePath)).zulipStreamProjectRoutes["abc d"], "abcd");
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex ask 检查已确认频道", { stream: "abc d" }), context(client));
+  assert.equal(client.calls.at(-1).method, "createTask");
+  assert.equal(client.calls.at(-1).body.projectId, "abcd");
+  assert.match(replies[0].text, /TASK-READ/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex route set abc", { stream: "调用工作", user: { id: "maintainer-1", role: "maintainer" } }), context(client));
+  assert.match(replies[0].text, /已将 Zulip 频道.*调用工作.*关联到 projectId=abc/);
+  assert.equal((await loadState(statePath)).zulipStreamProjectRoutes["调用工作"], "abc");
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex route none", { stream: "闲聊", user: { id: "maintainer-1", role: "maintainer" } }), context(client));
+  assert.match(replies[0].text, /通用对话|不关联项目/);
+  assert.equal((await loadState(statePath)).zulipGenericStreams["闲聊"], true);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex ask 不需要项目", { stream: "闲聊" }), context(client));
+  assert.equal(client.calls.some((call) => call.method === "createTask"), false);
+  assert.match(replies[0].text, /通用对话|不会创建 Codex Runner 任务/);
+
+  client = createMockClient();
+  replies = await handleMessage(
+    message("/codex bind stockprofits", { platform: "feishu", conversationId: "chat-1", stream: undefined, topic: undefined }),
+    context(client)
+  );
   assert.match(replies[0].text, /已绑定/);
-  assert.equal((await loadState(statePath)).bindings["zulip:dev/stockprofits"], "stockprofits");
+  assert.equal((await loadState(statePath)).bindings["feishu:chat-1"], "stockprofits");
 
   client = createMockClient();
   replies = await handleMessage(message("/codex ask 检查测试失败"), context(client));
@@ -119,7 +177,7 @@ try {
 
   client = createMockClient();
   replies = await handleMessage(
-    message("/codex run stockprofits 修复 bug", { user: { id: "maintainer-1", role: "maintainer" } }),
+    message("/codex run 修复 bug", { user: { id: "maintainer-1", role: "maintainer" } }),
     context(client)
   );
   assert.equal(client.calls.at(-1).body.allowCodeChanges, true);
@@ -127,11 +185,49 @@ try {
   assert.match(replies[0].text, /TASK-WRITE/);
   assert.equal((await loadState(statePath)).activeWriters.stockprofits.taskId, "TASK-WRITE");
 
+  client = createMockClient();
+  replies = await handleMessage(
+    message("/codex run --project other 修复另一个项目", { user: { id: "maintainer-1", role: "maintainer" } }),
+    context(client)
+  );
+  assert.equal(client.calls.at(-1).body.allowCodeChanges, true);
+  assert.equal(client.calls.at(-1).body.projectId, "other");
+  assert.equal(client.calls.at(-1).body.goal, "修复另一个项目");
+
+  client = createMockClient();
+  replies = await handleMessage(
+    message("/codex run abcd 修复 Feishu bug", {
+      platform: "feishu",
+      conversationId: "chat-2",
+      stream: undefined,
+      topic: undefined,
+      user: { id: "maintainer-1", role: "maintainer" }
+    }),
+    context(client)
+  );
+  assert.equal(client.calls.at(-1).body.projectId, "abcd");
+  assert.equal(client.calls.at(-1).body.goal, "修复 Feishu bug");
+  assert.equal(replies[0].targetKey, "feishu:chat-2");
+
+  client = createMockClient({ projects: [{ projectId: "stockprofits" }] });
+  replies = await handleMessage(
+    message("/codex run nonexistent-project 修复未知项目", {
+      platform: "feishu",
+      conversationId: "chat-3",
+      stream: undefined,
+      topic: undefined,
+      user: { id: "maintainer-1", role: "maintainer" }
+    }),
+    context(client)
+  );
+  assert.equal(client.calls.some((call) => call.method === "createTask"), false);
+  assert.match(replies[0].text, /找不到项目 nonexistent-project/);
+
   replies = await handleMessage(message("/codex run stockprofits 再修一个 bug"), context(createMockClient()));
   assert.match(replies[0].text, /权限不足|permission/i);
 
   replies = await handleMessage(
-    message("/codex run stockprofits 第二个写任务", { user: { id: "maintainer-2", role: "maintainer" } }),
+    message("/codex run 第二个写任务", { user: { id: "maintainer-2", role: "maintainer" } }),
     context(createMockClient())
   );
   assert.match(replies[0].text, /已有活跃写任务|project_busy/);

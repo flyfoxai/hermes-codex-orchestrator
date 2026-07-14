@@ -5,6 +5,8 @@ import path from "node:path";
 export function emptyState() {
   return {
     bindings: {},
+    zulipStreamProjectRoutes: {},
+    zulipGenericStreams: {},
     tasks: {},
     activeWriters: {},
     updatedAt: new Date().toISOString()
@@ -14,6 +16,8 @@ export function emptyState() {
 function normalizeState(value) {
   return {
     bindings: value?.bindings && typeof value.bindings === "object" ? value.bindings : {},
+    zulipStreamProjectRoutes: value?.zulipStreamProjectRoutes && typeof value.zulipStreamProjectRoutes === "object" ? value.zulipStreamProjectRoutes : {},
+    zulipGenericStreams: value?.zulipGenericStreams && typeof value.zulipGenericStreams === "object" ? value.zulipGenericStreams : {},
     tasks: value?.tasks && typeof value.tasks === "object" ? value.tasks : {},
     activeWriters: value?.activeWriters && typeof value.activeWriters === "object" ? value.activeWriters : {},
     updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : new Date().toISOString()

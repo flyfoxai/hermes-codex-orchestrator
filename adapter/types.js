@@ -7,12 +7,12 @@
 
 /**
  * @typedef {Object} NormalizedMessage
- * @property {'zulip'|'hermes'|'harness'} platform
+ * @property {'zulip'|'feishu'|'hermes'|'harness'} platform
  * @property {string} text
  * @property {NormalizedUser} user
- * @property {string} [stream]
- * @property {string} [topic]
- * @property {string} [conversationId]
+ * @property {string} [stream] Zulip stream. For Zulip, this maps to project routing.
+ * @property {string} [topic] Zulip topic. For Zulip, this maps to the conversation/notification target.
+ * @property {string} [conversationId] Generic conversation id for Feishu, Hermes, and harness messages.
  * @property {string} [messageId]
  * @property {string} receivedAt
  */

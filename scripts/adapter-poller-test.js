@@ -52,7 +52,7 @@ try {
         pollState: "polling",
         createdAt: iso(start),
         updatedAt: iso(start),
-        targetKey: "zulip:dev/stockprofits"
+        targetKey: "zulip:stockprofits/需求讨论"
       }
     },
     activeWriters: {
@@ -102,7 +102,7 @@ try {
         pollState: "polling",
         createdAt: iso(start - 10_000),
         updatedAt: iso(start - 10_000),
-        targetKey: "zulip:dev/stockprofits"
+        targetKey: "zulip:stockprofits/需求讨论"
       }
     },
     activeWriters: {
@@ -147,7 +147,7 @@ try {
         pollState: "polling",
         createdAt: iso(start - 10_000),
         updatedAt: iso(start - 10_000),
-        targetKey: "zulip:dev/stockprofits"
+        targetKey: "zulip:stockprofits/需求讨论"
       }
     },
     activeWriters: {

@@ -2,9 +2,9 @@
   "runnerBaseUrl": "http://127.0.0.1:8731",
   "runnerTokenFile": "/Users/hula/.hco/token",
   "defaultProjectId": "stockprofits",
-  "zulipProjectRoutes": {
-    "dev/stockprofits": "stockprofits",
-    "ops/hermes-runner": "hermes-codex-orchestrator"
+  "zulipStreamProjectRoutes": {
+    "stockprofits": "stockprofits",
+    "hermes-runner": "hermes-codex-orchestrator"
   },
   "pollIntervalMs": 5000,
   "pollMaxIntervalMs": 30000,

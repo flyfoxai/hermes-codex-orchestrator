@@ -172,9 +172,9 @@ pending -> queued -> running -> waiting_user -> verifying -> completed
 
 Runner 写入 `pending`、`queued`、`cancelled` 和 dispatch 失败时的 `failed`。Codex 负责回写 `running`、`waiting_user`、`verifying`、`completed` 和详细结果。
 
-## Hermes/Zulip Adapter MVP
+## Hermes/Zulip/Feishu Adapter MVP
 
-仓库现在包含一个平台中立的 Adapter MVP，用来验证 Hermes/Zulip 对话到 Runner HTTP API 的核心链路。它还不是生产 Zulip bot 或 Hermes bot；当前入口是本地 normalized message harness。
+仓库现在包含一个平台中立的 Adapter MVP，用来验证 Hermes、Zulip、飞书对话到 Runner HTTP API 的核心链路。它还不是生产 Zulip bot、飞书 bot 或 Hermes bot；当前入口是本地 normalized message harness。
 
 先创建仓库外 Adapter 配置和 Token 文件。Token 文件必须在仓库外，权限必须是 `0600`：
 
@@ -191,15 +191,17 @@ cp config/adapter.json.example "$HOME/.hco/adapter.json"
 - `runnerBaseUrl` 指向 Runner，例如 `http://127.0.0.1:8731`
 - `runnerTokenFile` 指向仓库外 Token 文件，例如 `/Users/hula/.hco/token`
 - `adapterStatePath` 指向仓库外状态文件，例如 `/Users/hula/.hco/adapter-state.json`
-- `zulipProjectRoutes` 把 `stream/topic` 映射到已注册的 `projectId`
+- `zulipStreamProjectRoutes` 可选地把 Zulip 频道名映射到已注册的 `projectId`；运行时确认的映射会保存在 `adapterStatePath`
+
+旧配置键 `zulipProjectRoutes` 已废弃并会被拒绝，因为 Zulip topic 现在只表示会话/通知目标，不再参与项目路由。
 
 本地 harness 示例：
 
 ```sh
 node adapter/index.js --config "$HOME/.hco/adapter.json" --message '{
   "platform": "zulip",
-  "stream": "dev",
-  "topic": "stockprofits",
+  "stream": "stockprofits",
+  "topic": "需求讨论",
   "text": "/codex projects",
   "user": { "id": "u1", "role": "member" },
   "receivedAt": "2026-07-14T12:00:00.000Z"
@@ -212,7 +214,23 @@ node adapter/index.js --config "$HOME/.hco/adapter.json" --message '{
 node adapter/index.js --config "$HOME/.hco/adapter.json" --recover
 ```
 
-已支持的命令包括 `/codex projects`、`/codex bind <projectId>`、`/codex ask <task>`、`/codex run <projectId> <task>`、`/codex status|logs|raw|cancel|dispatch <taskId>` 和 `/codex sessions`。`raw` 只允许 admin；写任务由 Adapter 侧按项目串行化。
+已支持的命令包括 `/codex projects`、`/codex bind <projectId>`、`/codex route show|set <projectId>|confirm <projectId>|unset|none`、`/codex ask <task>`、`/codex run <task>`（仅 Zulip 从频道推断项目）、`/codex run --project <projectId> <task>`（仅 Zulip 临时跨项目）、`/codex run <projectId> <task>`（飞书、Hermes、harness 通用格式）、`/codex status|logs|raw|cancel|dispatch <taskId>` 和 `/codex sessions`。`raw` 只允许 admin；写任务由 Adapter 侧按项目串行化。
+
+Zulip 专用路由规则：
+
+- Zulip 频道/stream 对应 `projectId`，例如频道 `stockprofits` 可路由到项目 `stockprofits`。
+- Zulip topic 对应会话/通知目标，同一个频道下不同 topic 会保留不同回复上下文。
+- 如果频道名和项目 ID 不一致，在 `zulipStreamProjectRoutes` 里配置别名，例如 `"hermes-runner": "hermes-codex-orchestrator"`。
+- 如果遇到新频道或频道名无法对应项目，Adapter 会先提示人工确认，例如 `/codex route confirm abcd` 或 `/codex route set abcd`，确认前不会创建任务。
+- 如果该频道是通用对话、不需要项目，回复 `/codex route none`；之后该频道不会再自动调度 Codex Runner。
+- Zulip topic 内不需要 `/codex bind`；如需临时操作其他项目，使用 `/codex run --project <projectId> <task>`。
+
+飞书、Hermes 原生对话和 harness 使用通用路由规则：
+
+- 优先使用命令里的显式 `projectId`。
+- 其次使用当前 `conversationId` 通过 `/codex bind <projectId>` 保存的绑定。
+- 最后才使用可选 `defaultProjectId`。
+- 不使用 Zulip 频道/topic 规则。
 
 当前边界：
 

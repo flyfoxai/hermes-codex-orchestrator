@@ -9,6 +9,11 @@ export function checkPermission({ command, user, taskRecord } = {}) {
   if (role === "admin") return { allowed: true };
   if (ADMIN_VERBS.has(verb)) return { allowed: false, reason: "admin_required" };
   if (role === "maintainer") return { allowed: true };
+  if (verb === "route") {
+    return command?.action === "show"
+      ? { allowed: true }
+      : { allowed: false, reason: "maintainer_required" };
+  }
   if (MAINTAINER_VERBS.has(verb)) return { allowed: false, reason: "maintainer_required" };
   if (verb === "run") return { allowed: false, reason: "write_permission_required" };
   if (verb === "cancel") {
