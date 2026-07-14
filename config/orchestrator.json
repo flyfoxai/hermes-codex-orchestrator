@@ -1,0 +1,13 @@
+{
+  "host": "127.0.0.1",
+  "port": 8731,
+  "defaultLanguage": "zh-CN",
+  "codexPath": "codex",
+  "pathEnv": "$HOME/.npm-global/bin:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+  "tmuxPrefix": "codex",
+  "taskIdPrefix": "HERMES",
+  "dispatchDelayMs": 1500,
+  "pasteSubmitDelayMs": 150,
+  "logLevel": "info",
+  "allowProjectRegistration": true
+}

@@ -1,0 +1,16 @@
+{
+  "projects": {
+    "example_project": {
+      "projectId": "example_project",
+      "name": "Example Project",
+      "path": "/absolute/path/to/example-project",
+      "tmuxSession": "codex-example-project",
+      "allowCodeChanges": true,
+      "allowNetwork": true,
+      "concurrency": "single-writer",
+      "language": "zh-CN",
+      "createdAt": "2026-07-14T00:00:00.000Z",
+      "updatedAt": "2026-07-14T00:00:00.000Z"
+    }
+  }
+}

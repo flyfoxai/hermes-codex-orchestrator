@@ -1,0 +1,24 @@
+{
+  "name": "hermes-codex-orchestrator",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "description": "Runner HTTP API for dispatching Hermes tasks to Codex via project files and tmux.",
+  "scripts": {
+    "start": "node runner/index.js serve",
+    "check": "node --check runner/index.js && node --check runner/config.js && node --check runner/http.js && node --check runner/task-store.js && node --check runner/tmux.js && node --check runner/codex.js && node --check runner/logger.js && node --check scripts/smoke-test.js && node --check scripts/contract-test.js && node --check scripts/dispatch-test.js && node --check scripts/dispatch-success-test.js && node --check scripts/hardening-test.js",
+    "smoke": "node scripts/smoke-test.js",
+    "contract": "node scripts/contract-test.js",
+    "dispatch": "node scripts/dispatch-test.js",
+    "dispatch:success": "node scripts/dispatch-success-test.js",
+    "hardening": "node scripts/hardening-test.js",
+    "adapter:check": "node scripts/adapter-check.js",
+    "adapter:test": "node scripts/adapter-foundation-test.js && node scripts/adapter-handler-test.js && node scripts/adapter-poller-test.js && node scripts/adapter-cli-test.js",
+    "adapter:verify": "npm run adapter:check && npm run adapter:test",
+    "verify": "npm run check && npm run smoke && npm run contract && npm run dispatch && npm run dispatch:success && npm run hardening"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
