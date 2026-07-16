@@ -335,6 +335,7 @@ process.stdin.on("data", (chunk) => {
       new Promise((_, reject) => setTimeout(() => reject(new Error(`HCO entry did not stop: ${stderr}`)), 5_000))
     ]);
   }
+  assert.equal(existsSync(socketPath), false, "HCO entry must remove its Unix socket before exiting");
 });
 
 test("binds adapters before initialize and keeps supported reverse requests deferred", async () => {

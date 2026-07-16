@@ -261,13 +261,19 @@ if (isDirectEntry()) {
     console.error("HCO does not accept command-line arguments.");
     process.exitCode = 1;
   } else {
-    createHcoRuntime({ configPath: process.env.HCO_CONFIG_PATH }).then((runtime) => {
-      const shutdown = () => {
-        runtime.close().catch(() => { process.exitCode = 1; });
-      };
-      process.once("SIGINT", shutdown);
-      process.once("SIGTERM", shutdown);
-    }).catch(() => {
+    const runtimePromise = createHcoRuntime({ configPath: process.env.HCO_CONFIG_PATH });
+    let shutdownPromise;
+    const shutdown = () => {
+      if (shutdownPromise) return;
+      const shutdownGuard = setInterval(() => {}, 1_000);
+      shutdownPromise = runtimePromise
+        .then((runtime) => runtime.close())
+        .catch(() => { process.exitCode = 1; })
+        .finally(() => clearInterval(shutdownGuard));
+    };
+    process.once("SIGINT", shutdown);
+    process.once("SIGTERM", shutdown);
+    runtimePromise.catch(() => {
       console.error("HCO startup failed.");
       process.exitCode = 1;
     });

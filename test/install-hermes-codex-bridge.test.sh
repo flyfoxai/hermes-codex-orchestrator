@@ -244,6 +244,9 @@ printf '%s\n' \
   '  zulip: [hco_bridge, no_mcp]' \
   'known_plugin_toolsets:' \
   '  zulip: [hco_bridge, operator-known]' \
+  'mcp_servers:' \
+  '  qmd: {enabled: true}' \
+  '  stockdata: {enabled: true}' \
   'context:' \
   '  engine: lcm' > "$HERMES_HOME/config.yaml"
 printf '%s\n' \
@@ -251,13 +254,19 @@ printf '%s\n' \
   '  zulip: [hco_bridge, no_mcp]' \
   'known_plugin_toolsets:' \
   '  zulip: [hco_bridge, operator-known]' \
+  'mcp_servers:' \
+  '  qmd: {enabled: true}' \
+  '  stockdata: {enabled: true}' \
   'context:' \
   '  engine: lcm' > "$HERMES_HOME/profiles/codex-bridge/config.yaml"
 printf '%s\n' \
   'platform_toolsets:' \
   '  zulip: [hermes-zulip, hco_bridge, no_mcp]' \
   'known_plugin_toolsets:' \
-  '  zulip: [hco_bridge, operator-known]' > "$HERMES_HOME/profiles/hermes-general/config.yaml"
+  '  zulip: [hco_bridge, operator-known]' \
+  'mcp_servers:' \
+  '  qmd: {enabled: true}' \
+  '  stockdata: {enabled: true}' > "$HERMES_HOME/profiles/hermes-general/config.yaml"
 printf '%s' "$MUTATE_SECRET" > "$BEARER_PATH"
 printf '%064d' 0 > "$CONTEXT_KEY_PATH"
 printf '%s\n' "UNRELATED_SETTING=preserved" > "$HERMES_HOME/.env"
@@ -423,7 +432,7 @@ printf '%s\n' \
   'case "$command_name" in' \
   '  print) [[ -f "$HCO_TEST_LAUNCHCTL_STATE/$label" ]] && printf "state = %s\n" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label")" ;;' \
   '  bootstrap) plist="${3:?}"; label="$(basename "$plist" .plist)"; mkdir -p "$HCO_TEST_LAUNCHCTL_STATE"; [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label" ;;' \
-  '  bootout) label="${target##*/}"; [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label" ;;' \
+  '  bootout) label="${target##*/}"; if [[ "$label" == "com.hermes.codex-bridge-hco" && "${HCO_TEST_ASYNC_BOOTOUT:-}" == "1" ]]; then stop_hco; printf stopping > "$HCO_TEST_LAUNCHCTL_STATE/$label"; (sleep 0.2; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label") </dev/null >/dev/null 2>&1 & else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  kickstart) label="${target##*/}"; [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label" ;;' \
   '  kill) target="${3:?}"; label="${target##*/}"; [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; printf stopped > "$HCO_TEST_LAUNCHCTL_STATE/$label" ;;' \
   '  *) exit 92 ;;' \
@@ -473,7 +482,7 @@ assert_contains "$(< "$HERMES_HOME/.env")" "UNRELATED_SETTING=preserved" "root d
 assert_contains "$(< "$HERMES_HOME/.env")" "HCO_CONFIG_PATH=$MUTATE_HCO_CONFIG" "root dotenv injects HCO config path"
 [[ ! -e "$HERMES_HOME/ai.hermes.gateway.plist" ]] || fail "generated Hermes gateway plist is untouched"
 
-PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$HERMES_HOME" "$LAUNCH_AGENTS" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" <<'PY'
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$HERMES_HOME" "$LAUNCH_AGENTS" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" "$PYTHON" <<'PY'
 import inspect
 import json
 import os
@@ -489,13 +498,16 @@ os.environ["HERMES_HOME"] = str(home)
 from hermes_cli.config import load_config
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.profiles import get_profile_dir
-from hermes_cli.tools_config import _get_platform_tools
+from hermes_cli.tools_config import _get_platform_tools, _save_platform_tools
+from hermes_cli.toolset_validation import validate_platform_toolsets
+from toolsets import validate_toolset
 import hermes_cli.plugins as plugin_module
 
 launch_agents = Path(sys.argv[2])
 hco_config_text = sys.argv[3]
 hco_config_path = Path(hco_config_text)
 configured_codex = sys.argv[4]
+expected_python = sys.argv[5]
 assert hco_config_path.stat().st_mode & 0o777 == 0o600
 assert json.loads(hco_config_path.read_text())["codexExecutablePath"] == configured_codex
 root = yaml.safe_load((home / "config.yaml").read_text())
@@ -504,8 +516,16 @@ general = yaml.safe_load((home / "profiles/hermes-general/config.yaml").read_tex
 assert "hermes-codex-bridge" in root["plugins"]["enabled"]
 assert "unrelated-fixture" in root["plugins"]["enabled"]
 assert root["gateway"]["multiplex_profiles"] is True
-assert root["platform_toolsets"]["zulip"] == []
-assert bridge["platform_toolsets"]["zulip"] == []
+assert root["platform_toolsets"]["zulip"] == ["zulip-history"]
+assert bridge["platform_toolsets"]["zulip"] == ["zulip-history"]
+assert validate_platform_toolsets(root["platform_toolsets"], validate_toolset) == []
+assert validate_platform_toolsets(bridge["platform_toolsets"], validate_toolset) == []
+assert "zulip-history" in root["agent"]["disabled_toolsets"]
+assert "zulip-history" in bridge["agent"]["disabled_toolsets"]
+assert root["mcp_servers"]["qmd"]["enabled"] is False
+assert root["mcp_servers"]["stockdata"]["enabled"] is False
+assert bridge["mcp_servers"]["qmd"]["enabled"] is False
+assert bridge["mcp_servers"]["stockdata"]["enabled"] is False
 assert "hco_bridge" not in root.get("known_plugin_toolsets", {}).get("zulip", [])
 assert "hco_bridge" not in bridge.get("known_plugin_toolsets", {}).get("zulip", [])
 assert "unrelated_fixture" in root["known_plugin_toolsets"]["zulip"]
@@ -514,6 +534,10 @@ assert "hco_bridge" not in general["platform_toolsets"]["zulip"]
 assert "hco_bridge" not in general.get("known_plugin_toolsets", {}).get("zulip", [])
 assert "operator-known" in general["known_plugin_toolsets"]["zulip"]
 assert general["platform_toolsets"]["zulip"]
+assert "no_mcp" not in general["platform_toolsets"]["zulip"]
+assert validate_platform_toolsets(general["platform_toolsets"], validate_toolset) == []
+assert general["mcp_servers"]["qmd"]["enabled"] is False
+assert general["mcp_servers"]["stockdata"]["enabled"] is False
 
 load_hermes_dotenv(hermes_home=home)
 manager = plugin_module.PluginManager()
@@ -535,7 +559,13 @@ assert callable(plugin_llm.acomplete_structured)
 assert manager._plugins["hermes-codex-bridge"].tools_registered == []
 
 os.environ["HERMES_HOME"] = str(home)
-assert _get_platform_tools(load_config(), "zulip") == set()
+root_effective = load_config()
+assert _get_platform_tools(root_effective, "zulip") == set()
+_save_platform_tools(root_effective, "zulip", set())
+root_after_tools_save = load_config()
+assert _get_platform_tools(root_after_tools_save, "zulip") == set()
+assert root_after_tools_save["mcp_servers"]["qmd"]["enabled"] is False
+assert root_after_tools_save["mcp_servers"]["stockdata"]["enabled"] is False
 os.environ["HERMES_HOME"] = str(get_profile_dir("codex-bridge"))
 assert _get_platform_tools(load_config(), "zulip") == set()
 for label in ("com.hermes.codex-bridge-hco", "com.hermes.codex-bridge-delivery"):
@@ -546,6 +576,10 @@ for label in ("com.hermes.codex-bridge-hco", "com.hermes.codex-bridge-delivery")
     assert all(not isinstance(value, str) or "task9-mutating-secret" not in value for value in plist.values()), label
     if label == "com.hermes.codex-bridge-hco":
         assert plist["EnvironmentVariables"] == {"HCO_CONFIG_PATH": hco_config_text}, plist["EnvironmentVariables"]
+    else:
+        assert plist["ProgramArguments"][0] == expected_python
+        assert plist["ProgramArguments"][1] == "-B"
+        assert plist["ProgramArguments"][2].endswith("/delivery_sidecar.py")
 PY
 assert_contains "$(< "$LAUNCHCTL_LOG")" "bootstrap gui/$(id -u) $LAUNCH_AGENTS/com.hermes.codex-bridge-hco.plist" "HCO is bootstrapped independently"
 assert_contains "$(< "$LAUNCHCTL_LOG")" "bootstrap gui/$(id -u) $LAUNCH_AGENTS/com.hermes.codex-bridge-delivery.plist" "delivery is bootstrapped independently"
@@ -1154,7 +1188,7 @@ ROLLBACK_BRIDGE_CONFIG_BEFORE="$(< "$HERMES_HOME/profiles/codex-bridge/config.ya
 ROLLBACK_GENERAL_CONFIG_BEFORE="$(< "$HERMES_HOME/profiles/hermes-general/config.yaml")"
 ROLLBACK_LINK_BEFORE="$(readlink "$PLUGIN_LINK")"
 set +e
-ROLLBACK_OUTPUT="$(HCO_TEST_NODE_BIN="$FAKE_NODE" HCO_INSTALLER_TEST_FAILPOINT=after_hco_bootstrap invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+ROLLBACK_OUTPUT="$(HCO_TEST_ASYNC_BOOTOUT=1 HCO_TEST_NODE_BIN="$FAKE_NODE" HCO_INSTALLER_TEST_FAILPOINT=after_hco_bootstrap invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
 ROLLBACK_STATUS=$?
 set -e
 [[ $ROLLBACK_STATUS -ne 0 ]] || fail "injected post-HCO failure aborts installation"

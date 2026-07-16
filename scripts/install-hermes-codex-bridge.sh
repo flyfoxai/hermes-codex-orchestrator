@@ -177,10 +177,10 @@ HCO_LABEL = "com.hermes.codex-bridge-hco"
 DELIVERY_LABEL = "com.hermes.codex-bridge-delivery"
 MAX_CONFIG_BYTES = 262_144
 MAX_SECRET_BYTES = 4_096
-RESTRICTED_TOOLSETS: list[str] = []
+RESTRICTED_TOOLSETS: list[str] = ["zulip-history"]
 HERMES_CHECKOUT = Path("/Users/hula/Projects/hermesAgent")
 HERMES_PROJECT_ENV = Path("/Users/hula/Projects/hermesAgent/.env")
-GENERAL_TOOLSETS = ["hermes-zulip", "no_mcp"]
+GENERAL_TOOLSETS = ["hermes-zulip"]
 RESTRICTED_DISABLED_TOOLSETS = ["context_engine", "kanban", "zulip-history"]
 
 
@@ -230,7 +230,7 @@ node_bin = Path(node_text)
 codex_bin = Path(codex_text)
 launchctl_bin = Path(launchctl_text)
 authorize_context_depth_zero = authorize_text == "true"
-python_bin = Path(sys.executable).resolve()
+python_bin = Path(sys.executable)
 uid = os.getuid()
 launch_domain = f"gui/{uid}"
 
@@ -718,6 +718,15 @@ def managed_known_plugin_toolsets(
     )
 
 
+def disable_mcp_servers(config: dict[str, Any]) -> None:
+    servers = config.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return
+    for server in servers.values():
+        if isinstance(server, dict):
+            server["enabled"] = False
+
+
 def root_config(
     existing: dict[str, Any], installed_plugin_toolsets: set[str]
 ) -> dict[str, Any]:
@@ -745,6 +754,7 @@ def root_config(
     if not isinstance(disabled, list):
         raise InstallError("root agent.disabled_toolsets must be a list")
     disabled.extend(item for item in RESTRICTED_DISABLED_TOOLSETS if item not in disabled)
+    disable_mcp_servers(result)
     return result
 
 
@@ -760,6 +770,7 @@ def restricted_config(
     if not isinstance(disabled, list):
         raise InstallError("restricted agent.disabled_toolsets must be a list")
     disabled.extend(item for item in RESTRICTED_DISABLED_TOOLSETS if item not in disabled)
+    disable_mcp_servers(result)
     return result
 
 
@@ -769,9 +780,11 @@ def general_config(existing: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(platform.get("zulip"), list) or not platform["zulip"]:
         platform["zulip"] = list(GENERAL_TOOLSETS)
     else:
-        platform["zulip"] = [item for item in platform["zulip"] if item != "hco_bridge"]
-        if "no_mcp" not in platform["zulip"]:
-            platform["zulip"].append("no_mcp")
+        platform["zulip"] = [
+            item for item in platform["zulip"] if item not in {"hco_bridge", "no_mcp"}
+        ]
+        if not platform["zulip"]:
+            platform["zulip"] = list(GENERAL_TOOLSETS)
     known = result.setdefault("known_plugin_toolsets", {})
     if not isinstance(known, dict):
         raise InstallError("general known_plugin_toolsets config must be a mapping")
@@ -779,6 +792,7 @@ def general_config(existing: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(configured, list):
         raise InstallError("general known_plugin_toolsets.zulip must be a list")
     known["zulip"] = [item for item in configured if item != "hco_bridge"]
+    disable_mcp_servers(result)
     return result
 
 
@@ -1000,6 +1014,7 @@ def make_plists(
         "Label": DELIVERY_LABEL,
         "ProgramArguments": [
             str(python_bin),
+            "-B",
             str(plugin_release / "delivery_sidecar.py"),
             "--socket-path", document["bridge"]["socketPath"],
             "--hco-bearer-file", document["bridge"]["tokenPath"],
@@ -1827,6 +1842,8 @@ def main() -> None:
         if services_mutated:
             for label in (DELIVERY_LABEL, HCO_LABEL):
                 bootout(label)
+            for label in (DELIVERY_LABEL, HCO_LABEL):
+                wait_service_state(label, ServiceState(False, False))
         for item in reversed(snapshots):
             if item.kind == "socket" and not services_mutated:
                 continue
@@ -1952,6 +1969,9 @@ def main() -> None:
         for label in (DELIVERY_LABEL, HCO_LABEL):
             if prior_services[label].loaded:
                 bootout(label)
+        for label in (DELIVERY_LABEL, HCO_LABEL):
+            if prior_services[label].loaded:
+                wait_service_state(label, ServiceState(False, False))
         bootstrap(hco_plist_path)
         # HCO starts first. Both launchd ownership and protocol readiness must
         # settle before the send-only delivery worker can consume an outbox row.
