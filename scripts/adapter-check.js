@@ -10,6 +10,8 @@ const files = [
   "adapter/commands.js",
   "adapter/router.js",
   "adapter/permissions.js",
+  "adapter/topic-mode.js",
+  "adapter/semantic-control.js",
   "adapter/write-gate.js",
   "adapter/handler.js",
   "adapter/poller.js",

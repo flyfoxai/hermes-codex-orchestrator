@@ -2,8 +2,10 @@ import { parseCommand } from "./commands.js";
 import { formatErrorForUser, permissionDenied } from "./errors.js";
 import { checkPermission } from "./permissions.js";
 import { normalizeZulipStreamName, resolveProjectId, targetKeyFromMessage } from "./router.js";
+import { applySemanticControl } from "./semantic-control.js";
 import { checkWriteGate, releaseActiveWriter, reserveActiveWriter } from "./write-gate.js";
 import { loadState, saveState } from "./state-store.js";
+import { bindTopicTask, clearTopicModesForStream, getTopicMode, TOPIC_MODES } from "./topic-mode.js";
 
 function replyText(text, targetKey) {
   return [{ targetKey, text }];
@@ -26,12 +28,28 @@ function taskRecordFromMessage(message, command, projectId) {
   };
 }
 
-async function persistTask(statePath, taskId, record) {
+async function persistTask(statePath, taskId, record, { message, projectId, command, now }) {
   const state = await loadState(statePath);
   state.tasks[taskId] = {
     ...record,
     taskId
   };
+  if (message.platform === "zulip") {
+    bindTopicTask(state, {
+      message,
+      projectId,
+      taskId,
+      actor: {
+        userId: message.user?.id ?? null,
+        source: message.platform,
+        messageId: message.messageId ?? null
+      },
+      now
+    });
+  }
+  if (command.verb === "run") {
+    reserveActiveWriter(state, projectId, taskId, { userId: message.user?.id ?? null });
+  }
   await saveState(statePath, state);
 }
 
@@ -43,29 +61,13 @@ function projectExists(projects, projectId) {
   return projects.some((project) => project.projectId === projectId);
 }
 
-function formatRouteConfirmation(error) {
+function formatHermesOwnedStream(error) {
   const stream = error.details?.stream ?? "当前频道";
-  const suggestions = error.details?.suggestions ?? [];
-  const projectIds = error.details?.projectIds ?? [];
-  const lines = [`当前 Zulip 频道“${stream}”没有关联到已注册项目。`];
-  if (suggestions.length > 0) {
-    lines.push("", "发现相似项目：");
-    for (const projectId of suggestions) lines.push(`- ${projectId}`);
-    lines.push("", `如确认关联，请回复：/codex route confirm ${suggestions[0]}`);
-  } else if (projectIds.length > 0) {
-    lines.push("", "可用项目：");
-    for (const projectId of projectIds.slice(0, 10)) lines.push(`- ${projectId}`);
-    lines.push("", "如需关联，请回复：/codex route set <projectId>");
-  } else {
-    lines.push("", "如需关联，请先确认 Runner 已注册项目，然后回复：/codex route set <projectId>");
-  }
-  lines.push("如果这是通用对话频道、不需要项目，请回复：/codex route none");
-  return lines.join("\n");
+  return `Zulip 频道“${stream}”没有 projectId，由 Hermes 直接管理，不会创建 Codex Runner 任务。如需改为项目频道，请由 maintainer 使用 /codex route set <projectId>。`;
 }
 
-function formatRouteGeneric(error) {
-  const stream = error.details?.stream ?? "当前频道";
-  return `Zulip 频道“${stream}”已标记为通用对话/不关联项目，不会创建 Codex Runner 任务。如需改为项目频道，请使用 /codex route set <projectId>。`;
+function formatProjectMismatch(error) {
+  return `请求的 projectId=${error.details?.requestedProjectId} 与当前频道绑定的 projectId=${error.details?.mappedProjectId} 不匹配，不能临时跨项目。请先由 maintainer 修改频道映射。`;
 }
 
 async function handleRouteCommand(command, message, context, state, targetKey) {
@@ -85,6 +87,7 @@ async function handleRouteCommand(command, message, context, state, targetKey) {
   }
 
   if (command.action === "unset") {
+    clearTopicModesForStream(state, stream);
     delete state.zulipStreamProjectRoutes[stream];
     delete state.zulipGenericStreams[stream];
     await saveState(context.statePath, state);
@@ -92,6 +95,7 @@ async function handleRouteCommand(command, message, context, state, targetKey) {
   }
 
   if (command.action === "none") {
+    clearTopicModesForStream(state, stream);
     delete state.zulipStreamProjectRoutes[stream];
     state.zulipGenericStreams[stream] = true;
     await saveState(context.statePath, state);
@@ -103,10 +107,48 @@ async function handleRouteCommand(command, message, context, state, targetKey) {
     return replyText(`找不到项目 ${command.projectId}。请先用 /codex projects 查看已注册项目。`, targetKey);
   }
 
+  clearTopicModesForStream(state, stream);
   state.zulipStreamProjectRoutes[stream] = command.projectId;
   delete state.zulipGenericStreams[stream];
   await saveState(context.statePath, state);
   return replyText(`已将 Zulip 频道“${stream}”关联到 projectId=${command.projectId}。`, targetKey);
+}
+
+async function handleTopicCommand(command, message, context, state, targetKey) {
+  if (message.platform !== "zulip") {
+    return replyText("topic 命令仅用于 Zulip 项目频道的当前话题。", targetKey);
+  }
+
+  let projectId;
+  try {
+    projectId = resolveProjectId({ command: {}, message, config: context.config, state });
+  } catch (error) {
+    if (error.code === "route_hermes_owned") return replyText(formatHermesOwnedStream(error), targetKey);
+    throw error;
+  }
+
+  const permission = checkPermission({ command, user: message.user });
+  if (!permission.allowed) {
+    return replyText(formatErrorForUser(permissionDenied(permission.reason)), targetKey);
+  }
+  if (command.action === "show") {
+    const mode = getTopicMode(state, { message, projectId });
+    return replyText(`当前话题模式为 ${mode}，projectId=${projectId}。`, targetKey);
+  }
+
+  const control = {
+    type: "CONTROL",
+    action: "SET_TOPIC_MODE",
+    mode: command.action === "auto" ? TOPIC_MODES.AUTO : TOPIC_MODES.HERMES_ONLY
+  };
+  const result = await applySemanticControl({
+    control,
+    message,
+    config: context.config,
+    statePath: context.statePath,
+    now: context.now
+  });
+  return replyText(result.text, targetKey);
 }
 
 export async function handleMessage(message, context) {
@@ -132,7 +174,7 @@ export async function handleMessage(message, context) {
 
   if (command.verb === "bind") {
     if (message.platform === "zulip") {
-      return replyText("Zulip 消息使用频道映射项目、话题作为会话目标；无需在话题里 bind。需要临时跨项目时请使用 /codex run --project <projectId> <task>。", targetKey);
+      return replyText("Zulip 消息使用频道映射项目、话题作为会话目标；无需在话题里 bind。跨项目工作必须先由 maintainer 修改频道映射。", targetKey);
     }
     const projects = await context.client.projects();
     const exists = (projects.projects ?? []).some((project) => project.projectId === command.projectId);
@@ -150,6 +192,10 @@ export async function handleMessage(message, context) {
     return handleRouteCommand(command, message, context, state, targetKey);
   }
 
+  if (command.verb === "topic") {
+    return handleTopicCommand(command, message, context, state, targetKey);
+  }
+
   if (command.verb === "cancel") {
     const taskRecord = state.tasks[command.taskId];
     const cancelPermission = checkPermission({ command, user: message.user, taskRecord });
@@ -165,21 +211,21 @@ export async function handleMessage(message, context) {
     return replyText(`任务 ${result.taskId} cancelled.`, targetKey);
   }
 
-  let projects;
-  if (command.verb === "ask" || command.verb === "run") {
-    projects = projectsFromResult(await context.client.projects());
-  }
-
   let projectId;
   try {
-    projectId = resolveProjectId({ command, message, config: context.config, state, projects });
+    projectId = resolveProjectId({ command, message, config: context.config, state });
   } catch (error) {
-    if (error.code === "route_confirmation_required") return replyText(formatRouteConfirmation(error), targetKey);
-    if (error.code === "route_generic") return replyText(formatRouteGeneric(error), targetKey);
+    if (error.code === "route_hermes_owned") return replyText(formatHermesOwnedStream(error), targetKey);
+    if (error.code === "route_project_mismatch") return replyText(formatProjectMismatch(error), targetKey);
     throw error;
   }
 
+  let projects;
   if (command.verb === "ask" || command.verb === "run") {
+    if (message.platform === "zulip" && getTopicMode(state, { message, projectId }) === TOPIC_MODES.HERMES_ONLY) {
+      return replyText("当前话题模式为 HERMES_ONLY，不会派发 Codex。使用 /codex topic auto 可恢复自动派发。", targetKey);
+    }
+    projects = projectsFromResult(await context.client.projects());
     const knownProjects = projects ?? [];
     if (knownProjects.length === 0) {
       return replyText("当前无法验证项目列表，暂时不能创建任务。", targetKey);
@@ -224,13 +270,12 @@ export async function handleMessage(message, context) {
     const task = await context.client.createTask(body);
     record.taskId = task.taskId;
     record.updatedAt = context.now?.() ?? new Date().toISOString();
-    await persistTask(context.statePath, task.taskId, record);
-
-    if (command.verb === "run") {
-      const nextState = await loadState(context.statePath);
-      reserveActiveWriter(nextState, projectId, task.taskId, { userId: message.user?.id ?? null });
-      await saveState(context.statePath, nextState);
-    }
+    await persistTask(context.statePath, task.taskId, record, {
+      message,
+      projectId,
+      command,
+      now: context.now
+    });
 
     if (context.poller?.pollTask) {
       queueMicrotask(() => {

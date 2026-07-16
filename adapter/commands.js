@@ -47,6 +47,14 @@ export function parseCommand(text, options = {}) {
     invalidCommand("Usage: /codex route show|set <projectId>|confirm <projectId>|unset|none.");
   }
 
+  if (verb === "topic") {
+    const [action, ...extra] = parts;
+    if (!new Set(["show", "auto", "hermes"]).has(action) || extra.length > 0) {
+      invalidCommand("Usage: /codex topic show|auto|hermes.");
+    }
+    return { verb, action, raw };
+  }
+
   if (verb === "ask") {
     const goal = cleanText(parts.join(" ")).slice(0, 2000);
     if (!goal) invalidCommand("Usage: /codex ask <task>.");

@@ -1,0 +1,6 @@
+name: hermes-codex-bridge
+version: 1.0.0
+description: Restricted Zulip bridge to the Hermes Codex Orchestrator
+kind: standalone
+provides_hooks:
+  - pre_gateway_dispatch

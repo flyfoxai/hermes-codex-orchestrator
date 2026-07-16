@@ -222,3 +222,43 @@ cat <project>/.hermes/logs/<taskId>.log
 5. Runner 重启后 tmux/Codex session 仍存在，且没有重复投递任务。
 6. 只运行一个 Runner，监听地址和代理暴露范围符合目标部署级别。
 7. Tailscale/LAN 另行完成私网调用验证；公网直连始终判定为不支持。
+
+## Option C Bridge 运维
+
+HCO 和 Zulip send-only delivery 是两个独立的当前用户 LaunchAgent。delivery 停止不会停止 HCO；检查、重启或卸载时使用各自 label：
+
+```sh
+DOMAIN="gui/$(id -u)"
+HCO_PLIST="$HOME/Library/LaunchAgents/com.hermes.codex-bridge-hco.plist"
+DELIVERY_PLIST="$HOME/Library/LaunchAgents/com.hermes.codex-bridge-delivery.plist"
+
+launchctl print "$DOMAIN/com.hermes.codex-bridge-hco"
+launchctl print "$DOMAIN/com.hermes.codex-bridge-delivery"
+
+launchctl kickstart -k "$DOMAIN/com.hermes.codex-bridge-hco"
+launchctl kickstart -k "$DOMAIN/com.hermes.codex-bridge-delivery"
+
+launchctl bootout "$DOMAIN/com.hermes.codex-bridge-delivery"
+launchctl bootstrap "$DOMAIN" "$DELIVERY_PLIST"
+```
+
+HCO 必须先于 delivery 可用。需要同时冷启动时，先 bootstrap HCO，确认其 socket 和 `/v1/compatibility` 正常，再 bootstrap delivery。日志默认位于 `~/Library/Application Support/HermesCodexBridge/logs/`，诊断和工单中不得粘贴 bearer、HMAC key、Zulip API key 或完整环境变量。
+
+升级使用与首次安装相同的命令重新运行安装器。它先持有每用户锁，完成三层兼容检查，创建完整的不可变版本目录，再原子切换 `plugins/hermes-codex-bridge` symlink。旧 release 在提交前不会删除；遇到非 symlink 的现有插件目录会保留原目录并拒绝安装。
+
+部署变更开始后的失败或信号会触发自动回滚：停止本次启动的 bridge 服务，恢复配置、`.env`、plist、插件 symlink 和原先的服务加载状态。若输出包含 `rollback verification failed`，不要继续启动 delivery；保留现场并按诊断中的非敏感路径人工恢复。
+
+自动回滚只覆盖尚未提交的安装事务。成功提交后的人工降级属于新的运维变更：先卸载 delivery 和 HCO，保存当前配置及 plist，确认目标旧 release 仍是 installer-owned 的完整目录，再切换 stable symlink、恢复与该 release 匹配的配置并依次启动 HCO、验证兼容性、启动 delivery。不要删除未知目录，也不要只切 symlink 后继续使用新配置。
+
+每次安装或升级后执行：
+
+```sh
+/bin/bash test/install-hermes-codex-bridge.test.sh
+PYTHONDONTWRITEBYTECODE=1 \
+  /Users/hula/Projects/hermesAgent/.venv/bin/python3 \
+  -m pytest -q test/hermes_plugin_contract_test.py
+launchctl print "gui/$(id -u)/com.hermes.codex-bridge-hco"
+launchctl print "gui/$(id -u)/com.hermes.codex-bridge-delivery"
+```
+
+验证默认与 `codex-bridge` profile 仍只暴露 bridge 所需工具，`hermes-general` 在 bridge 两个服务都关闭时仍能用于普通对话，并确认有效 `ZULIP_CONTEXT_DEPTH=0`。

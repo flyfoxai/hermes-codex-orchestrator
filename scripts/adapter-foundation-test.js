@@ -159,6 +159,21 @@ try {
     action: "none",
     raw: "/codex route none"
   });
+  assert.deepEqual(parseCommand("/codex topic show"), {
+    verb: "topic",
+    action: "show",
+    raw: "/codex topic show"
+  });
+  assert.deepEqual(parseCommand("/codex topic auto"), {
+    verb: "topic",
+    action: "auto",
+    raw: "/codex topic auto"
+  });
+  assert.deepEqual(parseCommand("/codex topic hermes"), {
+    verb: "topic",
+    action: "hermes",
+    raw: "/codex topic hermes"
+  });
   assert.deepEqual(parseCommand("/codex ask 检查测试失败"), {
     verb: "ask",
     goal: "检查测试失败",
@@ -197,11 +212,20 @@ try {
     assertCode(error, "invalid_command");
     return true;
   });
+  assert.throws(() => parseCommand("/codex topic"), (error) => {
+    assertCode(error, "invalid_command");
+    return true;
+  });
+  assert.throws(() => parseCommand("/codex topic auto extra"), (error) => {
+    assertCode(error, "invalid_command");
+    return true;
+  });
 
   const state = await loadState(statePath);
   assert.deepEqual(state.bindings, {});
   assert.deepEqual(state.zulipStreamProjectRoutes, {});
   assert.deepEqual(state.zulipGenericStreams, {});
+  assert.deepEqual(state.zulipTopicModes, {});
   assert.deepEqual(state.tasks, {});
   assert.deepEqual(state.activeWriters, {});
 
@@ -257,7 +281,7 @@ try {
       projects: [{ projectId: "stockprofits" }]
     }),
     (error) => {
-      assertCode(error, "route_generic");
+      assertCode(error, "route_hermes_owned");
       assert.equal(error.details?.stream, "闲聊");
       return true;
     }
@@ -271,8 +295,8 @@ try {
       projects: [{ projectId: "abcd" }, { projectId: "stockprofits" }]
     }),
     (error) => {
-      assertCode(error, "route_confirmation_required");
-      assert.deepEqual(error.details?.suggestions, ["abcd"]);
+      assertCode(error, "route_hermes_owned");
+      assert.equal(error.details?.stream, "abc d");
       return true;
     }
   );
@@ -285,9 +309,31 @@ try {
       projects: []
     }),
     (error) => {
-      assertCode(error, "route_confirmation_required");
-      assert.deepEqual(error.details?.suggestions, []);
-      assert.deepEqual(error.details?.projectIds, []);
+      assertCode(error, "route_hermes_owned");
+      assert.equal(error.details?.stream, "abc d");
+      return true;
+    }
+  );
+  assert.equal(
+    resolveProjectId({
+      command: { projectId: "stockprofits" },
+      message: { platform: "zulip", stream: "stockprofits", topic: "需求讨论" },
+      config: routingConfig,
+      state: reloadedState
+    }),
+    "stockprofits"
+  );
+  assert.throws(
+    () => resolveProjectId({
+      command: { projectId: "other" },
+      message: { platform: "zulip", stream: "stockprofits", topic: "需求讨论" },
+      config: routingConfig,
+      state: reloadedState
+    }),
+    (error) => {
+      assertCode(error, "route_project_mismatch");
+      assert.equal(error.details?.mappedProjectId, "stockprofits");
+      assert.equal(error.details?.requestedProjectId, "other");
       return true;
     }
   );
@@ -321,6 +367,7 @@ try {
 
   assert.equal(checkPermission({ command: { verb: "raw" }, user: { role: "member", id: "u1" } }).allowed, false);
   assert.equal(checkPermission({ command: { verb: "run" }, user: { role: "member", id: "u1" } }).allowed, false);
+  assert.equal(checkPermission({ command: { verb: "topic", action: "hermes" }, user: { role: "member", id: "u1" } }).allowed, true);
   assert.equal(checkPermission({ command: { verb: "raw" }, user: { role: "maintainer", id: "u1" } }).allowed, false);
   assert.equal(checkPermission({ command: { verb: "raw" }, user: { role: "admin", id: "u1" } }).allowed, true);
   assert.equal(

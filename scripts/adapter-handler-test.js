@@ -6,6 +6,8 @@ import path from "node:path";
 import { handleMessage } from "../adapter/handler.js";
 import { loadState, saveState } from "../adapter/state-store.js";
 
+const semanticControlModule = await import("../adapter/semantic-control.js").catch(() => null);
+
 const root = await mkdtemp(path.join(os.tmpdir(), "hco-adapter-handler-"));
 const statePath = path.join(root, "adapter-state.json");
 
@@ -122,11 +124,28 @@ try {
 
   client = createMockClient();
   replies = await handleMessage(message("/codex ask 检查新频道", { stream: "abc d" }), context(client));
-  assert.equal(client.calls.at(-1).method, "projects");
+  assert.equal(client.calls.length, 0);
   assert.equal(client.calls.some((call) => call.method === "createTask"), false);
-  assert.match(replies[0].text, /没有关联到已注册项目/);
-  assert.match(replies[0].text, /abcd/);
-  assert.match(replies[0].text, /\/codex route confirm abcd/);
+  assert.match(replies[0].text, /Hermes/);
+  assert.match(replies[0].text, /\/codex route set <projectId>/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex topic show", { stream: "未映射", topic: "闲聊" }), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /Hermes/);
+
+  client = createMockClient();
+  replies = await handleMessage(
+    message("/codex topic show", { platform: "hermes", conversationId: "chat-topic", stream: undefined, topic: undefined }),
+    context(client)
+  );
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /仅用于 Zulip/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex topic hermes", { user: {} }), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /权限不足/);
 
   client = createMockClient();
   replies = await handleMessage(message("/codex route confirm abcd", { stream: "abc d" }), context(client));
@@ -174,6 +193,30 @@ try {
   assert.equal(client.calls.at(-1).body.dispatch, true);
   assert.equal(client.calls.at(-1).body.requestedBy.source, "zulip");
   assert.match(replies[0].text, /TASK-READ/);
+  assert.equal((await loadState(statePath)).zulipTopicModes["zulip:stockprofits/需求讨论"].mode, "CODEX_BOUND");
+  assert.equal((await loadState(statePath)).zulipTopicModes["zulip:stockprofits/需求讨论"].taskId, "TASK-READ");
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex topic show"), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /CODEX_BOUND/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex topic hermes"), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /HERMES_ONLY/);
+  assert.match(replies[0].text, /没有取消|未取消/);
+  assert.match(replies[0].text, /\/codex cancel TASK-READ/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex ask 不应派发"), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /HERMES_ONLY/);
+
+  client = createMockClient();
+  replies = await handleMessage(message("/codex topic auto"), context(client));
+  assert.equal(client.calls.length, 0);
+  assert.match(replies[0].text, /AUTO/);
 
   client = createMockClient();
   replies = await handleMessage(
@@ -190,9 +233,8 @@ try {
     message("/codex run --project other 修复另一个项目", { user: { id: "maintainer-1", role: "maintainer" } }),
     context(client)
   );
-  assert.equal(client.calls.at(-1).body.allowCodeChanges, true);
-  assert.equal(client.calls.at(-1).body.projectId, "other");
-  assert.equal(client.calls.at(-1).body.goal, "修复另一个项目");
+  assert.equal(client.calls.some((call) => call.method === "createTask"), false);
+  assert.match(replies[0].text, /不匹配|不能.*跨项目/);
 
   client = createMockClient();
   replies = await handleMessage(
@@ -231,6 +273,78 @@ try {
     context(createMockClient())
   );
   assert.match(replies[0].text, /已有活跃写任务|project_busy/);
+
+  assert(semanticControlModule, "adapter/semantic-control.js must exist");
+  const semanticContext = context(createMockClient());
+  let controlResult = await semanticControlModule.applySemanticControl({
+    control: { type: "CONTROL", action: "SET_TOPIC_MODE", mode: "HERMES_ONLY" },
+    message: message("这个话题不要使用 Codex", { topic: "语义控制", messageId: "semantic-1" }),
+    config: semanticContext.config,
+    statePath: semanticContext.statePath,
+    now: semanticContext.now
+  });
+  assert.equal(controlResult.ok, true);
+  assert.equal(controlResult.previousMode, "AUTO");
+  assert.equal(controlResult.newMode, "HERMES_ONLY");
+  assert.equal(controlResult.changed, true);
+  assert.match(controlResult.text, /HERMES_ONLY/);
+
+  controlResult = await semanticControlModule.applySemanticControl({
+    control: { type: "CONTROL", action: "SET_TOPIC_MODE", mode: "HERMES_ONLY" },
+    message: message("这个话题不要使用 Codex", { topic: "语义控制", messageId: "semantic-1" }),
+    config: semanticContext.config,
+    statePath: semanticContext.statePath,
+    now: semanticContext.now
+  });
+  assert.equal(controlResult.changed, false);
+
+  await assert.rejects(
+    () => semanticControlModule.applySemanticControl({
+      control: { type: "CONTROL", action: "SET_TOPIC_MODE", mode: "CODEX_BOUND" },
+      message: message("无效模型输出", { topic: "语义控制" }),
+      config: semanticContext.config,
+      statePath: semanticContext.statePath
+    }),
+    (error) => error?.code === "model_protocol_error"
+  );
+  await assert.rejects(
+    () => semanticControlModule.applySemanticControl({
+      control: { type: "CONTROL", action: "SET_TOPIC_MODE", mode: "AUTO" },
+      message: message("恢复", { stream: "未映射", topic: "语义控制" }),
+      config: semanticContext.config,
+      statePath: semanticContext.statePath
+    }),
+    (error) => error?.code === "route_hermes_owned"
+  );
+  await assert.rejects(
+    () => semanticControlModule.applySemanticControl({
+      control: { type: "CONTROL", action: "SET_TOPIC_MODE", mode: "AUTO" },
+      message: message("恢复", { topic: "未认证语义控制", user: {} }),
+      config: semanticContext.config,
+      statePath: semanticContext.statePath
+    }),
+    (error) => error?.code === "permission_denied"
+  );
+
+  const routeResetState = await loadState(statePath);
+  routeResetState.zulipTopicModes["zulip:待重映射/旧话题"] = {
+    mode: "HERMES_ONLY",
+    projectId: "stockprofits",
+    stream: "待重映射",
+    topic: "旧话题"
+  };
+  await saveState(statePath, routeResetState);
+  client = createMockClient();
+  replies = await handleMessage(
+    message("/codex route set other", {
+      stream: "待重映射",
+      topic: "路由管理",
+      user: { id: "maintainer-1", role: "maintainer" }
+    }),
+    context(client)
+  );
+  assert.match(replies[0].text, /projectId=other/);
+  assert.equal((await loadState(statePath)).zulipTopicModes["zulip:待重映射/旧话题"], undefined);
 
   client = createMockClient();
   replies = await handleMessage(message("/codex status TASK-READ"), context(client));

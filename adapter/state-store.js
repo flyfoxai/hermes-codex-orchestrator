@@ -7,6 +7,7 @@ export function emptyState() {
     bindings: {},
     zulipStreamProjectRoutes: {},
     zulipGenericStreams: {},
+    zulipTopicModes: {},
     tasks: {},
     activeWriters: {},
     updatedAt: new Date().toISOString()
@@ -18,6 +19,7 @@ function normalizeState(value) {
     bindings: value?.bindings && typeof value.bindings === "object" ? value.bindings : {},
     zulipStreamProjectRoutes: value?.zulipStreamProjectRoutes && typeof value.zulipStreamProjectRoutes === "object" ? value.zulipStreamProjectRoutes : {},
     zulipGenericStreams: value?.zulipGenericStreams && typeof value.zulipGenericStreams === "object" ? value.zulipGenericStreams : {},
+    zulipTopicModes: value?.zulipTopicModes && typeof value.zulipTopicModes === "object" ? value.zulipTopicModes : {},
     tasks: value?.tasks && typeof value.tasks === "object" ? value.tasks : {},
     activeWriters: value?.activeWriters && typeof value.activeWriters === "object" ? value.activeWriters : {},
     updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : new Date().toISOString()

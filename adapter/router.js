@@ -8,10 +8,6 @@ function foldedRouteKey(value) {
   return normalizeZulipStreamName(value).toLowerCase();
 }
 
-function compactRouteKey(value) {
-  return foldedRouteKey(value).replace(/[\s_-]+/g, "");
-}
-
 function lookupRoute(map = {}, stream) {
   const normalized = normalizeZulipStreamName(stream);
   if (Object.hasOwn(map, stream)) return map[stream];
@@ -29,22 +25,6 @@ function isGenericStream(state = {}, stream) {
   if (map[stream] || map[normalized]) return true;
   const folded = foldedRouteKey(normalized);
   return Object.entries(map).some(([key, value]) => Boolean(value) && foldedRouteKey(key) === folded);
-}
-
-function projectList(projects) {
-  if (Array.isArray(projects)) return projects;
-  if (Array.isArray(projects?.projects)) return projects.projects;
-  return [];
-}
-
-function suggestProjects(stream, projects) {
-  const streamCompact = compactRouteKey(stream);
-  if (!streamCompact) return [];
-  return projectList(projects)
-    .map((project) => project.projectId)
-    .filter(Boolean)
-    .filter((projectId) => compactRouteKey(projectId) === streamCompact)
-    .slice(0, 5);
 }
 
 export function targetKeyFromMessage(message) {
@@ -67,41 +47,32 @@ export function targetKeyFromMessage(message) {
   throw adapterError("invalid_message_target", "Unsupported message platform.");
 }
 
-export function resolveProjectId({ command = {}, message = {}, config = {}, state = {}, projects = [] }) {
-  if (command.projectId) return command.projectId;
+export function resolveZulipStreamProjectId({ stream, config = {}, state = {} }) {
+  const normalized = normalizeZulipStreamName(stream);
+  if (!normalized || isGenericStream(state, normalized)) return null;
+  return lookupRoute(state.zulipStreamProjectRoutes, normalized)
+    ?? lookupRoute(config.zulipStreamProjectRoutes, normalized)
+    ?? null;
+}
 
+export function resolveProjectId({ command = {}, message = {}, config = {}, state = {} }) {
   if (message.platform === "zulip" && message.stream) {
     const stream = normalizeZulipStreamName(message.stream);
-    if (isGenericStream(state, stream)) {
-      throw adapterError("route_generic", "This Zulip stream is marked as generic and is not associated with a project.", {
-        stream
-      });
+    const mappedProjectId = resolveZulipStreamProjectId({ stream, config, state });
+    if (!mappedProjectId) {
+      throw adapterError("route_hermes_owned", "This Zulip stream is owned by Hermes and is not associated with a project.", { stream });
     }
-
-    const runtimeProjectId = lookupRoute(state.zulipStreamProjectRoutes, stream);
-    if (runtimeProjectId) return runtimeProjectId;
-
-    const configuredProjectId = lookupRoute(config.zulipStreamProjectRoutes, stream);
-    if (configuredProjectId) return configuredProjectId;
-
-    const knownProjects = projectList(projects);
-    const exactProject = knownProjects.find((project) => project.projectId === stream);
-    if (exactProject) return exactProject.projectId;
-
-    if (knownProjects.length > 0) {
-      throw adapterError("route_confirmation_required", "Zulip stream is not associated with a registered project.", {
+    if (command.projectId && command.projectId !== mappedProjectId) {
+      throw adapterError("route_project_mismatch", "The requested project does not match this Zulip stream's project mapping.", {
         stream,
-        suggestions: suggestProjects(stream, knownProjects),
-        projectIds: knownProjects.map((project) => project.projectId).filter(Boolean).slice(0, 20)
+        mappedProjectId,
+        requestedProjectId: command.projectId
       });
     }
-
-    throw adapterError("route_confirmation_required", "Zulip stream is not associated with a registered project.", {
-      stream,
-      suggestions: [],
-      projectIds: []
-    });
+    return mappedProjectId;
   }
+
+  if (command.projectId) return command.projectId;
 
   if (message.platform) {
     try {

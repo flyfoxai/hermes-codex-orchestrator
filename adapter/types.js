@@ -20,6 +20,9 @@
 /**
  * @typedef {Object} AdapterState
  * @property {{ [targetKey: string]: string }} bindings
+ * @property {{ [stream: string]: string }} zulipStreamProjectRoutes
+ * @property {{ [stream: string]: boolean }} zulipGenericStreams
+ * @property {{ [targetKey: string]: object }} zulipTopicModes
  * @property {{ [taskId: string]: object }} tasks
  * @property {{ [projectId: string]: object }} activeWriters
  * @property {string} updatedAt

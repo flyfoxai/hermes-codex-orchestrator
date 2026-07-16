@@ -1,6 +1,11 @@
 # Hermes Codex Orchestrator
 
-Hermes Codex Orchestrator 是一个 Runner HTTP API，用来把 Hermes 发来的开发任务写成项目内任务文件，并通过 `tmux` 投递给 Codex CLI。这个 README 提供本地验证、安全启动、项目注册、任务投递和常用查询的最短路径；更完整的部署和 API 细节见文末链接。
+Hermes Codex Orchestrator 包含两套彼此独立的执行面：
+
+- **Option C 生产面**：`hco/`、`plugin/hermes-codex-bridge/` 和 delivery sidecar，通过 Codex App Server 保持话题上下文。这里以数字 Zulip stream ID 和 SQLite 为唯一权威状态，使用 `scripts/install-hermes-codex-bridge.sh` 安装。
+- **旧 Runner/tmux 兼容面**：`runner/` 和 `adapter/`，把任务写成项目文件并通过 `tmux` 投递给 Codex TUI。它仍使用频道显示名称和 JSON adapter state，只用于旧部署、harness 与回滚，不参与 Option C 路由，也不能提供 App Server thread 续接。
+
+下面首先记录旧 Runner/tmux 的操作方式。Option C 的架构与生产安装要求见 [Option C 设计](docs/superpowers/specs/2026-07-16-hermes-codex-option-c-design.md)、[实施审核](docs/reviews/OPTION_C_IMPLEMENTATION_REVIEW.md)和[安装脚本](scripts/install-hermes-codex-bridge.sh)。不要在两套执行面之间复用或迁移 `taskId`、频道名称路由或状态文件作为权威数据。
 
 ## 工作方式
 
@@ -191,7 +196,7 @@ cp config/adapter.json.example "$HOME/.hco/adapter.json"
 - `runnerBaseUrl` 指向 Runner，例如 `http://127.0.0.1:8731`
 - `runnerTokenFile` 指向仓库外 Token 文件，例如 `/Users/hula/.hco/token`
 - `adapterStatePath` 指向仓库外状态文件，例如 `/Users/hula/.hco/adapter-state.json`
-- `zulipStreamProjectRoutes` 可选地把 Zulip 频道名映射到已注册的 `projectId`；运行时确认的映射会保存在 `adapterStatePath`
+- `zulipStreamProjectRoutes` 把项目 Zulip 频道名映射到已注册的 `projectId`；运行时设置的映射和话题模式会保存在 `adapterStatePath`
 
 旧配置键 `zulipProjectRoutes` 已废弃并会被拒绝，因为 Zulip topic 现在只表示会话/通知目标，不再参与项目路由。
 
@@ -214,16 +219,16 @@ node adapter/index.js --config "$HOME/.hco/adapter.json" --message '{
 node adapter/index.js --config "$HOME/.hco/adapter.json" --recover
 ```
 
-已支持的命令包括 `/codex projects`、`/codex bind <projectId>`、`/codex route show|set <projectId>|confirm <projectId>|unset|none`、`/codex ask <task>`、`/codex run <task>`（仅 Zulip 从频道推断项目）、`/codex run --project <projectId> <task>`（仅 Zulip 临时跨项目）、`/codex run <projectId> <task>`（飞书、Hermes、harness 通用格式）、`/codex status|logs|raw|cancel|dispatch <taskId>` 和 `/codex sessions`。`raw` 只允许 admin；写任务由 Adapter 侧按项目串行化。
+已支持的命令包括 `/codex projects`、`/codex bind <projectId>`、`/codex route show|set <projectId>|confirm <projectId>|unset|none`、`/codex topic show|auto|hermes`、`/codex ask <task>`、`/codex run <task>`（Zulip 使用频道的显式项目映射）、`/codex run --project <projectId> <task>`（Zulip 中只能断言与频道映射相同的项目）、`/codex run <projectId> <task>`（飞书、Hermes、harness 通用格式）、`/codex status|logs|raw|cancel|dispatch <taskId>` 和 `/codex sessions`。`raw` 只允许 admin；写任务由 Adapter 侧按项目串行化。
 
 Zulip 专用路由规则：
 
-- Zulip 频道/stream 对应 `projectId`，例如频道 `stockprofits` 可路由到项目 `stockprofits`。
-- Zulip topic 对应会话/通知目标，同一个频道下不同 topic 会保留不同回复上下文。
-- 如果频道名和项目 ID 不一致，在 `zulipStreamProjectRoutes` 里配置别名，例如 `"hermes-runner": "hermes-codex-orchestrator"`。
-- 如果遇到新频道或频道名无法对应项目，Adapter 会先提示人工确认，例如 `/codex route confirm abcd` 或 `/codex route set abcd`，确认前不会创建任务。
-- 如果该频道是通用对话、不需要项目，回复 `/codex route none`；之后该频道不会再自动调度 Codex Runner。
-- Zulip topic 内不需要 `/codex bind`；如需临时操作其他项目，使用 `/codex run --project <projectId> <task>`。
+- 只有在 `zulipStreamProjectRoutes` 或运行时 state 中显式映射了 `projectId` 的频道才是项目频道；频道名与项目名相同也不会自动建立绑定。
+- 没有 `projectId` 的频道由 Hermes 直接管理，其中所有话题都不会创建或继续 Codex Runner 任务。
+- 项目频道的话题默认是 `AUTO`；成功创建任务后记录为 `CODEX_BOUND`，但当前 Runner/tmux 后端只保存真实 `taskId`，不具备 App Server thread 续接能力。
+- `/codex topic hermes` 把当前话题设为 `HERMES_ONLY`，阻止后续派发；它不会取消已有任务。`/codex topic auto` 恢复自动派发资格。
+- 自然语言也可以控制话题，但理解工作由上游 Hermes 的一次模型调用完成；Hermes 必须把结构化 `CONTROL` 结果交给 `applySemanticControl()`，HCO 不直接解析普通消息。
+- `/codex run --project <projectId> <task>` 不能跨项目覆盖频道映射；参数不一致时会拒绝。
 
 飞书、Hermes 原生对话和 harness 使用通用路由规则：
 
@@ -236,6 +241,7 @@ Zulip 专用路由规则：
 
 - Adapter 不读取源码、不执行 shell、不操作 `tmux`、不直接驱动 Codex。
 - 真实 Zulip/Hermes transport 仍是后续集成工作。
+- 本仓库已提供 Hermes 自然语言 `CONTROL` 的接收合同，但真正的 Hermes 模型循环仍需在上游接线。
 - 当前实现未部署，也没有暴露任何新端口。
 - 完整对接设计见 [docs/HERMES_ZULIP_ADAPTER_INTEGRATION.md](docs/HERMES_ZULIP_ADAPTER_INTEGRATION.md)。
 
@@ -312,9 +318,16 @@ curl -H "Authorization: Bearer $HCO_API_TOKEN" "http://127.0.0.1:8731/tasks/<tas
 
 继续阅读这些文档：
 
+- [docs/JARVIS_HERMES_QUICKSTART.md](docs/JARVIS_HERMES_QUICKSTART.md)：Jarvis 主 Hermes 接入和使用本项目的最短说明
 - [docs/SETUP.md](docs/SETUP.md)：安装、Token、配置和项目注册
 - [docs/OPERATIONS.md](docs/OPERATIONS.md)：launchd/systemd、运维检查、网络边界和部署验证清单
 - [HTTP_API_INTEGRATION.md](HTTP_API_INTEGRATION.md)：Hermes adapter 集成方式和完整 API 参考
 - [docs/STATUS.md](docs/STATUS.md)：当前开发状态和下一步
 - [docs/reviews/CLAUDE_USER_DOCUMENTATION_DRAFT.md](docs/reviews/CLAUDE_USER_DOCUMENTATION_DRAFT.md)：Claude 候选稿
 - [docs/reviews/GEMINI_USER_DOCUMENTATION_DRAFT.md](docs/reviews/GEMINI_USER_DOCUMENTATION_DRAFT.md)：Gemini 候选稿
+
+## Option C 用户级安装
+
+macOS 上的生产化 Hermes bridge 使用 `scripts/install-hermes-codex-bridge.sh`。安装器以不可变版本目录和原子 symlink 激活独立插件，配置受限 multiplex profile，并分别管理 HCO 与 send-only Zulip delivery LaunchAgent；它不会修改 Hermes core 或 Hermes 生成的 gateway plist。
+
+先按 [docs/SETUP.md](docs/SETUP.md) 准备 owner-only 配置并运行严格 dry-run，再按 [docs/OPERATIONS.md](docs/OPERATIONS.md) 完成独立服务检查、升级与回滚。安装前会分别验证 HCO bridge protocol、当前 Hermes 安装和当前 Codex App Server；这些结果只证明当次检测到的版本与能力，不代表未来版本兼容。

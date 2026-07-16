@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "codexExecutablePath": "/ABSOLUTE/PATH/TO/codex",
+  "databasePath": "/ABSOLUTE/PATH/TO/hco.sqlite3",
+  "bridge": {
+    "tokenPath": "/ABSOLUTE/PATH/TO/hco.bearer",
+    "contextKeyPath": "/ABSOLUTE/PATH/TO/hco-context.key",
+    "socketPath": "/ABSOLUTE/PATH/TO/hco.sock",
+    "routeSnapshotPath": "/ABSOLUTE/PATH/TO/zulip-routes.json"
+  },
+  "snapshot": {
+    "ttlMs": 60000,
+    "maxBytes": 262144
+  },
+  "admins": [],
+  "projects": []
+}

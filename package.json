@@ -7,18 +7,31 @@
   "description": "Runner HTTP API for dispatching Hermes tasks to Codex via project files and tmux.",
   "scripts": {
     "start": "node runner/index.js serve",
-    "check": "node --check runner/index.js && node --check runner/config.js && node --check runner/http.js && node --check runner/task-store.js && node --check runner/tmux.js && node --check runner/codex.js && node --check runner/logger.js && node --check scripts/smoke-test.js && node --check scripts/contract-test.js && node --check scripts/dispatch-test.js && node --check scripts/dispatch-success-test.js && node --check scripts/hardening-test.js",
+    "check": "node --check runner/index.js && node --check runner/config.js && node --check runner/http.js && node --check runner/task-store.js && node --check runner/tmux.js && node --check runner/codex.js && node --check runner/logger.js && node --check hco/contracts/protocol.js && node --check hco/contracts/identity.js && node --check hco/contracts/envelope.js && node --check hco/state/migrations.js && node --check hco/state/reducer.js && node --check hco/state/store.js && node --check hco/delivery/renderer.js && node --check hco/bridge/auth.js && node --check hco/bridge/server.js && node --check hco/app-server/transport.js && node --check hco/app-server/rpc-client.js && node --check hco/app-server/client.js && node --check hco/execution/backend.js && node --check hco/execution/app-server-backend.js && node --check hco/execution/tmux-backend.js && node --check hco/turn-controller.js && node --check hco/recovery.js && node --check hco/config.js && node --check hco/acl.js && node --check hco/routes.js && node --check hco/service.js && node --check hco/index.js && node --check test/contracts.test.js && node --check test/state-store.test.js && node --check test/renderer.test.js && node --check test/bridge-server.test.js && node --check test/app-server-transport.test.js && node --check test/turn-controller.test.js && node --check test/hco-service.test.js && node --check test/hco-runtime.test.js && node --check test/option-c-e2e.test.js && node --check test/fixtures/fake-app-server.js && node --check scripts/smoke-test.js && node --check scripts/contract-test.js && node --check scripts/dispatch-test.js && node --check scripts/dispatch-success-test.js && node --check scripts/hardening-test.js",
     "smoke": "node scripts/smoke-test.js",
     "contract": "node scripts/contract-test.js",
     "dispatch": "node scripts/dispatch-test.js",
     "dispatch:success": "node scripts/dispatch-success-test.js",
     "hardening": "node scripts/hardening-test.js",
+    "contracts:test": "node --test test/contracts.test.js",
+    "state:test": "node --test test/state-store.test.js",
+    "renderer:test": "node --test test/renderer.test.js",
+    "bridge:test": "node --test test/bridge-server.test.js",
+    "task3:test": "node --test test/renderer.test.js test/bridge-server.test.js",
+    "app-server:test": "node --test test/app-server-transport.test.js",
+    "turn-controller:test": "node --test test/turn-controller.test.js",
+    "hco-service:test": "node --test test/hco-service.test.js test/hco-runtime.test.js",
+    "hco:serve": "node hco/index.js",
     "adapter:check": "node scripts/adapter-check.js",
-    "adapter:test": "node scripts/adapter-foundation-test.js && node scripts/adapter-handler-test.js && node scripts/adapter-poller-test.js && node scripts/adapter-cli-test.js",
+    "adapter:test": "node scripts/adapter-foundation-test.js && node scripts/adapter-topic-mode-test.js && node scripts/adapter-handler-test.js && node scripts/adapter-poller-test.js && node scripts/adapter-cli-test.js",
     "adapter:verify": "npm run adapter:check && npm run adapter:test",
     "verify": "npm run check && npm run smoke && npm run contract && npm run dispatch && npm run dispatch:success && npm run hardening"
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "better-sqlite3": "12.11.1",
+    "lossless-json": "4.3.0"
   }
 }

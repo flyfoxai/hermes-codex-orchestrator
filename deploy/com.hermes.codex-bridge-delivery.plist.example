@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.hermes.codex-bridge-delivery</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/hula/Projects/hermesAgent/.venv/bin/python3</string>
+    <string>/ABSOLUTE/PATH/TO/plugin/hermes-codex-bridge/delivery_sidecar.py</string>
+    <string>--socket-path</string>
+    <string>/ABSOLUTE/PATH/TO/hco.sock</string>
+    <string>--hco-bearer-file</string>
+    <string>/ABSOLUTE/PATH/TO/hco.bearer</string>
+    <string>--zulip-config-file</string>
+    <string>/ABSOLUTE/PATH/TO/zuliprc</string>
+    <string>--worker-id</string>
+    <string>hco-delivery-user</string>
+    <string>--claim-limit</string>
+    <string>10</string>
+    <string>--lease-ms</string>
+    <string>30000</string>
+    <string>--poll-seconds</string>
+    <string>1</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/ABSOLUTE/PATH/TO/logs/delivery.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/ABSOLUTE/PATH/TO/logs/delivery.stderr.log</string>
+</dict>
+</plist>

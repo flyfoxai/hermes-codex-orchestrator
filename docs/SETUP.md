@@ -154,3 +154,44 @@ npm run verify
 ```
 
 这只证明本地可复现的代码门禁通过。正式启用前还必须按 `docs/OPERATIONS.md` 完成用户级进程守护、真实 Codex 创建/投递/回写/查询回归，并确认网络暴露范围。Tailscale 私网还需要单独完成 Serve 或等价代理验证；公网直连 Runner 不在支持范围内。
+
+## Option C：Hermes Codex Bridge
+
+Option C 是 macOS 当前用户级安装路径。它不会修改 Hermes 源码，也不会修改 Hermes 生成的 `ai.hermes.gateway.plist`。安装器会创建版本化的独立插件、受限的默认及 `codex-bridge` profile、普通对话用的 `hermes-general` profile，以及两个互相独立的 LaunchAgent。
+
+准备仓库外的 HCO 配置、bearer、上下文 HMAC key 和 Zulip 配置。可从 `config/hco.json.example` 开始；所有路径必须为绝对路径。HCO JSON、bearer、HMAC key 和 Zulip 配置必须由当前用户拥有，是非空普通文件，且没有 group/other 权限：
+
+```sh
+chmod 600 "$HOME/.hco/hco.json" \
+  "$HOME/.hco/bridge.bearer" \
+  "$HOME/.hco/context.key" \
+  "$HOME/.zuliprc"
+```
+
+真实安装会在第一次部署变更前检查三层兼容性：配置中 Unix socket 上的 HCO bridge protocol、当前安装的 Hermes，以及 `codex app-server --stdio`。因此第一次安装时，也必须先用同一份 `HCO_CONFIG_PATH` 临时启动当前仓库的 HCO，使兼容性 endpoint 可用；安装提交后由 LaunchAgent 接管。
+
+先执行严格 dry-run。它不读取 secret 内容、不创建锁或临时文件，也不启动子进程；需要运行时的三层检查会明确标为 deferred：
+
+```sh
+NODE_BIN="$(command -v node)"
+CODEX_BIN="$(command -v codex)"
+
+./scripts/install-hermes-codex-bridge.sh \
+  --dry-run \
+  --hco-config "$HOME/.hco/hco.json" \
+  --zulip-config "$HOME/.zuliprc" \
+  --node-bin "$NODE_BIN" \
+  --codex-bin "$CODEX_BIN"
+```
+
+确认计划后去掉 `--dry-run`。如果现有 Hermes 环境的有效 `ZULIP_CONTEXT_DEPTH` 不是 `0`，安装器会拒绝修改；审核影响后显式追加 `--authorize-context-depth-zero`，安装器会事务性地保留其他 `.env` 行并把该值规范为单一的 `0`。
+
+成功后检查：
+
+```sh
+launchctl print "gui/$(id -u)/com.hermes.codex-bridge-hco"
+launchctl print "gui/$(id -u)/com.hermes.codex-bridge-delivery"
+readlink "$HERMES_HOME/plugins/hermes-codex-bridge"
+```
+
+不要把 bearer、HMAC key 或 Zulip API key 放进命令行、plist 或 Hermes `.env`。`.env` 中只保存 `HCO_CONFIG_PATH` 文件路径。
