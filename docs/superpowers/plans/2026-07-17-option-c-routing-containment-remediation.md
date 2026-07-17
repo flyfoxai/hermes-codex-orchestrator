@@ -96,7 +96,7 @@
 - [x] Ask Gemini and Claude independently to review the actual diff for correctness, lifecycle safety, rollback, and test gaps; save both outputs.
 - [x] Adjudicate every finding against source, fix substantiated issues, and rerun focused verification.
 - [x] Install into local Jarvis, restart `ai.hermes.gateway`, prove PID change and live hook/profile loading, then exercise ASK, stockprofits, Hermes-owned, invalid-snapshot, and plugin-absent containment cases.
-- [ ] Commit the verified changes and push `codex/option-c-app-server`.
+- [x] Commit the verified changes and push `codex/option-c-app-server`.
 
 #### Review remediation: Zulip ingress YAML preservation
 

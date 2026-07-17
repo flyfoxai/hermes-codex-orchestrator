@@ -14,7 +14,7 @@ into the local Jarvis instance, verify real Zulip routing, then commit and push
 - [completed] Obtain fresh Gemini and Claude reviews and adjudicate findings.
 - [completed] Transactionally disable same-credential Zulip pollers in external profiles, with RED/GREEN and rollback coverage.
 - [completed] Reinstall into `/Users/hula/.hermes` and verify live routing/renewal/attestation.
-- [in_progress] Update final evidence, review changes, commit, and push.
+- [completed] Update final evidence, review changes, commit, and push.
 
 ## Constraints
 

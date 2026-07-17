@@ -214,3 +214,5 @@
   `17655`, HCO PID `17315`, and delivery PID `18003` remained running; Zulip and
   Feishu remained connected; the renewed snapshot at `1784276468911` still
   contained only `4 -> ASK` and `5 -> stockprofits` project routes.
+- Committed the verified implementation as `5860529` (`Harden Option C routing
+  containment`) and pushed it to `origin/codex/option-c-app-server`.
