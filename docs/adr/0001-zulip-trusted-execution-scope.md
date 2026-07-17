@@ -1,6 +1,6 @@
 # 0001 - Trusted execution scope for Zulip project work
 
-**Status:** accepted
+**Status:** accepted; amended 2026-07-17 by the routing-containment remediation
 **Date:** 2026-07-16
 **Supersedes:** the 2026-07-15 proposal to modify Hermes core
 **Related:** ADR 0002, ADR 0003, `docs/superpowers/specs/2026-07-16-hermes-codex-option-c-design.md`
@@ -21,20 +21,41 @@ credentials.
 
 ## Decision
 
-Run exactly one Zulip adapter and two Hermes profiles:
+Run exactly one Zulip adapter and three Hermes profiles:
 
-- the default profile is the restricted project-bridge profile;
+- the default/root profile retains non-Zulip Jarvis behavior and never polls Zulip;
+- the project-neutral `zulip-ingress` profile owns the single Zulip adapter;
+- the restricted `codex-bridge` profile owns mapped project execution;
 - the allowlisted named `hermes-general` profile owns explicitly Hermes-managed
   streams;
-- the standalone bridge plugin is loaded in the default profile;
-- both profiles use the same Zulip adapter and credentials.
+- the standalone bridge plugin is loaded by the Zulip ingress process and may
+  select only the two named destination profiles;
+- only `zulip-ingress` contains the Zulip adapter and its credentials.
+
+The bridge plugin adapts the current Hermes Zulip implementation to multiplexed
+secret scopes at registration time. It reads profile bindings through Hermes'
+`agent.secret_scope.get_secret()` while preserving explicit YAML values, and it
+does not copy profile secrets into process-global environment variables. The
+wrapper validates the upstream function and constructor shape before activation;
+an incompatible Hermes upgrade fails the plugin attestation gate. This keeps the
+change outside Hermes core while making the upgrade dependency explicit.
 
 The local `pre_gateway_dispatch` hook reads only a bounded local route snapshot.
-For a numeric stream ID explicitly marked Hermes-managed it sets
-`event.source.profile = "hermes-general"`. For a mapped project stream, missing
-entry, stale/corrupt snapshot, unsupported source, or callback error, it leaves
-the event in the restricted default profile. The hook may write only profile
-names from a fixed local allowlist.
+For a numeric stream ID explicitly marked Hermes-managed, or an unmatched stream
+under a fresh snapshot whose trusted default owner is Hermes, it sets
+`event.source.profile = "hermes-general"`. For a mapped project stream it selects
+`codex-bridge`. A missing, stale, corrupt, oversized, structurally invalid, or
+integrity-invalid snapshot is rewritten to a fixed private rejection command
+while remaining under `zulip-ingress`; it cannot acquire project identity. The
+hook may write only profile names from a fixed local allowlist.
+
+If the hook is absent or throws, the event remains in project-neutral
+`zulip-ingress`, which has no project cwd, project memory, Task Guard projection,
+MCP configuration, or model credentials. Deployment remains unhealthy until
+the live Gateway PID attests the expected plugin release, hook, and ingress
+profile. This profile boundary contains project semantics even though a
+standalone plugin cannot prevent Hermes from attempting an internal model call
+before failing for absent ingress credentials.
 
 The hook performs no network I/O, durable mutation, HCO request, or untracked
 background task. Exact command execution occurs later in an awaited async
@@ -62,7 +83,8 @@ must not be substituted for this isolation boundary.
 ## Consequences
 
 - No Hermes core source modification or fork is required.
-- Unmapped or damaged routing fails toward fewer capabilities, not more.
+- Fresh unmatched routing follows the trusted snapshot default; damaged or
+  unavailable routing returns a fixed project-neutral failure.
 - One bot credential has one poller, avoiding duplicate consumption.
 - General Hermes conversation remains available in explicitly Hermes-managed
   streams through its separate profile/session namespace.

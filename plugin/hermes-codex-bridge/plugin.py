@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import secrets
@@ -23,6 +25,10 @@ MAX_REPLAY_ENTRIES = 4_096
 CONTEXT_LIFETIME_SECONDS = 60
 PRIVATE_COMMAND = "/hermes-codex-bridge-internal"
 NLP_PRIVATE_COMMAND = "/hermes-codex-bridge-natural"
+ROUTE_UNAVAILABLE_COMMAND = "/hermes-codex-bridge-route-unavailable"
+ROUTE_UNAVAILABLE_TEXT = "项目路由暂不可用，请稍后重试。"
+PLUGIN_VERSION = "1.0.0"
+ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
 NLP_CAPABILITY_PURPOSE = "codex-nlp-dispatch"
 MAX_INSTRUCTION_BYTES = 16 * 1024
 MAX_LIST_ENTRY_BYTES = 2 * 1024
@@ -159,6 +165,56 @@ def _read_owner_file(path: str, maximum: int) -> bytes:
         return data
     finally:
         os.close(descriptor)
+
+
+def _write_process_attestation() -> None:
+    home_text = os.environ.get("HERMES_HOME", "")
+    if not os.path.isabs(home_text):
+        raise ValueError("invalid Hermes home")
+    home_info = os.lstat(home_text)
+    if (
+        not stat.S_ISDIR(home_info.st_mode)
+        or stat.S_ISLNK(home_info.st_mode)
+        or home_info.st_uid != os.getuid()
+    ):
+        raise ValueError("invalid Hermes home")
+    path = os.path.join(home_text, ATTESTATION_FILE)
+    temporary = f"{path}.tmp-{os.getpid()}-{secrets.token_urlsafe(8)}"
+    payload = {
+        "schemaVersion": 1,
+        "pid": os.getpid(),
+        "pluginVersion": PLUGIN_VERSION,
+        "pluginPath": os.path.realpath(os.path.dirname(__file__)),
+        "hook": "pre_gateway_dispatch",
+        "ingressProfile": "zulip-ingress",
+    }
+    data = _canonical_json(payload) + b"\n"
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        written = 0
+        while written < len(data):
+            count = os.write(descriptor, data[written:])
+            if count <= 0:
+                raise OSError("attestation write made no progress")
+            written += count
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+        os.chmod(path, 0o600, follow_symlinks=False)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
 
 
 def _load_registration_config() -> tuple[bytes, bytes, str, str]:
@@ -664,8 +720,144 @@ def _verify_nlp_capability(
     return payload, entry
 
 
+def _install_zulip_secret_scope_compatibility() -> None:
+    """Bridge legacy Zulip env reads to Hermes' profile secret scope."""
+    from agent.secret_scope import get_secret
+    import gateway.platforms.zulip as zulip_module
+
+    original_check = zulip_module.check_zulip_requirements
+    original_adapter = zulip_module.ZulipAdapter
+    check_patched = getattr(original_check, "_hco_secret_scope_compatible", False)
+    adapter_patched = getattr(original_adapter, "_hco_secret_scope_compatible", False)
+    if check_patched or adapter_patched:
+        if check_patched and adapter_patched:
+            return
+        raise RuntimeError("partial Zulip secret-scope compatibility patch")
+    if list(inspect.signature(original_check).parameters) != ["config"]:
+        raise RuntimeError("unsupported Zulip requirements signature")
+    if list(inspect.signature(original_adapter.__init__).parameters) != [
+        "self",
+        "config",
+    ]:
+        raise RuntimeError("unsupported Zulip adapter signature")
+
+    def secret(name: str, default: str = "") -> str:
+        value = get_secret(name, default)
+        if not isinstance(value, str):
+            raise TypeError(f"{name} must be a string")
+        return value
+
+    def scoped_check(config=None) -> bool:
+        effective = copy.copy(config) if config is not None else zulip_module.PlatformConfig()
+        effective.extra = dict(effective.extra)
+        effective.api_key = effective.token or effective.api_key or secret("ZULIP_API_KEY")
+        effective.extra["bot_email"] = (
+            effective.extra.get("bot_email") or secret("ZULIP_BOT_EMAIL")
+        )
+        effective.extra["site_url"] = (
+            effective.extra.get("site_url") or secret("ZULIP_SITE_URL")
+        )
+        return original_check(effective)
+
+    class ScopedZulipAdapter(original_adapter):
+        def __init__(self, config):
+            super().__init__(config)
+            if not isinstance(config.extra, dict):
+                raise TypeError("Zulip config.extra must be a mapping")
+
+            def setting(key: str, secret_name: str, default: str = ""):
+                if key in config.extra:
+                    return config.extra[key]
+                return secret(secret_name, default)
+
+            def string_setting(key: str, secret_name: str, default: str = "") -> str:
+                value = setting(key, secret_name, default)
+                if not isinstance(value, str):
+                    raise TypeError(f"Zulip {key} must be a string")
+                return value
+
+            def boolean_setting(key: str, secret_name: str, default: str) -> bool:
+                value = setting(key, secret_name, default)
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    normalized = value.strip().lower()
+                    if normalized in ("true", "1", "yes"):
+                        return True
+                    if normalized in ("false", "0", "no"):
+                        return False
+                raise ValueError(f"Zulip {key} must be a boolean")
+
+            self._site_url = (
+                config.extra.get("site_url", "") or secret("ZULIP_SITE_URL")
+            ).rstrip("/")
+            self._bot_email = (
+                config.extra.get("bot_email", "") or secret("ZULIP_BOT_EMAIL")
+            )
+            self._api_key = config.token or config.api_key or secret("ZULIP_API_KEY")
+            self._default_stream = (
+                config.extra.get("default_stream", "")
+                or secret("ZULIP_DEFAULT_STREAM")
+            )
+            self._home_topic = (
+                config.extra.get("home_topic", "") or secret("ZULIP_HOME_TOPIC")
+            )
+            self._cert_bundle = string_setting("cert_bundle", "ZULIP_CERT_BUNDLE")
+            self._allow_insecure = boolean_setting(
+                "allow_insecure", "ZULIP_ALLOW_INSECURE", "false"
+            )
+            self._require_mention = boolean_setting(
+                "require_mention", "ZULIP_REQUIRE_MENTION", "true"
+            )
+            free_streams_raw = setting(
+                "free_response_streams", "ZULIP_FREE_RESPONSE_STREAMS"
+            )
+            if isinstance(free_streams_raw, str):
+                free_streams = free_streams_raw.split(",")
+            elif isinstance(free_streams_raw, list) and all(
+                isinstance(stream, str) for stream in free_streams_raw
+            ):
+                free_streams = free_streams_raw
+            else:
+                raise TypeError("Zulip free_response_streams must be a string or string list")
+            self._free_response_streams = {
+                stream.strip().lower()
+                for stream in free_streams
+                if stream.strip()
+            }
+            context_depth = setting("context_depth", "ZULIP_CONTEXT_DEPTH", "0")
+            if isinstance(context_depth, bool):
+                raise TypeError("Zulip context_depth must be an integer")
+            self._context_depth = int(context_depth)
+            self._catchup_enabled = boolean_setting(
+                "catchup_enabled", "ZULIP_CATCHUP", "false"
+            )
+            try:
+                self._catchup_max_messages = max(
+                    1,
+                    int(
+                        setting(
+                            "catchup_max_messages",
+                            "ZULIP_CATCHUP_MAX_MESSAGES",
+                            str(zulip_module._CATCHUP_DEFAULT_MAX_MESSAGES),
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                self._catchup_max_messages = zulip_module._CATCHUP_DEFAULT_MAX_MESSAGES
+
+    scoped_check._hco_secret_scope_compatible = True
+    ScopedZulipAdapter._hco_secret_scope_compatible = True
+    ScopedZulipAdapter.__name__ = original_adapter.__name__
+    ScopedZulipAdapter.__qualname__ = original_adapter.__qualname__
+    ScopedZulipAdapter.__module__ = original_adapter.__module__
+    zulip_module.check_zulip_requirements = scoped_check
+    zulip_module.ZulipAdapter = ScopedZulipAdapter
+
+
 def register(ctx) -> None:
     try:
+        _install_zulip_secret_scope_compatibility()
         key, token, socket_path, snapshot_path = _load_registration_config()
     except Exception:
         return
@@ -680,10 +872,16 @@ def register(ctx) -> None:
         source = getattr(event, "source", None)
         if source is None:
             return {"action": "allow"}
-        source.profile = None
+        platform = getattr(source, "platform", None)
+        if getattr(platform, "value", platform) != "zulip":
+            return {"action": "allow"}
+        source.profile = "zulip-ingress"
         provenance = _extract_provenance(event)
         if provenance is None:
             return {"action": "allow"}
+        snapshot = load_route_snapshot(snapshot_path)
+        if snapshot is None:
+            return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
         if (
             type(getattr(event, "text", None)) is str
             and event.text.startswith(NLP_PRIVATE_COMMAND)
@@ -712,7 +910,7 @@ def register(ctx) -> None:
                 "action": "rewrite",
                 "text": f"{PRIVATE_COMMAND} {context_token}",
             }
-        route = find_route(load_route_snapshot(snapshot_path), provenance.stream_id)
+        route = find_route(snapshot, provenance.stream_id)
         if route is not None and route.owner == "HERMES":
             source.profile = "hermes-general"
         elif (
@@ -756,10 +954,17 @@ def register(ctx) -> None:
                 "action": "rewrite",
                 "text": f"{NLP_PRIVATE_COMMAND} {context_token}",
             }
+        elif route is not None and route.owner == "PROJECT":
+            source.profile = "codex-bridge"
+        elif route is None and snapshot.default_owner == "HERMES":
+            source.profile = "hermes-general"
         return {"action": "allow"}
 
     async def public_command_handler(_raw_args: str):
         return "Invalid /codex command."
+
+    async def route_unavailable_handler(_raw_args: str):
+        return ROUTE_UNAVAILABLE_TEXT
 
     async def private_command_handler(raw_args: str):
         if raw_args == "invalid":
@@ -854,3 +1059,9 @@ def register(ctx) -> None:
         natural_command_handler,
         description="Internal natural-language Codex dispatch",
     )
+    ctx.register_command(
+        "hermes-codex-bridge-route-unavailable",
+        route_unavailable_handler,
+        description="Internal unavailable-route rejection",
+    )
+    _write_process_attestation()

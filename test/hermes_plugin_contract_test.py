@@ -24,6 +24,9 @@ from gateway.session import SessionSource, build_session_key
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLUGIN_SOURCE = REPO_ROOT / "plugin" / "hermes-codex-bridge"
+ROUTE_UNAVAILABLE_COMMAND = "/hermes-codex-bridge-route-unavailable"
+ROUTE_UNAVAILABLE_TEXT = "项目路由暂不可用，请稍后重试。"
+ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -132,6 +135,7 @@ def _event(
         raw_message={"message": message} if raw_message is None else raw_message,
         source=SimpleNamespace(
             profile="attacker-profile",
+            platform="zulip",
             chat_type=chat_type,
             chat_id=f"{stream_id}:{topic}",
             chat_topic=topic,
@@ -229,8 +233,54 @@ def test_real_directory_plugin_is_discovered_and_registers_synchronously(
         "codex",
         "hermes-codex-bridge-internal",
         "hermes-codex-bridge-natural",
+        "hermes-codex-bridge-route-unavailable",
     }
     assert loaded.tools_registered == []
+
+
+def test_successful_registration_writes_owner_only_process_attestation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _installed, _snapshot_path = _install_fixture(tmp_path, monkeypatch)
+
+    manager.discover_and_load()
+
+    loaded = manager._plugins["hermes-codex-bridge"]
+    registered_plugin = Path(loaded.module.register.__globals__["__file__"]).parent.resolve()
+    attestation_path = tmp_path / "hermes-home" / ATTESTATION_FILE
+    info = attestation_path.stat()
+    attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    assert stat.S_ISREG(info.st_mode)
+    assert info.st_uid == os.getuid()
+    assert stat.S_IMODE(info.st_mode) == 0o600
+    assert attestation == {
+        "schemaVersion": 1,
+        "pid": os.getpid(),
+        "pluginVersion": "1.0.0",
+        "pluginPath": str(registered_plugin),
+        "hook": "pre_gateway_dispatch",
+        "ingressProfile": "zulip-ingress",
+    }
+
+
+def test_process_attestation_retries_short_writes(tmp_path: Path, monkeypatch) -> None:
+    manager, _installed, _snapshot_path = _install_fixture(tmp_path, monkeypatch)
+    manager.discover_and_load()
+    globals_ = _plugin_globals(manager)
+    real_write = os.write
+    writes = []
+
+    def short_write(descriptor: int, data: bytes) -> int:
+        writes.append(len(data))
+        return real_write(descriptor, data[: max(1, len(data) // 2)])
+
+    monkeypatch.setattr(globals_["os"], "write", short_write)
+    globals_["_write_process_attestation"]()
+
+    attestation_path = tmp_path / "hermes-home" / ATTESTATION_FILE
+    attestation = json.loads(attestation_path.read_text(encoding="utf-8"))
+    assert attestation["pid"] == os.getpid()
+    assert len(writes) > 1
 
 
 def test_valid_numeric_routes_select_only_explicit_hermes_profile(
@@ -251,7 +301,7 @@ def test_valid_numeric_routes_select_only_explicit_hermes_profile(
     assert _invoke(manager, hermes) == {"action": "allow"}
     assert hermes.source.profile == "hermes-general"
     assert _invoke(manager, unknown) == {"action": "allow"}
-    assert unknown.source.profile is None
+    assert unknown.source.profile == "hermes-general"
 
 
 @pytest.mark.parametrize(
@@ -262,8 +312,20 @@ def test_valid_numeric_routes_select_only_explicit_hermes_profile(
         b"{}\n",
         b"x" * 262_145,
         _snapshot([_route(43, "HERMES")], now_ms=1),
+        _snapshot([_route(43, "HERMES")]).replace(b'"generation":7', b'"generation":8'),
+        _snapshot([_route(44, "HERMES"), _route(43, "HERMES")]),
+        _snapshot([_route(43, "HERMES"), _route(43, "HERMES")]),
     ],
-    ids=["missing", "corrupt", "wrong-shape", "oversized", "stale"],
+    ids=[
+        "missing",
+        "corrupt",
+        "wrong-shape",
+        "oversized",
+        "stale",
+        "bad-integrity",
+        "out-of-order-streams",
+        "duplicate-streams",
+    ],
 )
 def test_bad_route_snapshots_keep_restricted_default(
     tmp_path: Path, monkeypatch, snapshot: bytes | None
@@ -271,8 +333,24 @@ def test_bad_route_snapshots_keep_restricted_default(
     manager, _ = _load_manager(tmp_path, monkeypatch, snapshot)
     event = _event(stream_id=43)
 
-    assert _invoke(manager, event) == {"action": "allow"}
-    assert event.source.profile is None
+    assert _invoke(manager, event) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
+    assert event.source.profile == "zulip-ingress"
+
+
+def test_bad_route_snapshot_rejects_direct_codex_commands_before_hco(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    event = _event("/codex status")
+
+    assert _invoke(manager, event) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
+    assert event.source.profile == "zulip-ingress"
 
 
 @pytest.mark.parametrize(
@@ -320,7 +398,21 @@ def test_nested_zulip_provenance_must_be_complete_typed_and_consistent(
         message[mutation] = value
 
     assert _invoke(manager, event) == {"action": "allow"}
-    assert event.source.profile is None
+    assert event.source.profile == "zulip-ingress"
+
+
+def test_non_zulip_events_are_not_reprofiled(tmp_path: Path, monkeypatch) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event()
+    event.source.platform = "feishu"
+    event.source.profile = "jarvis-root"
+
+    assert _invoke(manager, event) == {"action": "allow"}
+    assert event.source.profile == "jarvis-root"
 
 
 def test_unsafe_key_disables_all_bridge_registration(tmp_path: Path, monkeypatch) -> None:
@@ -449,7 +541,11 @@ def test_key_path_swap_disables_all_bridge_registration(
 def test_exact_public_grammar_rewrites_to_command_bound_signed_envelope(
     tmp_path: Path, monkeypatch, text: str, command: dict
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     event = _event(text)
 
     token = _token_from_rewrite(_invoke(manager, event))
@@ -493,7 +589,11 @@ def test_exact_public_grammar_rewrites_to_command_bound_signed_envelope(
 async def test_malformed_public_commands_rewrite_to_no_model_error_without_hco(
     tmp_path: Path, monkeypatch, text: str
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     calls = []
 
     async def submit(_self, event):
@@ -518,7 +618,11 @@ async def test_malformed_public_commands_rewrite_to_no_model_error_without_hco(
 async def test_private_handler_verifies_then_awaits_exact_hco_event(
     tmp_path: Path, monkeypatch
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     calls = []
 
     async def submit(_self, event):
@@ -553,7 +657,11 @@ async def test_private_handler_verifies_then_awaits_exact_hco_event(
 async def test_private_handler_rejects_tamper_expiry_replay_and_direct_invocation(
     tmp_path: Path, monkeypatch
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     calls = []
 
     async def submit(_self, event):
@@ -583,7 +691,11 @@ async def test_private_handler_rejects_tamper_expiry_replay_and_direct_invocatio
 async def test_private_handler_rejects_replay_when_active_nonce_cache_is_full(
     tmp_path: Path, monkeypatch
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     calls = []
 
     async def submit(_self, event):
@@ -618,7 +730,11 @@ async def test_private_handler_rejects_replay_when_active_nonce_cache_is_full(
 async def test_private_handler_maps_transport_and_protocol_errors_stably(
     tmp_path: Path, monkeypatch
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     globals_ = _plugin_globals(manager)
     handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
 
@@ -938,8 +1054,12 @@ def test_commands_and_non_project_events_make_zero_natural_model_calls(
     hermes = _event(stream_id=43)
     assert _invoke(manager, hermes) == {"action": "allow"}
     assert hermes.source.profile == "hermes-general"
-    assert _invoke(manager, _event(stream_id=44)) == {"action": "allow"}
-    assert _invoke(manager, _event(raw_message={})) == {"action": "allow"}
+    unknown = _event(stream_id=44)
+    assert _invoke(manager, unknown) == {"action": "allow"}
+    assert unknown.source.profile == "hermes-general"
+    invalid = _event(raw_message={})
+    assert _invoke(manager, invalid) == {"action": "allow"}
+    assert invalid.source.profile == "zulip-ingress"
     assert llm.calls == []
 
 
@@ -1072,10 +1192,38 @@ async def test_gateway_dispatch_contains_malformed_reject_reason_code_without_ag
 
 
 @pytest.mark.asyncio
+async def test_gateway_dispatch_rejects_invalid_route_authority_without_model_hco_or_agent(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, llm = _load_manager_with_llm(tmp_path, monkeypatch, _dispatch())
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    event = _adapter_event("natural request", 501)
+    event.source.profile = "zulip-ingress"
+
+    result, agent_entries = await _dispatch_through_real_gateway(manager, monkeypatch, event)
+
+    assert result == ROUTE_UNAVAILABLE_TEXT
+    assert event.source.profile == "zulip-ingress"
+    assert llm.calls == []
+    assert submissions == []
+    assert agent_entries == []
+
+
+@pytest.mark.asyncio
 async def test_idle_and_busy_exact_commands_use_zero_model_calls_and_busy_is_delayed(
     tmp_path: Path, monkeypatch
 ) -> None:
-    manager, _ = _load_manager(tmp_path, monkeypatch)
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
     calls = []
     model_calls = []
     active_started = asyncio.Event()

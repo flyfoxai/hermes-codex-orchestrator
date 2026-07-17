@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 
 import { createAcl } from "./acl.js";
 import { verifyContext } from "./contracts/envelope.js";
@@ -215,6 +216,8 @@ export function createHcoService({
   let closed = false;
   let dirty = true;
   let publishedGeneration = -1;
+  let lastPublishedElapsedMs = null;
+  const snapshotRenewAfterMs = config.snapshot.ttlMs - Math.max(RETRY_DELAY_MS, Math.floor(config.snapshot.ttlMs / 5));
 
   function resolver() {
     return createRouteResolver({ projects, runtimeRoutes: store.listRuntimeRoutes() });
@@ -262,6 +265,7 @@ export function createHcoService({
         now
       });
       publishedGeneration = generation;
+      lastPublishedElapsedMs = performance.now();
       dirty = store.readControlGeneration().generation !== generation;
       return published;
     } catch {
@@ -596,7 +600,9 @@ export function createHcoService({
     if (closed || retryTimer !== null) return;
     retryTimer = setTimeout(async () => {
       retryTimer = null;
-      if (dirty && !closed) {
+      const renewalDue = lastPublishedElapsedMs !== null &&
+        performance.now() - lastPublishedElapsedMs >= snapshotRenewAfterMs;
+      if ((dirty || renewalDue) && !closed) {
         try { await publishSnapshot(); } catch {}
       }
       scheduleRetry();

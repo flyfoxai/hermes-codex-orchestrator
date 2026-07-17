@@ -406,7 +406,7 @@ test("trusted execution registration immutably binds project and atomically prom
   });
 });
 
-function serviceFixture(t, { snapshotPublisher, turnControllerFactory } = {}) {
+function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotTtlMs = 60_000 } = {}) {
   const fixture = storeFixture(t);
   const calls = { accept: [], continue: [], cancel: [], answer: [], interaction: [], completion: [] };
   const config = Object.freeze({
@@ -418,7 +418,7 @@ function serviceFixture(t, { snapshotPublisher, turnControllerFactory } = {}) {
       socketPath: "/tmp/hco.sock",
       routeSnapshotPath: "/tmp/hco-routes.json"
     }),
-    snapshot: Object.freeze({ ttlMs: 60_000, maxBytes: 262_144 }),
+    snapshot: Object.freeze({ ttlMs: snapshotTtlMs, maxBytes: 262_144 }),
     admins: Object.freeze([1]),
     projects: Object.freeze([
       Object.freeze({
@@ -1292,6 +1292,49 @@ test("construction is inert and start retries a failed initial snapshot publicat
 
   await new Promise((resolve) => setTimeout(resolve, 1_150));
   assert.equal(attempts, 2);
+  await fixture.service.close();
+});
+
+test("start renews unchanged route snapshots before their configured TTL expires", async (t) => {
+  const publications = [];
+  const fixture = serviceFixture(t, {
+    snapshotTtlMs: 5_000,
+    snapshotPublisher(options) {
+      publications.push({ generation: options.generation, at: Date.now() });
+      return { generation: options.generation };
+    }
+  });
+
+  await fixture.service.start();
+  assert.equal(publications.length, 1);
+  const initialGeneration = publications[0].generation;
+  await new Promise((resolve) => setTimeout(resolve, 4_200));
+  assert.ok(publications.length >= 2, "an unchanged snapshot must renew before its five-second TTL");
+  assert.ok(publications.every(({ generation }) => generation === initialGeneration));
+
+  await fixture.service.close();
+  const afterClose = publications.length;
+  await new Promise((resolve) => setTimeout(resolve, 1_100));
+  assert.equal(publications.length, afterClose);
+});
+
+test("snapshot renewal is not delayed when the wall clock moves backward", async (t) => {
+  let publications = 0;
+  const fixture = serviceFixture(t, {
+    snapshotTtlMs: 5_000,
+    snapshotPublisher(options) {
+      publications += 1;
+      return { generation: options.generation };
+    }
+  });
+  const originalDateNow = Date.now;
+  t.after(() => { Date.now = originalDateNow; });
+
+  await fixture.service.start();
+  assert.equal(publications, 1);
+  Date.now = () => originalDateNow() - 60_000;
+  await new Promise((resolve) => setTimeout(resolve, 4_200));
+  assert.ok(publications >= 2, "snapshot renewal must use elapsed time rather than wall-clock time");
   await fixture.service.close();
 });
 

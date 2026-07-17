@@ -32,6 +32,12 @@ class Route:
         return "AUTO"
 
 
+@dataclass(frozen=True)
+class RouteSnapshot:
+    default_owner: str
+    routes: tuple[Route, ...]
+
+
 def _safe_nonnegative(value: object) -> bool:
     return type(value) is int and 0 <= value <= MAX_SAFE_INTEGER
 
@@ -50,7 +56,7 @@ def _canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
-def load_route_snapshot(path: str, *, now_ms: int | None = None) -> tuple[Route, ...] | None:
+def load_route_snapshot(path: str, *, now_ms: int | None = None) -> RouteSnapshot | None:
     try:
         info = os.lstat(path)
         if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
@@ -163,13 +169,13 @@ def load_route_snapshot(path: str, *, now_ms: int | None = None) -> tuple[Route,
         )
     if total_topics > MAX_TOPICS:
         return None
-    return tuple(parsed)
+    return RouteSnapshot(snapshot["defaultOwner"], tuple(parsed))
 
 
-def find_route(routes: tuple[Route, ...] | None, stream_id: int) -> Route | None:
-    if routes is None:
+def find_route(snapshot: RouteSnapshot | None, stream_id: int) -> Route | None:
+    if snapshot is None:
         return None
-    for route in routes:
+    for route in snapshot.routes:
         if route.stream_id == stream_id:
             return route
         if route.stream_id > stream_id:

@@ -18,9 +18,11 @@ but it is too mutable and too broad to be the permanent Codex context identity.
 ### Channel ownership
 
 The numeric Zulip stream ID is the only authoritative route key. A stream is a
-project channel only when that ID maps to a registered `projectId`. Every
-unmapped or explicitly generic stream, and every topic inside it, is managed by
-the `hermes-general` profile and has no project cwd.
+project channel only when that ID maps to a registered `projectId`. An
+explicitly generic stream, and an unmatched stream only when a fresh,
+integrity-checked snapshot authorizes the Hermes default, is managed by the
+`hermes-general` profile and has no project cwd. An unavailable or invalid
+snapshot is not an unmatched route and must fail closed in `zulip-ingress`.
 
 A stream name is display metadata and may be used once as a migration alias.
 Migration occurs only after an authenticated real Zulip event supplies the

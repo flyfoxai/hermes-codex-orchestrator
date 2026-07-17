@@ -151,11 +151,13 @@ import configparser
 import copy
 import fcntl
 import hashlib
+import io
 import json
 import os
 import plistlib
 import pwd
 import queue
+import re
 import shutil
 import signal
 import stat
@@ -169,12 +171,16 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv.parser import parse_stream
 
 
 PLUGIN_NAME = "hermes-codex-bridge"
 PLUGIN_VERSION = "1.0.0"
 HCO_LABEL = "com.hermes.codex-bridge-hco"
 DELIVERY_LABEL = "com.hermes.codex-bridge-delivery"
+GATEWAY_LABEL = "ai.hermes.gateway"
+ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
+GATEWAY_STATE_FILE = "gateway_state.json"
 MAX_CONFIG_BYTES = 262_144
 MAX_SECRET_BYTES = 4_096
 RESTRICTED_TOOLSETS: list[str] = ["zulip-history"]
@@ -182,6 +188,8 @@ HERMES_CHECKOUT = Path("/Users/hula/Projects/hermesAgent")
 HERMES_PROJECT_ENV = Path("/Users/hula/Projects/hermesAgent/.env")
 GENERAL_TOOLSETS = ["hermes-zulip"]
 RESTRICTED_DISABLED_TOOLSETS = ["context_engine", "kanban", "zulip-history"]
+OWNED_PROFILE_NAMES = frozenset({"zulip-ingress", "codex-bridge", "hermes-general"})
+INGRESS_REMINDER = b"""# Zulip Ingress\n\nThis profile is project-neutral. It only receives Zulip events and lets the Codex routing hook choose an explicit project profile. A numeric Zulip stream ID plus a fresh, integrity-checked HCO route snapshot are the only project-routing authority. A channel name, topic, message text, cwd, memory, or model inference must never choose or change a project. Never infer a project, workspace, memory, credential, or task context from the default Hermes profile.\n"""
 
 
 class InstallError(RuntimeError):
@@ -205,8 +213,18 @@ class Snapshot:
 
 @dataclass(frozen=True)
 class ServiceState:
+    domain: str
     loaded: bool
     running: bool
+    pid: int | None
+
+
+@dataclass(frozen=True)
+class ExternalProfile:
+    name: str
+    home: Path
+    config_path: Path
+    env_path: Path
 
 
 (
@@ -232,7 +250,8 @@ launchctl_bin = Path(launchctl_text)
 authorize_context_depth_zero = authorize_text == "true"
 python_bin = Path(sys.executable)
 uid = os.getuid()
-launch_domain = f"gui/{uid}"
+bridge_launch_domain = f"gui/{uid}"
+gateway_launch_domains = (f"user/{uid}", f"gui/{uid}")
 
 
 def diagnostic(message: str) -> None:
@@ -317,7 +336,7 @@ def parse_hco_config() -> tuple[dict[str, Any], bytes]:
     return document, bearer
 
 
-def validate_zulip_config() -> None:
+def zulip_config_credentials() -> dict[str, str]:
     raw = read_owner_file(zulip_config_path, MAX_CONFIG_BYTES, "Zulip config")
     parser = configparser.ConfigParser(interpolation=None)
     try:
@@ -329,6 +348,11 @@ def validate_zulip_config() -> None:
     for key in ("email", "key", "site"):
         if not parser.get("api", key, fallback="").strip():
             raise InstallError(f"Zulip config requires api.{key}")
+    return {
+        "ZULIP_BOT_EMAIL": parser.get("api", "email").strip(),
+        "ZULIP_API_KEY": parser.get("api", "key").strip(),
+        "ZULIP_SITE_URL": parser.get("api", "site").strip(),
+    }
 
 
 def check_bridge_compatibility(document: dict[str, Any], bearer: bytes) -> None:
@@ -478,7 +502,7 @@ def app_server_gate(document: dict[str, Any]) -> None:
     diagnostic("installed Codex App Server compatibility: passed")
 
 
-def resolve_hermes_paths() -> tuple[Path, Path, Path]:
+def resolve_hermes_paths() -> tuple[Path, Path, Path, Path]:
     old_path = list(sys.path)
     hermes_checkout = Path("/Users/hula/Projects/hermesAgent")
     sys.path.insert(0, str(hermes_checkout))
@@ -489,11 +513,19 @@ def resolve_hermes_paths() -> tuple[Path, Path, Path]:
         root = get_default_hermes_root()
         if root != get_hermes_home():
             raise ValueError("installer must run against the default Hermes profile")
+        ingress_home = get_profile_dir("zulip-ingress")
         bridge_home = get_profile_dir("codex-bridge")
         general_home = get_profile_dir("hermes-general")
-        if len({root.resolve(), bridge_home.resolve(), general_home.resolve()}) != 3:
+        if len(
+            {
+                root.resolve(),
+                ingress_home.resolve(),
+                bridge_home.resolve(),
+                general_home.resolve(),
+            }
+        ) != 4:
             raise ValueError("Hermes profile homes are not distinct")
-        return root, bridge_home, general_home
+        return root, ingress_home, bridge_home, general_home
     except Exception as error:
         fail("installed Hermes compatibility", error)
     finally:
@@ -618,19 +650,63 @@ def effective_context_depth(root_env: Path) -> str | None:
         remove_path(workspace)
 
 
+def encode_dotenv_value(value: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_./,:@%+-]*", value):
+        return value
+    escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+    return f"'{escaped}'"
+
+
 def update_env(data: bytes | None, values: dict[str, str]) -> bytes:
-    text = (data or b"").decode("utf-8")
+    try:
+        text = (data or b"").decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise InstallError("Hermes .env cannot be parsed safely") from error
     managed = set(values)
     kept: list[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        name = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
-        if name not in managed:
-            kept.append(line)
-    if kept and kept[-1] != "":
-        kept.append("")
-    kept.extend(f"{name}={value}" for name, value in values.items())
-    return ("\n".join(kept) + "\n").encode("utf-8")
+    for binding in parse_stream(io.StringIO(text)):
+        if binding.error:
+            raise InstallError("Hermes .env cannot be parsed safely")
+        if binding.key not in managed:
+            kept.append(binding.original.string)
+    prefix = "".join(kept)
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix and not prefix.endswith("\n\n"):
+        prefix += "\n"
+    assignments = "".join(
+        f"{name}={encode_dotenv_value(value)}\n"
+        for name, value in values.items()
+    )
+    return (prefix + assignments).encode("utf-8")
+
+
+def dotenv_values(data: bytes | None) -> dict[str, str]:
+    try:
+        text = (data or b"").decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise InstallError("Hermes .env cannot be parsed safely") from error
+    result: dict[str, str] = {}
+    for binding in parse_stream(io.StringIO(text)):
+        if binding.error:
+            raise InstallError("Hermes .env cannot be parsed safely")
+        if binding.key is not None and binding.value is not None:
+            result[binding.key] = binding.value
+    return result
+
+
+def remove_env_prefix(data: bytes | None, prefix: str) -> bytes:
+    try:
+        text = (data or b"").decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise InstallError("Hermes .env cannot be parsed safely") from error
+    kept: list[str] = []
+    for binding in parse_stream(io.StringIO(text)):
+        if binding.error:
+            raise InstallError("Hermes .env cannot be parsed safely")
+        if binding.key is None or not binding.key.startswith(prefix):
+            kept.append(binding.original.string)
+    return "".join(kept).encode("utf-8")
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -746,15 +822,135 @@ def root_config(
     # The installed gateway loader currently resolves the top-level form while
     # the operator-facing config contract also records the nested gateway form.
     result["multiplex_profiles"] = True
-    result.setdefault("platform_toolsets", {})["zulip"] = list(RESTRICTED_TOOLSETS)
-    result.setdefault("known_plugin_toolsets", {})["zulip"] = managed_known_plugin_toolsets(
+    platforms = result.setdefault("platforms", {})
+    if type(platforms) is not dict:
+        raise InstallError("root platforms config must be a mapping")
+    zulip = platforms.setdefault("zulip", {})
+    if type(zulip) is not dict:
+        raise InstallError("root platforms.zulip config must be a mapping")
+    zulip["enabled"] = False
+    return result
+
+
+def merge_mapping(
+    existing: dict[str, Any], override: dict[str, Any]
+) -> dict[str, Any]:
+    result = copy.deepcopy(existing)
+    for key, value in override.items():
+        current = result.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            result[key] = merge_mapping(current, value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
+def zulip_adapter_config(config: dict[str, Any], source: str) -> dict[str, Any]:
+    platforms = config.get("platforms", {})
+    if not isinstance(platforms, dict):
+        raise InstallError(f"{source} platforms config must be a mapping")
+    zulip = platforms.get("zulip", {})
+    if not isinstance(zulip, dict):
+        raise InstallError(f"{source} platforms.zulip config must be a mapping")
+    return zulip
+
+
+def discover_external_profiles(profiles_dir: Path) -> list[ExternalProfile]:
+    if not profiles_dir.exists():
+        return []
+    result: list[ExternalProfile] = []
+    for home in sorted(profiles_dir.iterdir(), key=lambda path: path.name):
+        if home.name in OWNED_PROFILE_NAMES:
+            continue
+        info = home.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise InstallError(f"external profile directory must not be a symlink: {home.name}")
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        if info.st_uid != uid:
+            raise InstallError(f"external profile directory must be owned by the invoking user: {home.name}")
+        config_path = home / "config.yaml"
+        if not config_path.exists():
+            continue
+        validate_mutable_path(
+            config_path,
+            f"external profile config ({home.name})",
+            directory=False,
+        )
+        env_path = home / ".env"
+        validate_mutable_path(
+            env_path,
+            f"external profile dotenv ({home.name})",
+            directory=False,
+        )
+        result.append(ExternalProfile(home.name, home, config_path, env_path))
+    return result
+
+
+def configured_profile_zulip_key(
+    zulip: dict[str, Any], env_data: bytes | None, profile_name: str
+) -> str | None:
+    for field in ("token", "api_key"):
+        value = zulip.get(field)
+        if value is None or value == "":
+            continue
+        if type(value) is not str:
+            raise InstallError(
+                f"external profile platforms.zulip.{field} must be a string: {profile_name}"
+            )
+        return value
+    return dotenv_values(env_data).get("ZULIP_API_KEY")
+
+
+def external_profile_layout(
+    profiles: list[ExternalProfile], ingress_api_key: str
+) -> tuple[dict[str, tuple[bytes, bytes | None]], dict[Path, bytes]]:
+    staged: dict[str, tuple[bytes, bytes | None]] = {}
+    updates: dict[Path, bytes] = {}
+    for profile in profiles:
+        original_config = profile.config_path.read_bytes()
+        env_data = profile.env_path.read_bytes() if profile.env_path.exists() else None
+        config = load_yaml(profile.config_path)
+        zulip = zulip_adapter_config(config, f"external profile ({profile.name})")
+        config_data = original_config
+        if (
+            zulip.get("enabled") is True
+            and ingress_api_key
+            and configured_profile_zulip_key(zulip, env_data, profile.name)
+            == ingress_api_key
+        ):
+            updated = copy.deepcopy(config)
+            updated["platforms"]["zulip"]["enabled"] = False
+            config_data = yaml.safe_dump(updated, sort_keys=False).encode()
+            updates[profile.config_path] = config_data
+        staged[profile.name] = (config_data, env_data)
+    return staged, updates
+
+
+def ingress_config(
+    root: dict[str, Any],
+    existing: dict[str, Any],
+    installed_plugin_toolsets: set[str],
+) -> dict[str, Any]:
+    zulip = merge_mapping(
+        zulip_adapter_config(root, "root"),
+        zulip_adapter_config(existing, "zulip-ingress"),
+    )
+    zulip["enabled"] = True
+    extra = zulip.setdefault("extra", {})
+    if not isinstance(extra, dict):
+        raise InstallError("zulip-ingress platforms.zulip.extra config must be a mapping")
+    extra["context_depth"] = 0
+    result: dict[str, Any] = {
+        "platforms": {"zulip": zulip},
+        "platform_toolsets": {"zulip": list(RESTRICTED_TOOLSETS)},
+        "known_plugin_toolsets": {"zulip": []},
+        "agent": {"disabled_toolsets": list(RESTRICTED_DISABLED_TOOLSETS)},
+        "mcp_servers": {},
+    }
+    result["known_plugin_toolsets"]["zulip"] = managed_known_plugin_toolsets(
         result, installed_plugin_toolsets
     )
-    disabled = result.setdefault("agent", {}).setdefault("disabled_toolsets", [])
-    if not isinstance(disabled, list):
-        raise InstallError("root agent.disabled_toolsets must be a list")
-    disabled.extend(item for item in RESTRICTED_DISABLED_TOOLSETS if item not in disabled)
-    disable_mcp_servers(result)
     return result
 
 
@@ -762,6 +958,7 @@ def restricted_config(
     existing: dict[str, Any], installed_plugin_toolsets: set[str]
 ) -> dict[str, Any]:
     result = copy.deepcopy(existing)
+    result.setdefault("platforms", {}).setdefault("zulip", {})["enabled"] = False
     result.setdefault("platform_toolsets", {})["zulip"] = list(RESTRICTED_TOOLSETS)
     result.setdefault("known_plugin_toolsets", {})["zulip"] = managed_known_plugin_toolsets(
         result, installed_plugin_toolsets
@@ -776,6 +973,7 @@ def restricted_config(
 
 def general_config(existing: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(existing)
+    result.setdefault("platforms", {}).setdefault("zulip", {})["enabled"] = False
     platform = result.setdefault("platform_toolsets", {})
     if not isinstance(platform.get("zulip"), list) or not platform["zulip"]:
         platform["zulip"] = list(GENERAL_TOOLSETS)
@@ -924,33 +1122,278 @@ def launchctl(*arguments: str, check: bool = True) -> subprocess.CompletedProces
     )
 
 
-def service_state(label: str) -> ServiceState:
-    result = launchctl("print", f"{launch_domain}/{label}", check=False)
+def service_state(domain: str, label: str) -> ServiceState:
+    result = launchctl("print", f"{domain}/{label}", check=False)
     if result.returncode != 0:
-        return ServiceState(False, False)
+        return ServiceState(domain, False, False, None)
     running = any(
         line.strip() == "state = running"
         for line in result.stdout.splitlines()
     )
-    return ServiceState(True, running)
+    pid_matches = re.findall(r"^\s*pid\s*=\s*([1-9][0-9]*)\s*$", result.stdout, re.MULTILINE)
+    pid = int(pid_matches[-1]) if pid_matches else None
+    return ServiceState(domain, True, running, pid)
 
 
-def wait_service_state(label: str, expected: ServiceState, timeout: float = 8.0) -> None:
+def wait_service_state(
+    domain: str,
+    label: str,
+    expected: ServiceState,
+    timeout: float = 8.0,
+) -> ServiceState:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if service_state(label) == expected:
-            return
+        actual = service_state(domain, label)
+        if (
+            actual.domain == expected.domain
+            and actual.loaded == expected.loaded
+            and actual.running == expected.running
+        ):
+            return actual
         time.sleep(0.1)
     raise InstallError(f"service state did not settle for {label}")
 
 
 def bootout(label: str) -> None:
-    launchctl("bootout", f"{launch_domain}/{label}", check=False)
+    launchctl("bootout", f"{bridge_launch_domain}/{label}", check=False)
 
 
 def bootstrap(path: Path) -> None:
     argument = f"{launch_agents_text.rstrip('/')}/{path.name}"
-    launchctl("bootstrap", launch_domain, argument)
+    launchctl("bootstrap", bridge_launch_domain, argument)
+
+
+def discover_gateway() -> ServiceState:
+    loaded = [
+        state
+        for state in (
+            service_state(domain, GATEWAY_LABEL)
+            for domain in gateway_launch_domains
+        )
+        if state.loaded
+    ]
+    if len(loaded) > 1:
+        raise InstallError("Hermes Gateway is loaded in multiple launch domains")
+    if not loaded:
+        raise InstallError("exactly one loaded Hermes Gateway is required")
+    gateway = loaded[0]
+    if not gateway.running:
+        raise InstallError("Hermes Gateway is loaded but not running")
+    if gateway.pid is None:
+        raise InstallError("running Hermes Gateway did not expose a valid launchd PID")
+    return gateway
+
+
+def read_gateway_state(path: Path) -> dict[str, Any]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, flags)
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != uid
+            or info.st_size < 1
+            or info.st_size > MAX_CONFIG_BYTES
+        ):
+            raise InstallError("Gateway runtime state must be an invoking-user regular file")
+        raw = os.read(descriptor, MAX_CONFIG_BYTES + 1)
+    except OSError as error:
+        raise InstallError("Gateway runtime state cannot be read safely") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstallError("Gateway runtime state is not valid JSON") from error
+    if type(value) is not dict:
+        raise InstallError("Gateway runtime state must be a JSON object")
+    return value
+
+
+def validate_gateway_runtime_evidence(
+    gateway: ServiceState,
+    gateway_state_path: Path,
+    required_profiles: set[str],
+    required_platforms: set[str],
+) -> dict[str, Any]:
+    if not gateway.loaded or not gateway.running or gateway.pid is None:
+        raise InstallError("Hermes Gateway did not remain loaded and running")
+    state = read_gateway_state(gateway_state_path)
+    if state.get("pid") != gateway.pid or state.get("gateway_state") != "running":
+        raise InstallError("Gateway runtime state does not match the new launchd PID")
+    served_profiles = state.get("served_profiles")
+    if (
+        type(served_profiles) is not list
+        or any(type(item) is not str for item in served_profiles)
+        or not required_profiles.issubset(set(served_profiles))
+    ):
+        raise InstallError("Gateway runtime state is missing required served profiles")
+    platforms = state.get("platforms")
+    if type(platforms) is not dict or any(
+        type(platforms.get(name)) is not dict
+        or platforms[name].get("state") != "connected"
+        for name in required_platforms
+    ):
+        raise InstallError("Gateway runtime state is missing required connected platforms")
+    return state
+
+
+def capture_gateway_runtime_requirements(
+    gateway: ServiceState,
+    gateway_state_path: Path,
+) -> tuple[set[str], set[str]]:
+    state = read_gateway_state(gateway_state_path)
+    served_profiles = state.get("served_profiles")
+    platforms = state.get("platforms")
+    if (
+        state.get("pid") != gateway.pid
+        or state.get("gateway_state") != "running"
+        or type(served_profiles) is not list
+        or any(type(item) is not str for item in served_profiles)
+        or type(platforms) is not dict
+        or any(type(name) is not str or type(value) is not dict for name, value in platforms.items())
+    ):
+        raise InstallError(
+            "Gateway runtime state cannot establish a trustworthy preservation baseline"
+        )
+    connected_platforms = {
+        name
+        for name, value in platforms.items()
+        if value.get("state") == "connected"
+    }
+    return set(served_profiles), connected_platforms
+
+
+def validate_gateway_evidence(
+    gateway: ServiceState,
+    gateway_state_path: Path,
+    attestation_path: Path,
+    expected_release: Path,
+    expected_plugin_version: str | None,
+    required_profiles: set[str],
+    required_platforms: set[str],
+) -> str:
+    validate_gateway_runtime_evidence(
+        gateway,
+        gateway_state_path,
+        required_profiles,
+        required_platforms,
+    )
+
+    return validate_gateway_attestation(
+        gateway,
+        attestation_path,
+        expected_release,
+        expected_plugin_version,
+    )
+
+
+def validate_gateway_attestation(
+    gateway: ServiceState,
+    attestation_path: Path,
+    expected_release: Path,
+    expected_plugin_version: str | None,
+) -> str:
+    if not gateway.loaded or not gateway.running or gateway.pid is None:
+        raise InstallError("Hermes Gateway did not remain loaded and running")
+
+    raw_attestation = read_owner_file(
+        attestation_path,
+        MAX_CONFIG_BYTES,
+        "Hermes Codex bridge attestation",
+    )
+    try:
+        attestation = json.loads(raw_attestation.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise InstallError("Hermes Codex bridge attestation is not valid JSON") from error
+    if type(attestation) is not dict:
+        raise InstallError("Hermes Codex bridge attestation must be a JSON object")
+    plugin_path = attestation.get("pluginPath")
+    plugin_version = attestation.get("pluginVersion")
+    try:
+        resolved_plugin = Path(plugin_path).resolve(strict=True) if type(plugin_path) is str else None
+    except OSError as error:
+        raise InstallError("Hermes Codex bridge attestation pluginPath is invalid") from error
+    if (
+        attestation.get("schemaVersion") != 1
+        or attestation.get("pid") != gateway.pid
+        or type(plugin_version) is not str
+        or not plugin_version
+        or len(plugin_version.encode("utf-8")) > 128
+        or (
+            expected_plugin_version is not None
+            and plugin_version != expected_plugin_version
+        )
+        or resolved_plugin != expected_release.resolve(strict=True)
+        or attestation.get("hook") != "pre_gateway_dispatch"
+        or attestation.get("ingressProfile") != "zulip-ingress"
+    ):
+        raise InstallError("Hermes Codex bridge attestation does not match the activated release")
+    return plugin_version
+
+
+def wait_gateway_evidence(
+    domain: str,
+    old_pid: int,
+    gateway_state_path: Path,
+    attestation_path: Path,
+    expected_release: Path,
+    expected_plugin_version: str,
+    required_profiles: set[str],
+    required_platforms: set[str],
+    timeout: float = 20.0,
+) -> ServiceState:
+    deadline = time.monotonic() + timeout
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        gateway = service_state(domain, GATEWAY_LABEL)
+        if gateway.loaded and gateway.running and gateway.pid is not None and gateway.pid != old_pid:
+            try:
+                validate_gateway_evidence(
+                    gateway,
+                    gateway_state_path,
+                    attestation_path,
+                    expected_release,
+                    expected_plugin_version,
+                    required_profiles,
+                    required_platforms,
+                )
+                return gateway
+            except InstallError as error:
+                last_error = error
+        time.sleep(0.1)
+    detail = f": {last_error}" if last_error is not None else ""
+    raise InstallError(f"Hermes Gateway activation evidence did not settle{detail}")
+
+
+def wait_gateway_runtime_evidence(
+    domain: str,
+    old_pid: int,
+    gateway_state_path: Path,
+    required_profiles: set[str],
+    required_platforms: set[str],
+    timeout: float = 20.0,
+) -> ServiceState:
+    deadline = time.monotonic() + timeout
+    last_error: BaseException | None = None
+    while time.monotonic() < deadline:
+        gateway = service_state(domain, GATEWAY_LABEL)
+        if gateway.loaded and gateway.running and gateway.pid is not None and gateway.pid != old_pid:
+            try:
+                validate_gateway_runtime_evidence(
+                    gateway,
+                    gateway_state_path,
+                    required_profiles,
+                    required_platforms,
+                )
+                return gateway
+            except InstallError as error:
+                last_error = error
+        time.sleep(0.1)
+    detail = f": {last_error}" if last_error is not None else ""
+    raise InstallError(f"Hermes Gateway rollback evidence did not settle{detail}")
 
 
 def initial_bridge_gate(
@@ -1226,8 +1669,9 @@ import sys
 import time
 from pathlib import Path
 
-mode, root_text, bridge_text, general_text, hco_config_text, project_env_text = sys.argv[1:]
+mode, root_text, ingress_text, bridge_text, general_text, hco_config_text, project_env_text = sys.argv[1:]
 root = Path(root_text)
+ingress_home = Path(ingress_text)
 bridge_home = Path(bridge_text)
 general_home = Path(general_text)
 project_env = Path(project_env_text)
@@ -1251,12 +1695,13 @@ if root / ".env" not in loaded_env:
     raise ValueError("effective Hermes dotenv was not loaded")
 if os.environ.get("HCO_CONFIG_PATH") != hco_config_text:
     raise ValueError("effective HCO config path does not match the staged configuration")
-if os.environ.get("ZULIP_CONTEXT_DEPTH") not in (None, "0"):
-    raise ValueError("effective Zulip context depth is not zero")
-
 if get_default_hermes_root() != root or get_hermes_home() != root:
     raise ValueError("effective default Hermes home resolution changed")
-if get_profile_dir("codex-bridge") != bridge_home or get_profile_dir("hermes-general") != general_home:
+if (
+    get_profile_dir("zulip-ingress") != ingress_home
+    or get_profile_dir("codex-bridge") != bridge_home
+    or get_profile_dir("hermes-general") != general_home
+):
     raise ValueError("effective named Hermes home resolution changed")
 
 if mode == "general-disabled":
@@ -1273,7 +1718,11 @@ if mode == "general-disabled":
     raise SystemExit(0)
 
 from gateway.config import Platform, PlatformConfig, load_gateway_config
-from gateway.platforms.zulip import ZulipAdapter
+from gateway.run import (
+    _profile_runtime_scope,
+    _without_secondary_profile_platform_env,
+)
+import gateway.platforms.zulip as zulip_module
 
 gateway = load_gateway_config()
 if gateway.multiplex_profiles is not True:
@@ -1291,6 +1740,7 @@ required_commands = {
     "codex",
     "hermes-codex-bridge-internal",
     "hermes-codex-bridge-natural",
+    "hermes-codex-bridge-route-unavailable",
 }
 if not required_commands.issubset(manager._plugin_commands):
     raise ValueError("bridge private commands are missing")
@@ -1326,7 +1776,8 @@ def event_for(text):
         "Source",
         (),
         {
-            "profile": None,
+            "platform": Platform.ZULIP,
+            "profile": "zulip-ingress",
             "chat_type": "stream",
             "chat_id": "1:canary",
             "chat_topic": "canary",
@@ -1335,11 +1786,11 @@ def event_for(text):
     )()
     return event
 
-def require_restricted_default():
-    os.environ["HERMES_HOME"] = str(root)
+def require_restricted_ingress():
+    os.environ["HERMES_HOME"] = str(ingress_home)
     tools = _get_platform_tools(load_config(), "zulip")
     if tools:
-        raise ValueError("default profile is not restricted")
+        raise ValueError("zulip-ingress profile is not restricted")
 
 bridge_callback = callbacks[bridge_index]
 def invoke_bridge_fixture(event):
@@ -1368,27 +1819,29 @@ def invoke_bridge_fixture(event):
 route_path.unlink(missing_ok=True)
 missing_event = event_for("natural request")
 missing_results = invoke_bridge_fixture(missing_event)
-if missing_event.source.profile is not None or not any(
+if missing_event.source.profile != "zulip-ingress" or not any(
     isinstance(result, dict)
-    and result.get("action") == "allow"
+    and result.get("action") == "rewrite"
+    and result.get("text") == "/hermes-codex-bridge-route-unavailable"
     and result.get("_hco_probe_bridge") is True
     for result in missing_results
 ):
     raise ValueError("missing route snapshot did not fail closed")
-require_restricted_default()
+require_restricted_ingress()
 
 route_path.write_bytes(b"{malformed")
 os.chmod(route_path, 0o600)
 malformed_event = event_for("natural request")
 malformed_results = invoke_bridge_fixture(malformed_event)
-if malformed_event.source.profile is not None or not any(
+if malformed_event.source.profile != "zulip-ingress" or not any(
     isinstance(result, dict)
-    and result.get("action") == "allow"
+    and result.get("action") == "rewrite"
+    and result.get("text") == "/hermes-codex-bridge-route-unavailable"
     and result.get("_hco_probe_bridge") is True
     for result in malformed_results
 ):
     raise ValueError("malformed route snapshot did not fail closed")
-require_restricted_default()
+require_restricted_ingress()
 
 generated_at_ms = int(time.time() * 1000)
 route_payload = {
@@ -1441,7 +1894,7 @@ if (
     or routed_event.source.profile != "codex-bridge"
 ):
     raise ValueError("valid PROJECT route did not produce the bridge rewrite")
-require_restricted_default()
+require_restricted_ingress()
 
 def raising_bridge_callback(**_kwargs):
     raise RuntimeError("bridge hook failure fixture")
@@ -1450,9 +1903,9 @@ callbacks[bridge_index] = raising_bridge_callback
 try:
     failed_event = event_for("natural request")
     manager.invoke_hook("pre_gateway_dispatch", event=failed_event)
-    if failed_event.source.profile is not None:
-        raise ValueError("bridge hook exception changed the default profile")
-    require_restricted_default()
+    if failed_event.source.profile != "zulip-ingress":
+        raise ValueError("bridge hook exception escaped the ingress profile")
+    require_restricted_ingress()
 finally:
     callbacks[bridge_index] = bridge_callback
 
@@ -1460,14 +1913,45 @@ os.environ["HERMES_HOME"] = str(bridge_home)
 if _get_platform_tools(load_config(), "zulip"):
     raise ValueError("codex-bridge profile is not restricted")
 os.environ["HERMES_HOME"] = str(root)
-platform_config = gateway.platforms.get(Platform.ZULIP, PlatformConfig())
-if ZulipAdapter(platform_config)._context_depth != 0:
-    raise ValueError("Zulip adapter context depth is not zero")
+root_platform = gateway.platforms.get(Platform.ZULIP, PlatformConfig())
+if root_platform.enabled:
+    raise ValueError("default profile still owns Zulip polling")
+conflicting_zulip_env = {
+    "ZULIP_API_KEY": "hco-probe-wrong-global-key",
+    "ZULIP_BOT_EMAIL": "hco-probe-wrong-global@example.invalid",
+    "ZULIP_SITE_URL": "https://hco-probe-wrong-global.example.invalid",
+    "ZULIP_REQUIRE_MENTION": "false",
+    "ZULIP_FREE_RESPONSE_STREAMS": "hco-probe-wrong-global-stream",
+    "ZULIP_CONTEXT_DEPTH": "999",
+}
+os.environ.update(conflicting_zulip_env)
+with _without_secondary_profile_platform_env(), _profile_runtime_scope(ingress_home):
+    if any(name in os.environ for name in conflicting_zulip_env):
+        raise ValueError("secondary-profile Zulip environment was not isolated")
+    ingress_gateway = load_gateway_config()
+    platform_config = ingress_gateway.platforms.get(Platform.ZULIP, PlatformConfig())
+    if not platform_config.enabled:
+        raise ValueError("zulip-ingress does not own Zulip polling")
+    if not zulip_module.check_zulip_requirements(platform_config):
+        raise ValueError("zulip-ingress scoped requirements are unavailable")
+    adapter = zulip_module.ZulipAdapter(platform_config)
+    if not adapter._api_key or adapter._api_key == conflicting_zulip_env["ZULIP_API_KEY"]:
+        raise ValueError("Zulip adapter did not use the ingress API key")
+    if adapter._context_depth != 0:
+        raise ValueError("Zulip adapter context depth is not zero")
+    if "hco-probe-wrong-global-stream" in adapter._free_response_streams:
+        raise ValueError("Zulip adapter used process-global stream settings")
+if {
+    name: os.environ.get(name)
+    for name in conflicting_zulip_env
+} != conflicting_zulip_env:
+    raise ValueError("Zulip profile scope leaked process environment changes")
 '''
 
 
 def effective_hermes_probe(
     root: Path,
+    ingress_home: Path,
     bridge_home: Path,
     general_home: Path,
     document: dict[str, Any],
@@ -1491,6 +1975,7 @@ def effective_hermes_probe(
             json.dumps(probe_document, separators=(",", ":")).encode("utf-8"),
         )
         probe_root = workspace / "hermes-home"
+        probe_ingress_home = probe_root / "profiles" / "zulip-ingress"
         probe_bridge_home = probe_root / "profiles" / "codex-bridge"
         probe_general_home = probe_root / "profiles" / "hermes-general"
         probe_project_env = workspace / "project.env"
@@ -1503,6 +1988,18 @@ def effective_hermes_probe(
                 (root / ".env").read_bytes(),
                 {"HCO_CONFIG_PATH": str(probe_config)},
             ),
+        )
+        atomic_write(
+            probe_ingress_home / "config.yaml",
+            (ingress_home / "config.yaml").read_bytes(),
+        )
+        atomic_write(
+            probe_ingress_home / ".env",
+            (ingress_home / ".env").read_bytes(),
+        )
+        atomic_write(
+            probe_ingress_home / "SOUL.md",
+            (ingress_home / "SOUL.md").read_bytes(),
         )
         atomic_write(
             probe_bridge_home / "config.yaml",
@@ -1533,6 +2030,7 @@ def effective_hermes_probe(
                     EFFECTIVE_HERMES_PROBE_PROGRAM,
                     mode,
                     str(probe_root),
+                    str(probe_ingress_home),
                     str(probe_bridge_home),
                     str(probe_general_home),
                     str(probe_config),
@@ -1547,7 +2045,7 @@ def effective_hermes_probe(
             )
             if result.returncode != 0:
                 raise CompatibilityError(
-                    f"{phase} effective Hermes {mode} fixture failed"
+                    f"{phase} effective Hermes {mode} fixture failed: {result.stderr.strip()}"
                 )
         diagnostic(f"{phase} valid PROJECT route rewrite fixture: passed")
     except (OSError, subprocess.SubprocessError) as error:
@@ -1574,10 +2072,14 @@ def stage_effective_hermes_layout(
     source_plugin: Path,
     installed_plugins: Path,
     root_config_data: bytes,
+    ingress_config_data: bytes,
+    ingress_env_data: bytes,
+    ingress_reminder_data: bytes,
     bridge_config_data: bytes,
     general_config_data: bytes,
     env_data: bytes,
-) -> tuple[Path, Path, Path, Path]:
+    external_profiles: dict[str, tuple[bytes, bytes | None]],
+) -> tuple[Path, Path, Path, Path, Path]:
     try:
         stage_root.lstat()
     except FileNotFoundError:
@@ -1585,12 +2087,21 @@ def stage_effective_hermes_layout(
     else:
         raise InstallError("refusing pre-existing effective Hermes stage")
     stage_root.mkdir(mode=0o700)
+    ingress_home = stage_root / "profiles" / "zulip-ingress"
     bridge_home = stage_root / "profiles" / "codex-bridge"
     general_home = stage_root / "profiles" / "hermes-general"
     atomic_write(stage_root / "config.yaml", root_config_data)
     atomic_write(stage_root / ".env", env_data)
+    atomic_write(ingress_home / "config.yaml", ingress_config_data)
+    atomic_write(ingress_home / ".env", ingress_env_data)
+    atomic_write(ingress_home / "SOUL.md", ingress_reminder_data)
     atomic_write(bridge_home / "config.yaml", bridge_config_data)
     atomic_write(general_home / "config.yaml", general_config_data)
+    for profile_name, (config_data, profile_env_data) in external_profiles.items():
+        profile_home = stage_root / "profiles" / profile_name
+        atomic_write(profile_home / "config.yaml", config_data)
+        if profile_env_data is not None:
+            atomic_write(profile_home / ".env", profile_env_data)
     plugins_dir = stage_root / "plugins"
     plugins_dir.mkdir(mode=0o700)
     link_installed_plugin_siblings(installed_plugins, plugins_dir)
@@ -1602,7 +2113,7 @@ def stage_effective_hermes_layout(
     os.replace(staged_candidate, staged_release)
     staged_stable = plugins_dir / PLUGIN_NAME
     activate_symlink(staged_stable, staged_release, inject_failures=False)
-    return bridge_home, general_home, staged_release, staged_stable
+    return ingress_home, bridge_home, general_home, staged_release, staged_stable
 
 
 def main() -> None:
@@ -1690,12 +2201,13 @@ def main() -> None:
     install_root.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     document, bearer = parse_hco_config()
-    validate_zulip_config()
-    root, bridge_home, general_home = resolve_hermes_paths()
+    configured_zulip_credentials = zulip_config_credentials()
+    root, ingress_home, bridge_home, general_home = resolve_hermes_paths()
     if root != Path(os.environ.get("HERMES_HOME", str(root))):
         raise InstallError("HERMES_HOME did not resolve to the default Hermes root")
 
     root_env = root / ".env"
+    ingress_env = ingress_home / ".env"
     plugins_dir = root / "plugins"
     profiles_dir = bridge_home.parent
     logs_dir = install_root / "logs"
@@ -1706,6 +2218,10 @@ def main() -> None:
         )
     release = plugins_dir / f"{PLUGIN_NAME}-{PLUGIN_VERSION}-{release_digest(source_plugin)}"
     root_config_path = root / "config.yaml"
+    ingress_config_path = ingress_home / "config.yaml"
+    ingress_reminder_path = ingress_home / "SOUL.md"
+    gateway_state_path = root / GATEWAY_STATE_FILE
+    attestation_path = root / ATTESTATION_FILE
     bridge_config_path = bridge_home / "config.yaml"
     general_config_path = general_home / "config.yaml"
     hco_plist_path = launch_agents_dir / f"{HCO_LABEL}.plist"
@@ -1758,11 +2274,17 @@ def main() -> None:
         (root, "default Hermes root", True),
         (plugins_dir, "Hermes plugin directory", True),
         (profiles_dir, "Hermes profiles directory", True),
+        (ingress_home, "zulip-ingress profile directory", True),
         (bridge_home, "codex-bridge profile directory", True),
         (general_home, "hermes-general profile directory", True),
         (launch_agents_dir, "LaunchAgents directory", True),
         (logs_dir, "installer log directory", True),
         (root_config_path, "default Hermes config", False),
+        (ingress_config_path, "zulip-ingress config", False),
+        (ingress_env, "zulip-ingress dotenv", False),
+        (ingress_reminder_path, "zulip-ingress reminder", False),
+        (gateway_state_path, "Hermes Gateway runtime state", False),
+        (attestation_path, "Hermes Codex bridge attestation", False),
         (bridge_config_path, "codex-bridge config", False),
         (general_config_path, "hermes-general config", False),
         (root_env, "default Hermes dotenv", False),
@@ -1791,15 +2313,21 @@ def main() -> None:
         validate_mutable_path(path, "Hermes preflight directory", directory=True)
     for path in hermes_preflight_files:
         validate_mutable_path(path, "Hermes preflight file", directory=False)
+    external_profiles = discover_external_profiles(profiles_dir)
     touched_paths = list(dict.fromkeys([
         root,
         plugins_dir,
         profiles_dir,
+        ingress_home,
         bridge_home,
         general_home,
         launch_agents_dir,
         logs_dir,
         root_config_path,
+        ingress_config_path,
+        ingress_env,
+        ingress_reminder_path,
+        attestation_path,
         bridge_config_path,
         general_config_path,
         root_env,
@@ -1820,11 +2348,37 @@ def main() -> None:
         *hermes_preflight_files,
         *runtime_parents,
         *runtime_paths,
+        *(profile.config_path for profile in external_profiles),
     ]))
     snapshots = [snapshot(path) for path in touched_paths]
     runtime_path_set = set(runtime_parents + runtime_paths)
     runtime_snapshots = [item for item in snapshots if item.path in runtime_path_set]
-    prior_services = {HCO_LABEL: service_state(HCO_LABEL), DELIVERY_LABEL: service_state(DELIVERY_LABEL)}
+    prior_services = {
+        HCO_LABEL: service_state(bridge_launch_domain, HCO_LABEL),
+        DELIVERY_LABEL: service_state(bridge_launch_domain, DELIVERY_LABEL),
+    }
+    prior_gateway = discover_gateway()
+    prior_plugin_release = stable_link.resolve(strict=True) if stable_link.is_symlink() else None
+    prior_runtime_profiles, prior_runtime_platforms = capture_gateway_runtime_requirements(
+        prior_gateway,
+        gateway_state_path,
+    )
+    activated_runtime_profiles = prior_runtime_profiles | {"default", "zulip-ingress"}
+    activated_runtime_platforms = prior_runtime_platforms | {"zulip"}
+    prior_plugin_version: str | None = None
+    if prior_plugin_release is not None:
+        try:
+            prior_plugin_version = validate_gateway_evidence(
+                prior_gateway,
+                gateway_state_path,
+                attestation_path,
+                prior_plugin_release,
+                None,
+                prior_runtime_profiles,
+                prior_runtime_platforms,
+            )
+        except InstallError:
+            pass
     stopped_keepalive_labels = [
         label
         for label, state in prior_services.items()
@@ -1837,29 +2391,120 @@ def main() -> None:
         )
     mutation_started = False
     services_mutated = False
+    gateway_mutated = False
 
     def rollback() -> None:
+        rollback_produced_valid_attestation = False
+        stopped_gateway_pid = prior_gateway.pid
+        if gateway_mutated:
+            current_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
+            if current_gateway.pid is not None:
+                stopped_gateway_pid = current_gateway.pid
         if services_mutated:
             for label in (DELIVERY_LABEL, HCO_LABEL):
                 bootout(label)
             for label in (DELIVERY_LABEL, HCO_LABEL):
-                wait_service_state(label, ServiceState(False, False))
+                wait_service_state(
+                    bridge_launch_domain,
+                    label,
+                    ServiceState(bridge_launch_domain, False, False, None),
+                )
         for item in reversed(snapshots):
             if item.kind == "socket" and not services_mutated:
                 continue
             restore(item)
-        if services_mutated:
-            for label, plist_path in (
-                (HCO_LABEL, hco_plist_path),
-                (DELIVERY_LABEL, delivery_plist_path),
-            ):
-                if prior_services[label].loaded and plist_path.exists():
-                    bootstrap(plist_path)
+        # Prove restoration before either service can legitimately mutate its
+        # runtime state. Sockets are recreated by the restored HCO process and
+        # are covered by the bridge readiness gate below.
         for item in snapshots:
+            if item.kind != "socket":
+                verify_snapshot(item)
+        if services_mutated:
+            if prior_services[HCO_LABEL].loaded and hco_plist_path.exists():
+                bootstrap(hco_plist_path)
+                wait_service_state(
+                    bridge_launch_domain,
+                    HCO_LABEL,
+                    prior_services[HCO_LABEL],
+                )
+                if prior_services[HCO_LABEL].running:
+                    wait_bridge_gate(document, bearer)
+        if gateway_mutated:
+            launchctl(
+                "kickstart",
+                "-k",
+                f"{prior_gateway.domain}/{GATEWAY_LABEL}",
+            )
+            if prior_plugin_version is not None:
+                restored_gateway = wait_gateway_evidence(
+                    prior_gateway.domain,
+                    stopped_gateway_pid or 0,
+                    gateway_state_path,
+                    attestation_path,
+                    prior_plugin_release,
+                    prior_plugin_version,
+                    prior_runtime_profiles,
+                    prior_runtime_platforms,
+                )
+            else:
+                restored_gateway = wait_gateway_runtime_evidence(
+                    prior_gateway.domain,
+                    stopped_gateway_pid or 0,
+                    gateway_state_path,
+                    prior_runtime_profiles,
+                    prior_runtime_platforms,
+                )
+            time.sleep(0.2)
+            stable_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
+            if prior_plugin_version is not None:
+                validate_gateway_evidence(
+                    stable_gateway,
+                    gateway_state_path,
+                    attestation_path,
+                    prior_plugin_release,
+                    prior_plugin_version,
+                    prior_runtime_profiles,
+                    prior_runtime_platforms,
+                )
+            else:
+                validate_gateway_runtime_evidence(
+                    stable_gateway,
+                    gateway_state_path,
+                    prior_runtime_profiles,
+                    prior_runtime_platforms,
+                )
+                if prior_plugin_release is not None:
+                    try:
+                        validate_gateway_attestation(
+                            stable_gateway,
+                            attestation_path,
+                            prior_plugin_release,
+                            None,
+                        )
+                    except InstallError:
+                        pass
+                    else:
+                        rollback_produced_valid_attestation = True
+            if restored_gateway.pid == prior_gateway.pid:
+                raise InstallError("rollback did not restart the prior Hermes Gateway configuration")
+        if services_mutated and prior_services[DELIVERY_LABEL].loaded and delivery_plist_path.exists():
+            bootstrap(delivery_plist_path)
+        for item in snapshots:
+            if item.path in runtime_path_set:
+                continue
+            if (
+                gateway_mutated
+                and item.path == attestation_path
+                and (
+                    prior_plugin_version is not None
+                    or rollback_produced_valid_attestation
+                )
+            ):
+                continue
             verify_snapshot(item)
         if services_mutated:
             for label in (HCO_LABEL, DELIVERY_LABEL):
-                wait_service_state(label, prior_services[label])
+                wait_service_state(bridge_launch_domain, label, prior_services[label])
 
     old_handlers: dict[int, Any] = {}
 
@@ -1891,13 +2536,20 @@ def main() -> None:
                 raise InstallError(
                     "effective ZULIP_CONTEXT_DEPTH is nonzero or invalid; rerun with --authorize-context-depth-zero"
                 )
-            env_values["ZULIP_CONTEXT_DEPTH"] = "0"
         if effective_hco_path is not None and process_hco_path is not None and effective_hco_path != hco_config_text:
             raise InstallError("effective HCO_CONFIG_PATH does not match --hco-config")
 
         plugin_toolsets = installed_plugin_toolsets(root)
+        existing_root_config = load_yaml(root_config_path)
+        existing_ingress_config = load_yaml(ingress_config_path)
         root_config_data = yaml.safe_dump(
-            root_config(load_yaml(root_config_path), plugin_toolsets), sort_keys=False
+            root_config(existing_root_config, plugin_toolsets), sort_keys=False
+        ).encode()
+        ingress_config_data = yaml.safe_dump(
+            ingress_config(
+                existing_root_config, existing_ingress_config, plugin_toolsets
+            ),
+            sort_keys=False,
         ).encode()
         bridge_config_data = yaml.safe_dump(
             restricted_config(load_yaml(bridge_config_path), plugin_toolsets), sort_keys=False
@@ -1906,10 +2558,45 @@ def main() -> None:
             general_config(load_yaml(general_config_path)), sort_keys=False
         ).encode()
         previous_env = root_env.read_bytes() if root_env.exists() else None
-        env_data = update_env(previous_env, env_values)
+        previous_ingress_env = ingress_env.read_bytes() if ingress_env.exists() else None
+        previous_env_values = dotenv_values(previous_env)
+        existing_ingress_values = {
+            name: value
+            for name, value in dotenv_values(previous_ingress_env).items()
+            if name.startswith("ZULIP_")
+        }
+        migrated_root_values = {
+            name: value
+            for name, value in previous_env_values.items()
+            if name.startswith("ZULIP_")
+        }
+        legacy_aliases = {
+            "ZULIP_BOT_EMAIL": "ZULIP_EMAIL",
+            "ZULIP_SITE_URL": "ZULIP_SITE",
+        }
+        for values in (existing_ingress_values, migrated_root_values):
+            for name, legacy_name in legacy_aliases.items():
+                if name not in values and legacy_name in values:
+                    values[name] = values[legacy_name]
+                values.pop(legacy_name, None)
+        ingress_values = dict(migrated_root_values)
+        ingress_values.update(existing_ingress_values)
+        for name, fallback in configured_zulip_credentials.items():
+            ingress_values.setdefault(name, fallback)
+        ingress_values["ZULIP_CONTEXT_DEPTH"] = "0"
+        staged_external_profiles, external_profile_updates = external_profile_layout(
+            external_profiles,
+            ingress_values.get("ZULIP_API_KEY", ""),
+        )
+        ingress_env_data = update_env(
+            remove_env_prefix(previous_ingress_env, "ZULIP_"),
+            ingress_values,
+        )
+        env_data = update_env(remove_env_prefix(previous_env, "ZULIP_"), env_values)
 
         try:
             (
+                staged_ingress_home,
                 staged_bridge_home,
                 staged_general_home,
                 staged_release,
@@ -1919,9 +2606,13 @@ def main() -> None:
                     source_plugin,
                     plugins_dir,
                     root_config_data,
+                    ingress_config_data,
+                    ingress_env_data,
+                    INGRESS_REMINDER,
                     bridge_config_data,
                     general_config_data,
                     env_data,
+                    staged_external_profiles,
                 )
             if stage_root.stat().st_dev != root.parent.stat().st_dev:
                 raise InstallError("effective Hermes stage is not on the live root filesystem")
@@ -1929,6 +2620,7 @@ def main() -> None:
                 raise InstallError("plugin source changed while the release was staged")
             effective_hermes_probe(
                 stage_root,
+                staged_ingress_home,
                 staged_bridge_home,
                 staged_general_home,
                 document,
@@ -1939,11 +2631,12 @@ def main() -> None:
                 raise InstallError("injected failure after staged Hermes probe")
 
             plugins_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            ingress_home.mkdir(mode=0o700, parents=True, exist_ok=True)
             bridge_home.mkdir(mode=0o700, parents=True, exist_ok=True)
             general_home.mkdir(mode=0o700, parents=True, exist_ok=True)
             launch_agents_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            for directory in (plugins_dir, profiles_dir, bridge_home, general_home, launch_agents_dir, logs_dir):
+            for directory in (plugins_dir, profiles_dir, ingress_home, bridge_home, general_home, launch_agents_dir, logs_dir):
                 os.chmod(directory, 0o700)
             promote_release(staged_release, release)
             promote_stable_symlink(staged_stable, stable_link, release)
@@ -1951,14 +2644,20 @@ def main() -> None:
             remove_path(stage_root)
 
         atomic_write(root_config_path, root_config_data)
+        atomic_write(ingress_config_path, ingress_config_data)
+        atomic_write(ingress_env, ingress_env_data)
+        atomic_write(ingress_reminder_path, INGRESS_REMINDER)
         atomic_write(bridge_config_path, bridge_config_data)
         atomic_write(general_config_path, general_config_data)
+        for path, config_data in external_profile_updates.items():
+            atomic_write(path, config_data)
         atomic_write(root_env, env_data)
         hco_plist, delivery_plist = make_plists(release, document)
         atomic_write(hco_plist_path, hco_plist)
         atomic_write(delivery_plist_path, delivery_plist)
         effective_hermes_probe(
             root,
+            ingress_home,
             bridge_home,
             general_home,
             document,
@@ -1971,16 +2670,58 @@ def main() -> None:
                 bootout(label)
         for label in (DELIVERY_LABEL, HCO_LABEL):
             if prior_services[label].loaded:
-                wait_service_state(label, ServiceState(False, False))
+                wait_service_state(
+                    bridge_launch_domain,
+                    label,
+                    ServiceState(bridge_launch_domain, False, False, None),
+                )
         bootstrap(hco_plist_path)
         # HCO starts first. Both launchd ownership and protocol readiness must
         # settle before the send-only delivery worker can consume an outbox row.
-        wait_service_state(HCO_LABEL, ServiceState(True, True))
+        wait_service_state(
+            bridge_launch_domain,
+            HCO_LABEL,
+            ServiceState(bridge_launch_domain, True, True, None),
+        )
         wait_bridge_gate(document, bearer)
+        gateway_mutated = True
+        remove_path(attestation_path)
+        launchctl(
+            "kickstart",
+            "-k",
+            f"{prior_gateway.domain}/{GATEWAY_LABEL}",
+        )
+        activated_gateway = wait_gateway_evidence(
+            prior_gateway.domain,
+            prior_gateway.pid or 0,
+            gateway_state_path,
+            attestation_path,
+            release,
+            PLUGIN_VERSION,
+            activated_runtime_profiles,
+            activated_runtime_platforms,
+        )
+        time.sleep(0.2)
+        stable_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
+        if stable_gateway.pid != activated_gateway.pid:
+            raise InstallError("Hermes Gateway PID changed during the stability window")
+        validate_gateway_evidence(
+            stable_gateway,
+            gateway_state_path,
+            attestation_path,
+            release,
+            PLUGIN_VERSION,
+            activated_runtime_profiles,
+            activated_runtime_platforms,
+        )
         if os.environ.get("HCO_INSTALLER_TEST_FAILPOINT") == "after_hco_bootstrap":
             raise InstallError("injected failure after HCO bootstrap")
         bootstrap(delivery_plist_path)
-        wait_service_state(DELIVERY_LABEL, ServiceState(True, True))
+        wait_service_state(
+            bridge_launch_domain,
+            DELIVERY_LABEL,
+            ServiceState(bridge_launch_domain, True, True, None),
+        )
     except BaseException:
         if mutation_started:
             try:
@@ -1988,6 +2729,7 @@ def main() -> None:
             except BaseException as rollback_error:
                 raise InstallError(
                     "rollback verification failed; bridge services were stopped but manual restoration is required"
+                    f" ({rollback_error})"
                 ) from rollback_error
         raise
     finally:
