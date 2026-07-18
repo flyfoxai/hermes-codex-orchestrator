@@ -29,7 +29,7 @@ into the local Jarvis instance, verify real Zulip routing, then commit and push
 - [completed] Record final evidence, run fresh dual-model review and release gates.
 - [completed] Reinstall into Jarvis and verify sidecar inode continuity plus a new real stockprofits smoke.
 - [completed] Adjudicate the final Gemini residual findings against source and tests.
-- [in_progress] Commit and push the verified release.
+- [completed] Commit and push the verified release.
 
 ## Constraints
 

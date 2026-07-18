@@ -627,3 +627,5 @@
   `210/210` passed.
 - Re-ran `npm run verify`; syntax, smoke, contract, dispatch failure/success,
   and hardening stages all exited successfully.
+- Committed the verified Option C repair as `9325ea8` and pushed
+  `codex/option-c-app-server` to `origin`.
