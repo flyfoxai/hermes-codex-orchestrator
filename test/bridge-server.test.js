@@ -41,13 +41,54 @@ function deferred() {
 
 async function startTcp(t, store, options = {}) {
   const paths = options.paths ?? fixturePaths();
-  const bridge = createBridge({ store, tokenPath: paths.tokenPath, hcoVersion: "0.1.0-test" });
+  const bridge = createBridge({
+    store,
+    tokenPath: paths.tokenPath,
+    hcoVersion: "0.1.0-test",
+    ...(options.healthProvider ? { healthProvider: options.healthProvider } : {})
+  });
   const running = await bridge.start({ host: options.host ?? "127.0.0.1", port: 0 });
   t.after(() => running.close());
   assert.deepEqual(Object.keys(running).sort(), ["address", "close"]);
   assert.equal(running.address.transport, "tcp");
   return { paths, running, url: `http://${running.address.host}:${running.address.port}` };
 }
+
+test("health is authenticated, bounded, and does not touch durable state", async (t) => {
+  const { calls, store } = countingStore();
+  let available = false;
+  const { url } = await startTcp(t, store, {
+    healthProvider: () => ({ appServerAvailable: available })
+  });
+
+  const unauthorized = await fetch(`${url}/v1/health`);
+  assert.equal(unauthorized.status, 401);
+
+  assert.deepEqual(await jsonRequest(url, "/v1/health", { method: "GET" }), {
+    status: 200,
+    body: { status: "degraded", appServer: { available: false } }
+  });
+  available = true;
+  assert.deepEqual(await jsonRequest(url, "/v1/health", { method: "GET" }), {
+    status: 200,
+    body: { status: "ok", appServer: { available: true } }
+  });
+  assert.deepEqual(calls, { ackOutbox: 0, claimOutbox: 0, ingest: 0, nackOutbox: 0 });
+});
+
+test("health provider failures return a stable error without leaking details", async (t) => {
+  const { store } = countingStore();
+  const { url } = await startTcp(t, store, {
+    healthProvider() { throw new Error("private-health-secret"); }
+  });
+
+  const result = await jsonRequest(url, "/v1/health", { method: "GET" });
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.body, {
+    error: { code: "BRIDGE_INTERNAL", message: "Bridge request failed." }
+  });
+  assert.equal(JSON.stringify(result).includes("private-health-secret"), false);
+});
 
 async function jsonRequest(url, route, { body, headers = {}, method = "POST" } = {}) {
   const response = await fetch(`${url}${route}`, {

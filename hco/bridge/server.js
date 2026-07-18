@@ -88,6 +88,7 @@ function parseRoute(rawUrl) {
   if (parsed.search || parsed.hash) throw bridgeError("BRIDGE_PATH_INVALID", "Request path is invalid.");
   const pathname = parsed.pathname;
   if (pathname === "/v1/compatibility") return { kind: "compatibility", method: "GET" };
+  if (pathname === "/v1/health") return { kind: "health", method: "GET" };
   if (pathname === "/v1/events") return { kind: "events", method: "POST" };
   if (pathname === "/v1/outbox/claim") return { kind: "claim", method: "POST" };
   const delivery = pathname.match(/^\/v1\/outbox\/([^/]+)\/(ack|nack)$/u);
@@ -222,7 +223,7 @@ function safeNegotiate(metadata) {
   }
 }
 
-function createHandler({ authenticator, eventHandler, hcoVersion, store }) {
+function createHandler({ authenticator, eventHandler, healthProvider, hcoVersion, store }) {
   return async function handle(request, response) {
     try {
       const authorization = headerValues(request, "authorization");
@@ -240,6 +241,17 @@ function createHandler({ authenticator, eventHandler, hcoVersion, store }) {
       if (route.kind === "compatibility") {
         const compatibility = compatibilityMetadata(request);
         jsonResponse(response, 200, { compatibility, hco: { version: hcoVersion } });
+        return;
+      }
+      if (route.kind === "health") {
+        const health = healthProvider();
+        if (!isPlainObject(health) || typeof health.appServerAvailable !== "boolean") {
+          throw new TypeError("invalid health state");
+        }
+        jsonResponse(response, 200, {
+          status: health.appServerAvailable ? "ok" : "degraded",
+          appServer: { available: health.appServerAvailable }
+        });
         return;
       }
 
@@ -298,7 +310,14 @@ function closeServer(server) {
   });
 }
 
-export function createBridge({ store, tokenPath, authenticator, eventHandler, hcoVersion = "0.1.0" } = {}) {
+export function createBridge({
+  store,
+  tokenPath,
+  authenticator,
+  eventHandler,
+  healthProvider = () => ({ appServerAvailable: true }),
+  hcoVersion = "0.1.0"
+} = {}) {
   const hasTokenPath = typeof tokenPath === "string" && tokenPath.length > 0;
   const hasAuthenticator = authenticator !== null && typeof authenticator === "object" &&
     typeof authenticator.authenticate === "function";
@@ -307,6 +326,7 @@ export function createBridge({ store, tokenPath, authenticator, eventHandler, hc
     ["claimOutbox", "ackOutbox", "nackOutbox"].some((method) => typeof store[method] !== "function") ||
     (eventHandler === undefined ? typeof store.ingest !== "function" : typeof eventHandler !== "function") ||
     hasTokenPath === hasAuthenticator ||
+    typeof healthProvider !== "function" ||
     typeof hcoVersion !== "string" || hcoVersion.trim().length === 0 || Buffer.byteLength(hcoVersion, "utf8") > 64
   ) {
     throw bridgeError("BRIDGE_OPTIONS_INVALID", "Bridge options are invalid.");
@@ -349,6 +369,7 @@ export function createBridge({ store, tokenPath, authenticator, eventHandler, hc
       const server = http.createServer(createHandler({
         authenticator: requestAuthenticator,
         eventHandler: handleEvent,
+        healthProvider,
         hcoVersion,
         store
       }));

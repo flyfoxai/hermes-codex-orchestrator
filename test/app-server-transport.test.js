@@ -33,17 +33,18 @@ function createHarness(options = {}) {
 }
 
 class ControlledWritable extends EventEmitter {
-  constructor() {
+  constructor(backpressureAt = 1) {
     super();
     this.writable = true;
     this.writableEnded = false;
     this.frames = [];
     this.endCalls = 0;
+    this.backpressureAt = backpressureAt;
   }
 
   write(frame) {
     this.frames.push(String(frame));
-    return this.frames.length !== 1;
+    return this.frames.length !== this.backpressureAt;
   }
 
   end() {
@@ -481,12 +482,16 @@ test("times out a committed request even when its backpressure never drains", as
   const transport = new NdjsonTransport({ readable, writable });
   const rpc = new AppServerRpcClient({ transport });
   const request = rpc.request("committed/no-drain", {}, { timeoutMs: 10 });
+  const timedOut = assert.rejects(
+    within(request, 60),
+    (error) => error.code === "APP_SERVER_RPC_TIMEOUT"
+  );
   await immediate();
   assert.deepEqual(writable.frames, [
     '{"id":1,"method":"committed/no-drain","params":{}}\n'
   ]);
 
-  await assert.rejects(within(request, 60), (error) => error.code === "APP_SERVER_RPC_TIMEOUT");
+  await timedOut;
   assert.equal(writable.frames.length, 1);
   rpc.close();
   await immediate();
@@ -703,6 +708,60 @@ test("shares one initialize handshake and sends initialized before becoming read
   assert.deepEqual(harness.sent.at(-1), { method: "initialized" });
   assert.deepEqual(await harness.client.initialize(), metadata);
   assert.equal(harness.sent.filter((message) => message.method === "initialize").length, 1);
+});
+
+test("times out an unresponsive initialize and closes without retry", async () => {
+  const harness = createClientHarness({ initializeTimeoutMs: 10 });
+  const first = harness.client.initialize();
+  const second = harness.client.initialize();
+
+  assert.equal(first, second);
+  await assert.rejects(within(first, 100),
+    (error) => error.code === "APP_SERVER_CLIENT_INITIALIZE_FAILED");
+  await assert.rejects(second,
+    (error) => error.code === "APP_SERVER_CLIENT_INITIALIZE_FAILED");
+  await assert.rejects(() => harness.client.initialize(),
+    (error) => error.code === "APP_SERVER_CLIENT_CLOSED");
+  assert.equal(harness.sent.filter((message) => message.method === "initialize").length, 1);
+  assert.equal(harness.child.killCalls, 0);
+});
+
+test("bounds the full initialize handshake when initialized notification backpressure never drains", async () => {
+  const child = new InjectedChild();
+  child.stdin = new ControlledWritable(2);
+  const client = new CodexAppServerClient({
+    childProcess: child,
+    clientInfo: { name: "hco-test", version: "1.2.3" },
+    initializeTimeoutMs: 10
+  });
+  const initialization = client.initialize();
+  await immediate();
+  assert.deepEqual(child.stdin.frames.map((frame) => JSON.parse(frame)), [{
+    id: 1,
+    method: "initialize",
+    params: {
+      clientInfo: { name: "hco-test", version: "1.2.3" },
+      capabilities: { experimentalApi: false }
+    }
+  }]);
+
+  child.stdout.write(`${JSON.stringify({
+    id: 1,
+    result: {
+      userAgent: "fake/0.142.3",
+      codexHome: "/tmp/codex-home",
+      platformFamily: "unix",
+      platformOs: "test"
+    }
+  })}\n`);
+  await immediate();
+  assert.deepEqual(child.stdin.frames.map((frame) => JSON.parse(frame)).at(-1), { method: "initialized" });
+  await assert.rejects(within(initialization, 100),
+    (error) => error.code === "APP_SERVER_CLIENT_INITIALIZE_FAILED");
+  await assert.rejects(() => client.initialize(),
+    (error) => error.code === "APP_SERVER_CLIENT_CLOSED");
+  assert.equal(child.stdin.frames.length, 2);
+  assert.equal(child.stdin.endCalls, 1);
 });
 
 test("maps supported thread and turn methods exactly after initialization", async () => {

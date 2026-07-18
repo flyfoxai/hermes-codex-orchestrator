@@ -367,7 +367,10 @@ export function createHcoService({
       if (route.owner === "PROJECT") {
         acl.require({ userId: binding.senderId, projectId: route.projectId, permission: "project.read" });
       }
-      return deepFreeze({ schemaVersion: 1, status: "ok", action: "route.show", route });
+      const visibleRoute = route.owner === "PROJECT"
+        ? { ...route, cwd: projectById.get(route.projectId).cwd }
+        : route;
+      return deepFreeze({ schemaVersion: 1, status: "ok", action: "route.show", route: visibleRoute });
     }
     return enqueue(async () => {
       const before = resolveRoute(binding.streamId);

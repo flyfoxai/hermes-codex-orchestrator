@@ -1,5 +1,154 @@
 # Progress
 
+## 2026-07-18 final Jarvis production acceptance
+
+- Recovered the post-compaction state and continued the already accepted
+  stream-5 smoke instead of creating a duplicate objective.
+- Confirmed HCO PID `72242`, its Codex App Server children, Gateway PID
+  `72469`, and delivery PID `72577` remained alive during verification.
+- Queried the production database with a bounded busy timeout. Objective
+  `objective-34196845-262f-4757-b3a7-4d767aff1ec6`, its App Server execution,
+  and its turn submission are all completed with no reconciliation required.
+- Verified the stored output reports only
+  `/Users/hula/Projects/stockprofits` and the unique smoke marker. The outbox
+  delivered it once and recorded Zulip message ID `345`.
+- Read message `345` independently through the Zulip client. It is in
+  `量化交易stockProfits` / `框架安装`, is authored by Jarvis PM, and contains
+  the same stockprofits cwd and marker.
+- Compared HCO's open SQLite descriptors with the live database, WAL, and SHM
+  paths. Their inodes match, so the writer and fresh readers share the same
+  sidecar files after the repaired installation.
+- Production acceptance is complete. Remaining work is fresh release gates,
+  final Claude/Gemini read-only review, adjudication, commit, and push.
+- Completed fresh release gates sequentially after production acceptance:
+  installer transactions `30/30`, Node tests `237/237`, Jarvis-runtime Hermes
+  plugin contracts `210/210`, and every `npm run verify` stage passed. Shell
+  syntax and `git diff --check` also exited cleanly.
+
+## 2026-07-18 - SQLite process-exit timeout continuation
+
+- Restored the prior session and confirmed the active installer suite failed in
+  scenario 1 rather than at the new scenario 30 boundary.
+- Traced that failure to the test fixture: global environment forwarding
+  supplied an empty SQLite stop delay, and the fake HCO crashed while parsing
+  it as a float. Updated only the fixture's default parsing; production code is
+  unchanged pending a clean RED for the actual timeout behavior.
+- Re-ran the complete installer suite. Scenarios 1 through 29 passed, then
+  scenario 30 produced the intended RED because the installation succeeded
+  after the old HCO exceeded the requested exit deadline.
+- Added transaction-level PID retention and a validated test-only timeout
+  override. Rollback now checks every retained service PID before restoring
+  migrations or snapshots, even when launchd already reports the service as
+  unloaded.
+- Re-ran all 30 installer transaction scenarios after the production change.
+  Both SQLite lifecycle cases passed: replacement waits for descriptor ownership
+  to drain, and an exit timeout fails closed before snapshot restoration.
+- The inherited `npm test` gate is not defined in `package.json`; npm failed
+  before executing tests. Confirmed the repository documents `npm run verify`.
+  Shell syntax and `git diff --check` both passed while selecting the actual
+  Node gate commands.
+- The first `node --test test/*.test.js` run passed 236/237. The only failure
+  was an unhandled-rejection race in the 10 ms committed-backpressure timeout
+  test; it passed in isolation and reported `PromiseRejectionHandledWarning`
+  in the full run. Attached `assert.rejects` immediately after creating the
+  request, before yielding to inspect the committed frame.
+- Re-ran the remaining release gates after the SQLite lifecycle fix. Jarvis'
+  runtime Python passed all 210 Hermes plugin contract tests; `npm run verify`
+  passed its syntax, smoke, contract, dispatch, dispatch-success, and hardening
+  stages; `bash -n scripts/install-hermes-codex-bridge.sh` and
+  `git diff --check` both exited cleanly.
+- Completed the requested Claude and Gemini review pass. Claude inspected the
+  complete tracked diff and reported two candidate findings; source-level
+  control-flow review rejected both because successful initialization resets
+  reconnect backoff and rollback drains retained PIDs before migration or
+  snapshot restoration. Gemini's repository-tool review was incompatible with
+  its current CLI tool registry, so a tool-free focused review was used. Its
+  candidate replacement-PID gap was also rejected: rollback captures the
+  currently running replacement HCO/delivery PIDs before bootout and drains
+  them before restoration. A requested Gemini recheck then encountered a local
+  proxy fetch failure; no unadjudicated source finding remains.
+
+## 2026-07-17 final boundary audit
+
+- Restored 14 unsynced messages from the prior Codex context. They showed that
+  the full-handshake backpressure regression had already been added and failed
+  before the context transition, so no duplicate RED test was created.
+- Re-ran focused renderer coverage. Unknown future action passed, while three
+  unknown status variants failed because their private values were reflected in
+  user-visible text; this is the RED evidence for the status allowlist fix.
+- Added a client-level RED test for an unresponsive initialize handshake. It
+  exceeded the 100 ms test deadline because the constructor ignored the proposed
+  10 ms initialization timeout, confirming the lifecycle gap.
+- Implemented action-specific bridge status validation and an initialization
+  timeout option with the existing 30-second behavior retained as the default.
+- Extended the same initialization deadline across both handshake phases. A
+  valid initialize response followed by a permanently non-draining
+  `initialized` notification now fails closed and closes the client instead of
+  blocking HCO startup or shutdown indefinitely.
+- Fresh focused lifecycle verification passed 4/4 cases: shared initialization,
+  silent-server timeout, post-response notification backpressure timeout, and
+  failed-initialize non-retry behavior.
+
+## 2026-07-17 - Real App Server completion investigation
+
+- Restored the post-install context with the planning catch-up helper and
+  preserved all uncommitted remediation changes.
+- Queried the live HCO database using its real schema. Confirmed correct
+  `stockprofits` routing, a bound App Server thread and turn, and absence of all
+  App Server audit/output/delivery records before recovery changed the submission
+  to `reconciliation_needed`.
+- No production code has been changed for this incident. Root-cause tracing now
+  continues through runtime notification ownership and lost-turn recovery.
+- Confirmed the App Server process did not reconnect during the turn. Queried
+  the persisted thread through a fresh initialized App Server client and found
+  the exact mismatch: current `agentMessage` items omit `status`, while HCO
+  requires it. The persisted final answer contains both the canonical
+  stockprofits cwd and `HCO_APP_SERVER_SMOKE_OK`.
+- The current Codex manual fetch failed with HTTP 403; protocol validation will
+  use the installed App Server's generated schema plus the observed live
+  payload.
+- Generated the installed Codex `0.142.3` JSON schema. Its
+  `AgentMessageThreadItem` requires only `id`, `text`, and `type`, permits an
+  optional phase, and defines no item status field.
+- Added a RED regression with the exact current payload shape and observed the
+  expected `null` output. Changed the reducer to accept an omitted item status
+  while still rejecting any explicit non-completed status. The focused RED test
+  and all 42 turn-controller tests then passed.
+- Updated the Option C end-to-end completion fixture to use the current App
+  Server schema so future integration coverage cannot silently regress to the
+  obsolete test-only status field.
+- Added explicit negative coverage for every defined non-completed status raised
+  by Claude's review; the focused controller/E2E run passed 50/50. Gemini found
+  no actionable issue in the compatibility change.
+- Transactionally installed the repaired release into Jarvis. The installer
+  passed its launchd-equivalent App Server canary, authenticated live readiness
+  gate, Gateway attestation gate, and delivery readiness gate before commit.
+- Verified the running checkpoint: HCO PID `37337`, App Server PIDs `37340` and
+  `37341`, Gateway PID `37484`, and delivery PID `37603`. Authenticated health
+  reported App Server available, and the stable plugin plus Gateway attestation
+  resolved to `hermes-codex-bridge-1.0.0-58bb1ceea2a8`.
+- Observed automatic route-snapshot renewal advance generation 2 to 3 while the
+  only project routes remained `4 -> ASK` and `5 -> stockprofits` with a
+  60-second validity interval.
+- Submitted fresh read-only objective
+  `objective-a8b267af-2181-44cc-a4da-14b71e148d13`; HCO accepted it for
+  `stockprofits` and created new App Server thread
+  `019f7053-b556-7212-8289-36820d31eca5` and turn
+  `019f7053-d81a-7d80-a767-1cc03723f9c8`.
+- Confirmed the task completed without reconciliation, persisted output
+  `cwd=/Users/hula/Projects/stockprofits` and
+  `HCO_APP_SERVER_SMOKE_OK`, and produced an outbox delivery acknowledged once
+  as Zulip message `343`.
+- Queried Zulip independently and confirmed message `343` landed in
+  `量化交易stockProfits / 框架安装` with the exact stockprofits cwd and success
+  marker. This is the first fresh end-to-end proof that the repaired completion
+  payload reaches the user rather than being discarded.
+- Logged non-production diagnostic errors from the smoke investigation: direct
+  standalone plugin import, stale SQLite column names, unavailable Zulip client
+  method, root-only `launchctl procinfo`, and one undefined local JavaScript
+  variable. Each was corrected with a read-only alternative and none created a
+  task or changed production state.
+
 ## 2026-07-17
 
 - Resumed hardened Option C from the independent Codex review gate.
@@ -216,3 +365,265 @@
   contained only `4 -> ASK` and `5 -> stockprofits` project routes.
 - Committed the verified implementation as `5860529` (`Harden Option C routing
   containment`) and pushed it to `origin/codex/option-c-app-server`.
+- Began the live App Server availability remediation after reproducing the
+  `stockprofits` Zulip failure against objective
+  `objective-24cf35e8-0452-440f-99dc-38612b0c63ec`.
+- Confirmed the route is correct and isolated from ASK; the immediate startup
+  failure is launchd PATH resolution of the Node-based Codex wrapper.
+- Adopted the already approved full Option C repair: deterministic service
+  environment, launchd-equivalent canary, live health gate, bounded reconnect,
+  human-readable failure rendering, and trusted route/status queries.
+- Resumed after context compaction and independently reproduced the remaining
+  installer RED: fresh activation passed bridge, App Server canary, route, and
+  Hermes gates, then failed the new HCO health gate because its fake server
+  returned only a compatibility document. Rollback subsequently reported a
+  service-settle failure.
+- Updated only the fresh-HCO fixture to distinguish `/v1/health` from the
+  compatibility endpoint. Legacy-HCO and lock-gate fixtures remain unchanged so
+  upgrade and rollback compatibility coverage stays meaningful.
+- The next GREEN attempt reached the installed-plist assertions and stopped on
+  a test-only `NameError`: the new PATH assertion referenced `expected_node`
+  without passing it into the Python fixture. Added `$FAKE_NODE` as an explicit
+  fixture argument and now assert both the HCO executable and PATH from it.
+- Line-level inspection showed `$FAKE_NODE` is only the fake launchctl's service
+  shim; the installer itself receives `--node-bin "$(command -v node)"`. Corrected
+  the fixture argument to that real installer input while retaining exact
+  executable and PATH assertions.
+- The following run exposed a second test-contract mistake: `HERMES_HOME` is
+  isolated fixture state, whereas launchd `HOME` must be the actual service
+  user's home. The generated plist correctly used the process HOME and the
+  node parent in PATH; changed the assertion to match that intended contract.
+- The installer then passed all earlier transaction scenarios and failed only
+  the first-install temporary-HCO handoff. Root cause: the fake node depended on
+  two `HCO_TEST_*` variables that are intentionally absent from the new
+  launchd-equivalent environment. Embedded the fake server and lifecycle-log
+  paths as fixture arguments so the executable no longer relies on ambient
+  test-only environment variables.
+- Re-ran the complete installer suite after fixture corrections: all 28
+  scenarios passed, including rollback renewal, legacy compatibility, failure
+  injection, lock serialization, and temporary-HCO handoff.
+- Added a shutdown-versus-retry-initialize regression and observed the intended
+  RED result: close counts were `[1, 2]` instead of `[1, 1]`. Implemented a
+  candidate-owned idempotent close helper shared by terminal, connect-failure,
+  and runtime shutdown paths.
+- Ran the four newly added runtime edge-case scenarios. The first run exposed a
+  test-only queue-consumption mistake: the backoff test shifted the same retry
+  record twice before invoking it. Corrected the fixture without changing
+  production behavior.
+- Re-ran `node --test test/hco-runtime.test.js`: all 20 runtime tests passed,
+  including bounded backoff/reset, shutdown cancellation, stale terminal
+  isolation, synchronous backend-construction recovery, and single-owner close.
+- Resumed the App Server remediation after context compaction and recovered the
+  pending review/install plan from the on-disk planning files.
+- Gemini completed the full uncommitted-diff review as session
+  `7f0f753e-dedc-4cb7-a9e1-bad90f9acee5` and returned
+  `NO_ACTIONABLE_FINDINGS` without tool writes.
+- Claude's first full-diff process exited successfully but returned an empty
+  result, so it was not counted as an approval. Started a smaller read-only
+  review with a mandatory structured-output schema.
+- Collected fresh pre-install regression evidence: Node `233/233`, Hermes
+  plugin contracts `200/200`, and installer transactions `28/28` all passed
+  with zero failures. The installer warning is an existing third-party
+  `pkg_resources` deprecation notice, not a test failure.
+- Captured the live pre-install baseline: launchd still supplied only
+  `/usr/bin:/bin:/usr/sbin:/sbin`; HCO PID `17315` was alive but owned no
+  `codex app-server --stdio` child. This reproduces the reported degraded state
+  without any ASK/stockprofits routing ambiguity.
+- Adjudicated Claude's structured review. Both findings are already blocked by
+  stronger invariants: stale removed-project overrides fail resolver
+  construction with `ROUTE_CONFIG_INVALID`, and missing/mismatched HOME fails
+  the installer entry check before plist generation. No production change was
+  justified; the approved remediation diff remains unchanged.
+- The first fresh plugin-contract command used system `python3` and stopped
+  before tests with `ModuleNotFoundError: hermes_cli`. This interpreter is not
+  the Jarvis runtime and the result is not counted; verification will use the
+  installed Hermes venv Python.
+- Fresh verification now has Node `233/233` and Hermes plugin contracts
+  `200/200` passing. The latter used the exact Python environment referenced by
+  the live delivery LaunchAgent.
+- Fresh installer transaction verification passed `28/28`, including the new
+  App Server health gate, prior-version rollback, route-snapshot renewal races,
+  service-state restoration, and first-install temporary HCO handoff.
+- Restored the post-compaction session with the planning catch-up helper and
+  reconfirmed the live pre-install baseline: HCO PID `17315` still has no child
+  App Server and its LaunchAgent still exposes only launchd's default PATH.
+- The first installer help probe invoked the non-executable script directly and
+  returned `permission denied`; all production invocations must use `bash
+  scripts/install-hermes-codex-bridge.sh`, matching the test and documented
+  shell-script contract.
+- The setup document's illustrative secret names (`bridge.bearer` and
+  `context.key`) do not match this installation. The authoritative HCO config
+  references owner-only `hco.bearer` and `hco-context.key`; deployment will use
+  the config paths and will not print their contents.
+- Ran the real transaction with the approved context-depth containment flag.
+  Bridge protocol, launchd-equivalent Codex App Server compatibility, staged
+  and activated route/Hermes probes, installed Hermes compatibility, and the
+  new live App Server readiness gate all passed.
+- The transaction then exited with code 1 at the Gateway activation evidence
+  gate: the runtime attestation did not match the newly activated release.
+  Started a boundary-by-boundary rollback and attestation investigation before
+  any retry.
+- Read Hermes' complete user-plugin discovery path. Confirmed it scans the
+  stable symlink plus every historical immutable release, then deduplicates by
+  the shared manifest key with the last sorted directory winning.
+- Ran a read-only live discovery probe: all three HCO paths were candidates and
+  the selected winner was a historical version directory. This establishes the
+  remaining activation failure's root cause without another production retry.
+- Started a TDD migration phase: first require exactly one discoverable HCO
+  manifest with immutable releases stored outside `plugins/`, then add legacy
+  upgrade and transaction rollback coverage before implementation.
+- Reproduced the migration rollback RED with the preserved fixture. The stable
+  link returned to the old release name, but both old release directories
+  remained in `plugin-releases/` because the migration ledger had been cleared
+  before Gateway attestation.
+- Moved migration commit/cleanup to the final transaction boundary after HCO
+  App Server readiness, Gateway attestation/stability, and delivery readiness.
+- Fresh verification after the fix: installer transactions `28/28`, Node tests
+  `233/233`, Hermes plugin contracts `200/200`, shell syntax, and diff whitespace
+  checks all passed.
+- Gemini's focused migration review identified a reachable mismatch between
+  cache exclusion in release manifest generation and strict destination
+  validation. Read-only inspection confirmed both live historical release
+  directories contain normal Python runtime caches, so a real retry would have
+  failed before migration despite the synthetic suite passing.
+- Added the cache-bearing legacy migration regression first and observed the
+  expected RED failure: `plugin release integrity check rejected directory
+  mode` for a normal `0755` `__pycache__` directory.
+- Implemented one consistent policy: runtime caches stay outside semantic
+  content hashes but every ignored path is still ownership/type/mode checked;
+  cache symlinks, special paths, and cross-user writable paths remain rejected.
+  File hashing now uses bounded streaming reads.
+- Re-ran the installer transaction suite after the cache fix. All `28/28`
+  scenarios passed, including cache preservation during migration, cache
+  symlink rejection before service mutation, and byte-preserving rollback.
+- The first focused Claude and Gemini review attempts returned empty responses
+  and were explicitly rejected as evidence. Smaller non-mutating reviews then
+  both raised the same empty-directory digest concern.
+- Supplied the reviewers with every destination reuse and migration branch.
+  Claude session `f6866761-6c32-42ca-a30e-1181e333bdd2` and Gemini session
+  `0bebe861-d9d8-489b-a77e-ef688fd72400` both concluded `NON_ACTIONABLE` because
+  full directory manifests are validated before any same-name destination is
+  reused. No compatibility-breaking digest change was made.
+- Completed the retried live transactional install with exit code zero. Bridge
+  compatibility, launchd-equivalent App Server compatibility, staged and
+  activated Hermes probes, and live Codex App Server readiness all passed;
+  plugin version `1.0.0` was committed. Runtime process, attestation, renewal,
+  route isolation, and real `stockprofits` delivery remain to be verified
+  before publication.
+- Verified the committed runtime: LaunchAgent PID `76494` owns the Codex App
+  Server stdio child, authenticated `/v1/health` reports App Server available,
+  Gateway PID `76801` serves `zulip-ingress` with Zulip connected, and delivery
+  PID `76903` runs from the same immutable release selected by the stable link
+  and Gateway attestation.
+- Reconfirmed the live registry is isolated: stream `4` maps only to `ASK` at
+  `/Users/hula/workspace/ASK`; stream `5` maps only to `stockprofits` at
+  `/Users/hula/Projects/stockprofits`; both use the App Server backend.
+- Observed route snapshot renewal from `1784293933299` to `1784293981402` with
+  the exact two-route document, 60-second validity interval, SHA-256 integrity,
+  and owner-only mode.
+- Queried the real stream-5 topic without mutation. Incident reply `342`
+  confirms the bridge had selected `stockprofits`; only backend availability
+  failed. Prepared a bounded, read-only `OBJECTIVE_NEW` smoke request so the
+  verification cannot reuse the prior failed objective or alter project files.
+- A diagnostic topic-mode query used the wrong table shape and failed before
+  reading rows. Schema inspection confirmed `topic_modes` joins to
+  `topic_aliases` by `alias_id`; the production database was not mutated.
+- First live smoke harness stopped at `ModuleNotFoundError` because it used a
+  nonexistent import package name. No bridge request was sent and no live
+  objective was created; the retry will use the installed module layout.
+- Recovered the real completed turn through `thread/read` and confirmed the
+  completion-loss root cause: Codex App Server `0.142.3` omits `status` from
+  `agentMessage` items, while HCO required `status === "completed"`.
+- Added the current-protocol RED regression before changing production logic;
+  it failed because output reduction returned `null`. Updated the filter to
+  accept an omitted status or explicit `completed`, while rejecting every
+  explicit alternative. Focused recovery/service/E2E verification passed
+  137/137 after the production fix.
+- Ran fresh Gemini and Claude incident reviews. Gemini reported no actionable
+  finding. Claude's low-severity negative-coverage finding was valid, so added
+  explicit rejection coverage for `null`, `inProgress`, `failed`, and
+  `cancelled` item statuses. The focused controller/E2E run passed 50/50.
+- Re-ran both external reviews after adding the complete user-facing result
+  renderer. Claude returned `NO_ACTIONABLE_FINDINGS`. Gemini session
+  `eb516ed2-9f6e-4b43-9811-ad64fd37a78a` raised five possible issues; source,
+  protocol, and server-response checks rejected four as contract
+  misunderstandings and accepted one privacy/compatibility defect.
+- Added a RED contract case proving that an unknown future schema-v1 action
+  caused arbitrary response fields, including a token-shaped value, to be
+  reflected to Zulip. Replaced that reflection with a fixed compatibility
+  notice that exposes neither the unknown action nor any unrecognized field.
+  The focused renderer suite passed 8/8.
+- Ran the complete pre-deployment gates after the renderer fix: Node 235/235,
+  Hermes plugin contracts 206/206, installer transactions 28/28, and
+  `npm run verify` all passed. A single Node test initially raced only while
+  Node and pytest were run concurrently: its 10 ms rejection could occur
+  before `assert.rejects` was attached after a `setImmediate`. The same test
+  and the complete Node suite passed in isolation; no unrelated production or
+  test timing change was made.
+- The first initialize-pending adjudication was incomplete: the production RPC
+  request owns a 30-second timeout, but that deadline ends before the following
+  `initialized` notification. Independent review reproduced a valid initialize
+  response followed by permanently non-draining stdin, which left the complete
+  handshake and initial shutdown pending.
+- Added RED renderer cases for unknown statuses on dispatch, cancellation,
+  interaction answer, and nested objective execution status. All four failed
+  by reflecting the injected private marker before the production change.
+- Added action-specific status allowlists and one fixed fail-closed
+  compatibility response. The focused renderer run passed 11/11 and the full
+  Hermes plugin contract suite passed 210/210.
+- Added a RED App Server regression for post-response notification backpressure;
+  before the fix it exceeded the 100 ms test deadline. Applied one deadline to
+  the complete initialize handshake so timeout closes the transport and releases
+  the pending send. The focused initialize/backpressure run passed 5/5.
+- Added an installer contract proving App Server activation uses a distinct
+  40-second readiness window instead of the normal 8-second bridge window.
+- Added a partial release-migration rollback fault injection. The repaired
+  transaction restores and verifies every independent snapshot, stops all
+  affected services on incomplete evidence, and retains the original failure
+  without secrets.
+- Corrected two cache fixtures to valid semantic versions, exposing and fixing
+  acceptance of nested directories under `__pycache__` while preserving normal
+  owner-controlled `.pyc` support.
+- Re-ran the installer transaction suite after the final rollback changes; all
+  `28/28` scenarios passed.
+
+## 2026-07-18 SQLite sidecar persistence incident
+
+- Submitted a current-release, stream-5 `stockprofits` smoke through the real
+  installed plugin without starting another Zulip poller. The plugin reported
+  objective `objective-56b35d0c-ac86-45cd-9a9b-6ba48a24f856` accepted.
+- Confirmed the accepted objective and replay nonce are absent to a fresh
+  SQLite reader. HCO PID `69585` has the main database open at the expected
+  inode but holds WAL/SHM inodes whose pathnames had been removed.
+- Rechecked after pathname recreation: HCO descriptors still point to WAL/SHM
+  inodes `52666426/52666427`, while the live paths point to
+  `52677093/52677094`. This rules out a wrong database path and proves split
+  SQLite sidecar state.
+- Deferred service restart so the unlinked WAL remains available for forensic
+  inspection. Began TDD investigation of installer runtime snapshot lifecycle;
+  no production fix has been applied yet.
+
+## 2026-07-18 - Final external-review adjudication
+
+- Completed source-level review of Gemini's two residual candidates after
+  Claude returned `NO_ACTIONABLE_FINDINGS`.
+- Confirmed successful installation never restores SQLite runtime snapshots.
+  Temporary preflight and rollback restoration are both ordered after HCO
+  process exit; the retained-PID timeout test proves uncertain ownership fails
+  closed before any snapshot restoration.
+- Confirmed failed and cancelled App Server turns are durable terminal states,
+  not stuck work. Both clear reconciliation and lease state; cancellation emits
+  one outbox notification, while failure records `terminal_error` and an audit
+  fact without reflecting untrusted backend error text.
+- No further production or test change was required for either review item.
+
+## 2026-07-18 - Final pre-commit verification
+
+- Re-ran the installer transaction suite sequentially: all `30/30` scenarios
+  passed, including SQLite owner-drain handoff and exit-timeout fail-closed
+  restoration.
+- Re-ran all Node tests sequentially: `237/237` passed.
+- Re-ran the Jarvis Hermes plugin contracts with its actual virtualenv:
+  `210/210` passed.
+- Re-ran `npm run verify`; syntax, smoke, contract, dispatch failure/success,
+  and hardening stages all exited successfully.

@@ -24,6 +24,7 @@ const DIAGNOSTIC_MESSAGES = Object.freeze({
 const MAX_METADATA_LENGTH = 4096;
 const MAX_STDERR_BYTES = 16 * 1024;
 const MAX_STDERR_EVENTS = 32;
+const DEFAULT_INITIALIZE_TIMEOUT_MS = 30_000;
 const THREAD_OPTION_KEYS = new Set([
   "approvalPolicy",
   "baseInstructions",
@@ -128,6 +129,7 @@ export class CodexAppServerClient {
   #diagnosticCallback;
   #explicitClose = false;
   #initializePromise = null;
+  #initializeTimeoutMs;
   #metadata = null;
   #ownedChild;
   #rpc;
@@ -143,6 +145,7 @@ export class CodexAppServerClient {
     executablePath = process.env.CODEX_EXECUTABLE || "codex",
     spawn = spawnProcess,
     clientInfo = { name: "hermes-codex-orchestrator", version: "0.1.0" },
+    initializeTimeoutMs = DEFAULT_INITIALIZE_TIMEOUT_MS,
     requestHandlers,
     onDiagnostic = () => undefined,
     onNotification = () => undefined,
@@ -150,11 +153,13 @@ export class CodexAppServerClient {
     onTerminal = () => undefined
   } = {}) {
     if (!validBoundedString(executablePath) || typeof spawn !== "function" ||
+        !Number.isSafeInteger(initializeTimeoutMs) || initializeTimeoutMs <= 0 ||
         typeof onDiagnostic !== "function" || typeof onNotification !== "function" ||
         typeof onServerRequest !== "function" || typeof onTerminal !== "function") {
       throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
     }
     this.#clientInfo = validateClientInfo(clientInfo);
+    this.#initializeTimeoutMs = initializeTimeoutMs;
     this.#diagnosticCallback = onDiagnostic;
     this.#terminalCallback = onTerminal;
     this.#ownedChild = childProcess === undefined;
@@ -194,20 +199,29 @@ export class CodexAppServerClient {
     if (this.#state === "closed") return Promise.reject(ownedError("APP_SERVER_CLIENT_CLOSED"));
 
     this.#state = "initializing";
-    this.#initializePromise = this.#rpc.request("initialize", {
+    let deadline;
+    const deadlinePromise = new Promise((resolve, reject) => {
+      deadline = setTimeout(() => reject(ownedError("APP_SERVER_CLIENT_INITIALIZE_FAILED")),
+        this.#initializeTimeoutMs);
+      deadline.unref?.();
+    });
+    const handshake = this.#rpc.request("initialize", {
       clientInfo: this.#clientInfo,
       capabilities: { experimentalApi: false }
-    }).then(async (result) => {
+    }, { timeoutMs: this.#initializeTimeoutMs }).then(async (result) => {
       const metadata = validateMetadata(result);
       await this.#rpc.notify("initialized");
       if (this.#state === "closed") throw this.#terminalError ?? ownedError("APP_SERVER_CLIENT_CLOSED");
       this.#metadata = metadata;
       this.#state = "ready";
       return metadata;
-    }).catch(() => {
+    });
+    this.#initializePromise = Promise.race([handshake, deadlinePromise]).catch(() => {
       const error = ownedError("APP_SERVER_CLIENT_INITIALIZE_FAILED");
       this.#fail(error, true);
       throw error;
+    }).finally(() => {
+      clearTimeout(deadline);
     });
     return this.#initializePromise;
   }

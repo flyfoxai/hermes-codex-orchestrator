@@ -548,6 +548,190 @@ def _parse_command(text: object) -> dict | None:
     return None
 
 
+def _is_route_query(text: object) -> bool:
+    if type(text) is not str or "\n" in text or "\r" in text:
+        return False
+    normalized = text.strip().lower()
+    for character in " \t，,。.!！?？:：;；、":
+        normalized = normalized.replace(character, "")
+    return normalized in {
+        "当前工作文件夹当前projectid",
+        "当前工作目录当前projectid",
+        "当前项目目录当前projectid",
+        "请汇报当前工作文件夹当前projectid",
+        "请汇报当前工作目录当前projectid",
+        "请你汇报当前工作文件夹当前projectid",
+        "请告诉我当前工作文件夹和当前projectid",
+        "请告诉我当前工作目录和当前projectid",
+        "当前projectid当前工作文件夹",
+        "当前projectid当前工作目录",
+    }
+
+
+def _unsupported_bridge_result() -> str:
+    return (
+        "Codex 返回了当前插件不支持的操作结果；"
+        "详细内容未显示，请检查插件与 HCO 版本。"
+    )
+
+
+def _render_bridge_result(result: object) -> str:
+    if type(result) is not dict:
+        return "Codex bridge protocol error."
+    if result.get("accepted") is True and set(result).issubset(
+        {"accepted", "objectiveId"}
+    ):
+        objective_id = result.get("objectiveId")
+        if objective_id is None:
+            return "Codex 请求已提交。"
+        if type(objective_id) is str and objective_id:
+            return f"Codex 请求已提交。任务：{objective_id}。"
+        return "Codex bridge protocol error."
+    if result.get("schemaVersion") != 1:
+        return "Codex bridge protocol error."
+    action = result.get("action")
+    status = result.get("status")
+    if type(action) is not str or type(status) is not str:
+        return "Codex bridge protocol error."
+    if action == "dispatch":
+        if status not in {
+            "accepted",
+            "duplicate",
+            "busy",
+            "backend_unavailable",
+            "reconciliation_needed",
+            "submission_unknown",
+            "cancelled",
+            "terminal_error",
+        }:
+            return _unsupported_bridge_result()
+        project_id = result.get("projectId")
+        objective_id = result.get("objectiveId")
+        if not all(type(value) is str and value for value in (project_id, objective_id)):
+            return "Codex bridge protocol error."
+        if status == "accepted":
+            return f"Codex 请求已提交。项目：{project_id}。任务：{objective_id}。"
+        if status == "backend_unavailable":
+            return (
+                f"已识别项目 {project_id}，但 Codex 后端暂时不可用；"
+                f"本次任务未执行。任务记录：{objective_id}。"
+            )
+        return f"Codex 请求状态：{status}。项目：{project_id}。任务：{objective_id}。"
+    if action == "route.show" and status == "ok":
+        route = result.get("route")
+        if type(route) is not dict or type(route.get("owner")) is not str:
+            return "Codex bridge protocol error."
+        if route["owner"] == "PROJECT":
+            project_id = route.get("projectId")
+            cwd = route.get("cwd")
+            if not all(type(value) is str and value for value in (project_id, cwd)):
+                return "Codex bridge protocol error."
+            return f"当前项目：{project_id}。工作目录：{cwd}。"
+        if route["owner"] == "HERMES":
+            return "当前频道由 Hermes 管理，没有关联 Codex 项目。"
+        return "Codex bridge protocol error."
+    if action in {"route.set", "route.none", "route.unset"} and status == "ok":
+        route = result.get("route")
+        if type(route) is not dict or type(route.get("owner")) is not str:
+            return "Codex bridge protocol error."
+        if route["owner"] == "PROJECT":
+            project_id = route.get("projectId")
+            if type(project_id) is not str or not project_id:
+                return "Codex bridge protocol error."
+            return f"频道路由已更新。当前项目：{project_id}。"
+        if route["owner"] == "HERMES":
+            return "频道路由已更新。当前由 Hermes 管理。"
+        return "Codex bridge protocol error."
+    if action == "topic.show" and status == "ok":
+        project_id = result.get("projectId")
+        mode = result.get("mode")
+        objective_id = result.get("objectiveId")
+        if (
+            type(project_id) is not str
+            or not project_id
+            or type(mode) is not str
+            or not mode
+            or (objective_id is not None and (type(objective_id) is not str or not objective_id))
+        ):
+            return "Codex bridge protocol error."
+        objective = (
+            f"任务：{objective_id}。"
+            if objective_id is not None
+            else "当前没有绑定任务。"
+        )
+        return f"当前话题模式：{mode}。项目：{project_id}。{objective}"
+    if action == "topic.set" and status == "ok":
+        mode = result.get("mode")
+        if type(mode) is not str or not mode:
+            return "Codex bridge protocol error."
+        return f"话题模式已更新：{mode}。"
+    if action == "objective.status" and status == "ok":
+        project_id = result.get("projectId")
+        objective_id = result.get("objectiveId")
+        execution_status = result.get("executionStatus")
+        backend = result.get("backend")
+        thread_id = result.get("threadId")
+        if (
+            not all(
+                type(value) is str and value
+                for value in (project_id, objective_id, execution_status, backend)
+            )
+            or (thread_id is not None and (type(thread_id) is not str or not thread_id))
+        ):
+            return "Codex bridge protocol error."
+        if execution_status not in {
+            "idle",
+            "starting",
+            "ready",
+            "submitting",
+            "running",
+            "submission_unknown",
+            "reconciliation_needed",
+            "backend_unavailable",
+            "completed",
+            "cancelled",
+            "terminal_error",
+        }:
+            return _unsupported_bridge_result()
+        thread = thread_id if thread_id is not None else "尚未建立"
+        return (
+            f"任务：{objective_id}。项目：{project_id}。状态：{execution_status}。"
+            f"后端：{backend}。会话：{thread}。"
+        )
+    if action == "objective.cancel":
+        if status not in {"cancelled", "reconciliation_needed", "backend_unavailable"}:
+            return _unsupported_bridge_result()
+        project_id = result.get("projectId")
+        objective_id = result.get("objectiveId")
+        turn_id = result.get("turnId")
+        if (
+            not all(type(value) is str and value for value in (project_id, objective_id))
+            or (turn_id is not None and (type(turn_id) is not str or not turn_id))
+        ):
+            return "Codex bridge protocol error."
+        turn = f"轮次：{turn_id}。" if turn_id is not None else ""
+        return (
+            f"任务取消状态：{status}。项目：{project_id}。"
+            f"任务：{objective_id}。{turn}"
+        )
+    if action == "interaction.answer":
+        if status not in {"answered", "response_uncertain", "response_retryable"}:
+            return _unsupported_bridge_result()
+        project_id = result.get("projectId")
+        objective_id = result.get("objectiveId")
+        interaction_id = result.get("interactionId")
+        if not all(
+            type(value) is str and value
+            for value in (project_id, objective_id, interaction_id)
+        ):
+            return "Codex bridge protocol error."
+        return (
+            f"交互回复状态：{status}。项目：{project_id}。任务：{objective_id}。"
+            f"交互：{interaction_id}。"
+        )
+    return _unsupported_bridge_result()
+
+
 def _valid_command(command: object) -> bool:
     if type(command) is not dict or type(command.get("type")) is not str:
         return False
@@ -867,6 +1051,22 @@ def register(ctx) -> None:
     used_nonces: dict[str, int] = {}
     pending_vault = PendingVault()
 
+    def signed_command_rewrite(command: dict, provenance: Provenance) -> dict:
+        now = _now_seconds()
+        payload = {
+            "version": 1,
+            "issuedAt": now,
+            "expiresAt": now + CONTEXT_LIFETIME_SECONDS,
+            "nonce": secrets.token_urlsafe(24),
+            "binding": _binding(provenance),
+            "command": command,
+        }
+        try:
+            context_token = _sign_context(payload, key)
+        except Exception:
+            return {"action": "rewrite", "text": f"{PRIVATE_COMMAND} invalid"}
+        return {"action": "rewrite", "text": f"{PRIVATE_COMMAND} {context_token}"}
+
     def hook(**kwargs):
         event = kwargs.get("event")
         source = getattr(event, "source", None)
@@ -893,24 +1093,17 @@ def register(ctx) -> None:
             command = _parse_command(event.text)
             if command is None:
                 return {"action": "rewrite", "text": f"{PRIVATE_COMMAND} invalid"}
-            now = _now_seconds()
-            payload = {
-                "version": 1,
-                "issuedAt": now,
-                "expiresAt": now + CONTEXT_LIFETIME_SECONDS,
-                "nonce": secrets.token_urlsafe(24),
-                "binding": _binding(provenance),
-                "command": command,
-            }
-            try:
-                context_token = _sign_context(payload, key)
-            except Exception:
-                return {"action": "rewrite", "text": f"{PRIVATE_COMMAND} invalid"}
-            return {
-                "action": "rewrite",
-                "text": f"{PRIVATE_COMMAND} {context_token}",
-            }
+            return signed_command_rewrite(command, provenance)
         route = find_route(snapshot, provenance.stream_id)
+        if (
+            route is not None
+            and route.owner == "PROJECT"
+            and _is_route_query(getattr(event, "text", None))
+        ):
+            source.profile = "codex-bridge"
+            return signed_command_rewrite(
+                {"type": "ROUTE", "action": "SHOW"}, provenance
+            )
         if route is not None and route.owner == "HERMES":
             source.profile = "hermes-general"
         elif (
@@ -986,10 +1179,7 @@ def register(ctx) -> None:
             return "Codex bridge unavailable."
         except BridgeProtocolError:
             return "Codex bridge protocol error."
-        try:
-            return json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        except (TypeError, ValueError):
-            return "Codex bridge protocol error."
+        return _render_bridge_result(result)
 
     async def natural_command_handler(raw_args: str):
         try:
@@ -1042,10 +1232,7 @@ def register(ctx) -> None:
             return "Codex bridge unavailable."
         except BridgeProtocolError:
             return "Codex bridge protocol error."
-        try:
-            return json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        except (TypeError, ValueError):
-            return "Codex bridge protocol error."
+        return _render_bridge_result(result)
 
     ctx.register_hook("pre_gateway_dispatch", hook)
     ctx.register_command("codex", public_command_handler, description="Codex bridge")

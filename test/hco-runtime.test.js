@@ -453,6 +453,247 @@ test("degrades initialize failure without closing control or selecting tmux", as
   await runtime.close();
 });
 
+test("retries a failed App Server initialization and re-enables the stable backend gate", async () => {
+  const scheduled = [];
+  const clients = [];
+  const fixture = harness();
+  fixture.dependencies.createClient = (options) => {
+    const index = clients.length;
+    const candidate = {
+      async initialize() {
+        fixture.calls.push(["client:initialize", index]);
+        if (index === 0) throw new Error("private initial failure");
+        return { userAgent: "recovered" };
+      },
+      close() { fixture.calls.push(["client:close", index]); },
+      options
+    };
+    clients.push(candidate);
+    return candidate;
+  };
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return scheduled.length;
+  };
+  fixture.dependencies.cancelRetry = () => undefined;
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  assert.equal(runtime.appServerAvailable, false);
+  assert.equal(clients.length, 1);
+  assert.deepEqual(scheduled.map(({ delayMs }) => delayMs), [1_000]);
+  await scheduled.shift().callback();
+
+  assert.equal(clients.length, 2);
+  assert.equal(runtime.appServerAvailable, true);
+  await fixture.controllerOptions.appServerBackend.startObjective({ objective: 1 });
+  assert.deepEqual(fixture.backendCalls, [["startObjective", { objective: 1 }]]);
+  assert.equal(JSON.stringify(fixture.diagnostics).includes("private initial failure"), false);
+  await runtime.close();
+});
+
+test("closes a retrying App Server client only once when runtime shutdown races initialization", async () => {
+  const retryInitialization = deferred();
+  const retryStarted = deferred();
+  const scheduled = [];
+  const closeCounts = [];
+  const fixture = harness();
+  fixture.dependencies.createClient = () => {
+    const index = closeCounts.length;
+    closeCounts.push(0);
+    return {
+      async initialize() {
+        if (index === 0) throw new Error("initial failure");
+        retryStarted.resolve();
+        return retryInitialization.promise;
+      },
+      close() { closeCounts[index] += 1; }
+    };
+  };
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return scheduled.length;
+  };
+  fixture.dependencies.cancelRetry = () => undefined;
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  const retryPromise = scheduled.shift().callback();
+  await retryStarted.promise;
+  await runtime.close();
+  retryInitialization.resolve({ userAgent: "late success" });
+  await retryPromise;
+
+  assert.deepEqual(closeCounts, [1, 1]);
+  assert.equal(runtime.appServerAvailable, false);
+});
+
+test("backs off repeated failures and resets retry delay after recovery", async () => {
+  const scheduled = [];
+  const clientOptions = [];
+  let clientIndex = 0;
+  const fixture = harness();
+  fixture.dependencies.createClient = (options) => {
+    const index = clientIndex++;
+    clientOptions.push(options);
+    return {
+      async initialize() {
+        if (index < 2 || index === 3) throw new Error("bounded failure");
+        return { userAgent: "recovered" };
+      },
+      close() {}
+    };
+  };
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return scheduled.length;
+  };
+  fixture.dependencies.cancelRetry = () => undefined;
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  const firstRetry = scheduled.shift();
+  assert.equal(firstRetry.delayMs, 1_000);
+  await firstRetry.callback();
+  const secondRetry = scheduled.shift();
+  assert.equal(secondRetry.delayMs, 2_000);
+  await secondRetry.callback();
+  assert.equal(runtime.appServerAvailable, true);
+
+  await clientOptions[2].onTerminal(new Error("post-recovery disconnect"));
+  assert.equal(scheduled.shift().delayMs, 1_000);
+  await runtime.close();
+});
+
+test("cancels a scheduled retry and ignores its late callback after shutdown", async () => {
+  const scheduled = [];
+  const cancelled = [];
+  const fixture = harness({
+    client: {
+      async initialize() { throw new Error("initial failure"); },
+      close() {}
+    }
+  });
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    const handle = { callback, delayMs };
+    scheduled.push(handle);
+    return handle;
+  };
+  fixture.dependencies.cancelRetry = (handle) => { cancelled.push(handle); };
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  assert.equal(fixture.createClientCalls, 1);
+  await runtime.close();
+  assert.deepEqual(cancelled, scheduled);
+  await scheduled[0].callback();
+  assert.equal(fixture.createClientCalls, 1);
+});
+
+test("ignores an old client terminal callback after a newer connection recovers", async () => {
+  const scheduled = [];
+  const clientOptions = [];
+  const fixture = harness();
+  fixture.dependencies.createClient = (options) => {
+    const index = clientOptions.length;
+    clientOptions.push(options);
+    return {
+      async initialize() {
+        if (index === 0) throw new Error("initial failure");
+        return { userAgent: "recovered" };
+      },
+      close() {}
+    };
+  };
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return scheduled.length;
+  };
+  fixture.dependencies.cancelRetry = () => undefined;
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  await scheduled.shift().callback();
+  assert.equal(runtime.appServerAvailable, true);
+  await clientOptions[0].onTerminal(new Error("late old terminal"));
+
+  assert.equal(runtime.appServerAvailable, true);
+  assert.equal(scheduled.length, 0);
+  assert.equal(
+    fixture.calls.filter((call) => Array.isArray(call) && call[0] === "controller:connection-lost").length,
+    0
+  );
+  await runtime.close();
+});
+
+test("retries synchronous backend construction failure and closes the failed client", async () => {
+  const scheduled = [];
+  const closeCounts = [0, 0];
+  let backendAttempt = 0;
+  let clientIndex = 0;
+  const fixture = harness();
+  fixture.dependencies.createClient = () => {
+    const index = clientIndex++;
+    return {
+      async initialize() { return { userAgent: "fake" }; },
+      close() { closeCounts[index] += 1; }
+    };
+  };
+  fixture.dependencies.createBackend = (options) => {
+    fixture.calls.push(["backend:create", options]);
+    if (backendAttempt++ === 0) throw new Error("backend construction failure");
+    return fixture.backend;
+  };
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return scheduled.length;
+  };
+  fixture.dependencies.cancelRetry = () => undefined;
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  assert.deepEqual(closeCounts, [1, 0]);
+  await scheduled.shift().callback();
+  assert.equal(runtime.appServerAvailable, true);
+  await runtime.close();
+  assert.deepEqual(closeCounts, [1, 1]);
+});
+
+test("terminal disconnect closes the availability gate before retrying", async () => {
+  const scheduled = [];
+  const clientOptions = [];
+  const fixture = harness();
+  fixture.dependencies.createClient = (options) => {
+    clientOptions.push(options);
+    return {
+      async initialize() { return { userAgent: "fake" }; },
+      close() { fixture.calls.push("dynamic-client:close"); }
+    };
+  };
+  fixture.dependencies.scheduleRetry = (callback, delayMs) => {
+    scheduled.push({ callback, delayMs });
+    return scheduled.length;
+  };
+  fixture.dependencies.cancelRetry = () => undefined;
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  assert.equal(runtime.appServerAvailable, true);
+  await clientOptions[0].onTerminal(new Error("private disconnect"));
+  assert.equal(runtime.appServerAvailable, false);
+  await assert.rejects(
+    fixture.controllerOptions.appServerBackend.startObjective({}),
+    { code: "EXECUTION_BACKEND_UNAVAILABLE" }
+  );
+  assert.equal(scheduled.length, 1);
+  await scheduled[0].callback();
+  assert.equal(runtime.appServerAvailable, true);
+  assert.equal(clientOptions.length, 2);
+  await runtime.close();
+});
+
+test("publishes bounded App Server health through the bridge provider", async () => {
+  const fixture = harness();
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  assert.deepEqual(fixture.bridgeOptions.healthProvider(), { appServerAvailable: true });
+  await fixture.clientOptions.onTerminal(new Error("private disconnect"));
+  assert.deepEqual(fixture.bridgeOptions.healthProvider(), { appServerAvailable: false });
+  await runtime.close();
+});
+
 test("degrades synchronous client creation to a pre-write unavailable backend", async () => {
   const fixture = harness({ createClientError: new Error("private spawn failure") });
   const runtime = await createHcoRuntime(fixture.dependencies);
@@ -478,7 +719,7 @@ test("passes tmux only when explicitly injected", async () => {
   await runtime.close();
 });
 
-test("failed initial snapshot prevents listener start and rolls startup back", async () => {
+test("failed initial snapshot prevents listener and App Server start then rolls back", async () => {
   const fixture = harness({
     service: {
       async start() { fixture.calls.push("service:start"); throw new Error("snapshot failed"); },
@@ -488,10 +729,11 @@ test("failed initial snapshot prevents listener start and rolls startup back", a
 
   await assert.rejects(() => createHcoRuntime(fixture.dependencies), /snapshot failed/);
   assert.equal(fixture.calls.some((call) => Array.isArray(call) && call[0] === "bridge:start"), false);
-  assert.deepEqual(fixture.calls.slice(-3), ["service:close", "client:close", "store:close"]);
+  assert.equal(fixture.calls.includes("client:create"), false);
+  assert.deepEqual(fixture.calls.slice(-2), ["service:close", "store:close"]);
 });
 
-test("listener startup failure rolls service, owned client, and store back in reverse order", async () => {
+test("listener startup failure rolls service and store back before App Server creation", async () => {
   const fixture = harness({
     bridge: {
       async start(options) {
@@ -502,7 +744,8 @@ test("listener startup failure rolls service, owned client, and store back in re
   });
 
   await assert.rejects(() => createHcoRuntime(fixture.dependencies), /listen failed/);
-  assert.deepEqual(fixture.calls.slice(-3), ["service:close", "client:close", "store:close"]);
+  assert.equal(fixture.calls.includes("client:create"), false);
+  assert.deepEqual(fixture.calls.slice(-2), ["service:close", "store:close"]);
 });
 
 test("close uses one promise and shuts down listener, service, owned client, then store", async () => {

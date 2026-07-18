@@ -1,6 +1,6 @@
 function isCompletedAgentMessage(item) {
   return item !== null && typeof item === "object" &&
-    item.type === "agentMessage" && item.status === "completed" &&
+    item.type === "agentMessage" && (item.status === undefined || item.status === "completed") &&
     typeof item.id === "string" && item.id.length > 0 && typeof item.text === "string";
 }
 

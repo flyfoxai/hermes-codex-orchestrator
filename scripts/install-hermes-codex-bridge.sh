@@ -153,6 +153,7 @@ import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 import plistlib
 import pwd
@@ -183,6 +184,9 @@ ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
 GATEWAY_STATE_FILE = "gateway_state.json"
 MAX_CONFIG_BYTES = 262_144
 MAX_SECRET_BYTES = 4_096
+BRIDGE_READINESS_TIMEOUT_SECONDS = 8.0
+APP_SERVER_READINESS_TIMEOUT_SECONDS = 40.0
+PROCESS_EXIT_TIMEOUT_SECONDS = 8.0
 RESTRICTED_TOOLSETS: list[str] = ["zulip-history"]
 HERMES_CHECKOUT = Path("/Users/hula/Projects/hermesAgent")
 HERMES_PROJECT_ENV = Path("/Users/hula/Projects/hermesAgent/.env")
@@ -200,6 +204,19 @@ class CompatibilityError(InstallError):
     pass
 
 
+_process_exit_timeout_override = os.environ.get(
+    "HCO_INSTALLER_TEST_PROCESS_EXIT_TIMEOUT_SECONDS"
+)
+if _process_exit_timeout_override is not None:
+    try:
+        _process_exit_timeout_candidate = float(_process_exit_timeout_override)
+    except ValueError as error:
+        raise InstallError("test process-exit timeout must be a positive finite number") from error
+    if not math.isfinite(_process_exit_timeout_candidate) or _process_exit_timeout_candidate <= 0:
+        raise InstallError("test process-exit timeout must be a positive finite number")
+    PROCESS_EXIT_TIMEOUT_SECONDS = _process_exit_timeout_candidate
+
+
 @dataclass
 class Snapshot:
     path: Path
@@ -209,6 +226,15 @@ class Snapshot:
     mode: int | None
     uid: int | None
     gid: int | None
+
+
+@dataclass(frozen=True)
+class ReleaseMigration:
+    source: Path
+    destination: Path
+    quarantine: Path | None
+    expected_files: dict[str, str]
+    expected_directories: set[str]
 
 
 @dataclass(frozen=True)
@@ -252,6 +278,14 @@ python_bin = Path(sys.executable)
 uid = os.getuid()
 bridge_launch_domain = f"gui/{uid}"
 gateway_launch_domains = (f"user/{uid}", f"gui/{uid}")
+
+
+def hco_launch_environment() -> dict[str, str]:
+    return {
+        "HCO_CONFIG_PATH": hco_config_text,
+        "HOME": os.environ["HOME"],
+        "PATH": f"{node_bin.parent}:/usr/bin:/bin:/usr/sbin:/sbin",
+    }
 
 
 def diagnostic(message: str) -> None:
@@ -372,6 +406,23 @@ def check_bridge_compatibility(document: dict[str, Any], bearer: bytes) -> None:
         sys.modules.pop("zulip_sender", None)
 
 
+def check_hco_health(document: dict[str, Any], bearer: bytes) -> None:
+    source = repository / "plugin" / PLUGIN_NAME
+    old_path = list(sys.path)
+    sys.path.insert(0, str(source))
+    try:
+        from delivery_sidecar import HcoClient
+
+        client = HcoClient(
+            document["bridge"]["socketPath"], bearer, "installer-health", 1, 1000
+        )
+        client.check_health()
+    finally:
+        sys.path[:] = old_path
+        sys.modules.pop("delivery_sidecar", None)
+        sys.modules.pop("zulip_sender", None)
+
+
 def bridge_gate(document: dict[str, Any], bearer: bytes) -> None:
     try:
         check_bridge_compatibility(document, bearer)
@@ -384,9 +435,15 @@ def wait_bridge_gate(
     document: dict[str, Any],
     bearer: bytes,
     *,
-    timeout: float = 8.0,
+    timeout: float | None = None,
     process: subprocess.Popen[Any] | None = None,
+    require_app_server: bool = False,
 ) -> None:
+    if timeout is None:
+        timeout = (
+            APP_SERVER_READINESS_TIMEOUT_SECONDS if require_app_server
+            else BRIDGE_READINESS_TIMEOUT_SECONDS
+        )
     deadline = time.monotonic() + timeout
     last_error: BaseException | None = None
     while time.monotonic() < deadline:
@@ -394,7 +451,11 @@ def wait_bridge_gate(
             raise CompatibilityError("bridge protocol compatibility: failed (temporary HCO exited before readiness)")
         try:
             check_bridge_compatibility(document, bearer)
+            if require_app_server:
+                check_hco_health(document, bearer)
             diagnostic("bridge protocol compatibility: passed")
+            if require_app_server:
+                diagnostic("Codex App Server readiness: passed")
             return
         except BaseException as error:
             last_error = error
@@ -444,7 +505,7 @@ def app_server_gate(document: dict[str, Any]) -> None:
             stderr=subprocess.DEVNULL,
             text=True,
             bufsize=1,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            env={**hco_launch_environment(), "PYTHONDONTWRITEBYTECODE": "1"},
         )
         assert process.stdout is not None
         reader = threading.Thread(target=collect, args=(process.stdout,), daemon=True)
@@ -1154,6 +1215,27 @@ def wait_service_state(
     raise InstallError(f"service state did not settle for {label}")
 
 
+def wait_process_exit(
+    pid: int | None,
+    label: str,
+    timeout: float = PROCESS_EXIT_TIMEOUT_SECONDS,
+) -> None:
+    if pid is None:
+        return
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        except PermissionError as error:
+            raise InstallError(
+                f"cannot verify stopped process ownership for {label} PID {pid}"
+            ) from error
+        time.sleep(0.05)
+    raise InstallError(f"stopped process did not exit for {label} PID {pid}")
+
+
 def bootout(label: str) -> None:
     launchctl("bootout", f"{bridge_launch_domain}/{label}", check=False)
 
@@ -1418,9 +1500,9 @@ def initial_bridge_gate(
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            env={**os.environ, "HCO_CONFIG_PATH": hco_config_text, "PYTHONDONTWRITEBYTECODE": "1"},
+            env={**hco_launch_environment(), "PYTHONDONTWRITEBYTECODE": "1"},
         )
-        wait_bridge_gate(document, bearer, process=process)
+        wait_bridge_gate(document, bearer, process=process, require_app_server=True)
     finally:
         if process is not None and process.poll() is None:
             process.terminate()
@@ -1447,7 +1529,7 @@ def make_plists(
     hco = {
         "Label": HCO_LABEL,
         "ProgramArguments": [str(node_bin), str(repository / "hco" / "index.js")],
-        "EnvironmentVariables": {"HCO_CONFIG_PATH": hco_config_text},
+        "EnvironmentVariables": hco_launch_environment(),
         "RunAtLoad": True,
         "KeepAlive": True,
         "StandardOutPath": str(logs / "hco.stdout.log"),
@@ -1478,20 +1560,59 @@ def make_plists(
     )
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def is_python_runtime_cache(relative: Path) -> bool:
+    return "__pycache__" in relative.parts or relative.name.endswith(".pyc")
+
+
+def validate_python_runtime_cache(relative: Path, info: os.stat_result) -> None:
+    if stat.S_ISLNK(info.st_mode) or info.st_uid != uid:
+        raise InstallError("plugin release Python cache rejected ownership or symlink")
+    mode = stat.S_IMODE(info.st_mode)
+    if mode & 0o022:
+        raise InstallError("plugin release Python cache is writable by another user")
+    if stat.S_ISDIR(info.st_mode):
+        if (
+            relative.name != "__pycache__"
+            or "__pycache__" in relative.parent.parts
+            or (mode & 0o700) != 0o700
+        ):
+            raise InstallError("plugin release Python cache contains an invalid directory")
+    elif stat.S_ISREG(info.st_mode):
+        if (
+            relative.suffix != ".pyc"
+            or relative.parent.name != "__pycache__"
+            or "__pycache__" in relative.parent.parent.parts
+            or (mode & 0o600) != 0o600
+        ):
+            raise InstallError("plugin release Python cache contains an invalid file")
+    else:
+        raise InstallError("plugin release Python cache contains an unsupported path")
+
+
 def release_manifest(source: Path) -> tuple[dict[str, str], set[str]]:
     files: dict[str, str] = {}
     directories: set[str] = set()
     for path in sorted(source.rglob("*")):
-        relative = str(path.relative_to(source))
-        if "__pycache__" in path.parts or path.name.endswith(".pyc"):
-            continue
         info = path.lstat()
+        relative_path = path.relative_to(source)
+        relative = str(relative_path)
+        if is_python_runtime_cache(relative_path):
+            validate_python_runtime_cache(relative_path, info)
+            continue
         if stat.S_ISLNK(info.st_mode):
             raise InstallError("plugin release source contains a symlink")
         if stat.S_ISDIR(info.st_mode):
             directories.add(relative)
         elif stat.S_ISREG(info.st_mode):
-            files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            files[relative] = file_sha256(path)
         else:
             raise InstallError("plugin release source contains an unsupported path")
     return files, directories
@@ -1525,8 +1646,12 @@ def validate_release_manifest(
     actual_files: dict[str, str] = {}
     actual_directories: set[str] = set()
     for path in sorted(destination.rglob("*")):
-        relative = str(path.relative_to(destination))
         info = path.lstat()
+        relative_path = path.relative_to(destination)
+        relative = str(relative_path)
+        if is_python_runtime_cache(relative_path):
+            validate_python_runtime_cache(relative_path, info)
+            continue
         if stat.S_ISLNK(info.st_mode) or info.st_uid != uid:
             raise InstallError("plugin release integrity check rejected ownership or symlink")
         if stat.S_ISDIR(info.st_mode):
@@ -1536,7 +1661,7 @@ def validate_release_manifest(
         elif stat.S_ISREG(info.st_mode):
             if stat.S_IMODE(info.st_mode) != 0o600:
                 raise InstallError("plugin release integrity check rejected file mode")
-            actual_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+            actual_files[relative] = file_sha256(path)
         else:
             raise InstallError("plugin release integrity check rejected unsupported path")
     if actual_files != expected_files or actual_directories != expected_directories:
@@ -1546,6 +1671,189 @@ def validate_release_manifest(
 def validate_release_integrity(source: Path, destination: Path) -> None:
     expected_files, expected_directories = release_manifest(source)
     validate_release_manifest(expected_files, expected_directories, destination)
+
+
+RELEASE_NAME_PATTERN = re.compile(
+    rf"^{re.escape(PLUGIN_NAME)}-(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-(?P<digest>[0-9a-f]{{12}})$"
+)
+
+
+def validate_installer_owned_release(
+    release: Path,
+    match: re.Match[str],
+) -> tuple[dict[str, str], set[str]]:
+    try:
+        info = release.lstat()
+    except FileNotFoundError as error:
+        raise InstallError("installer-owned plugin release disappeared during validation") from error
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise InstallError("installer-owned plugin release must be a real directory")
+    expected_files, expected_directories = release_manifest(release)
+    validate_release_manifest(expected_files, expected_directories, release)
+    required_files = {"plugin.py", "delivery_sidecar.py", "plugin.yaml"}
+    if not required_files <= expected_files.keys():
+        raise InstallError("installer-owned plugin release is incomplete")
+    if release_digest(release) != match.group("digest"):
+        raise InstallError("installer-owned plugin release digest does not match its name")
+    try:
+        manifest = yaml.safe_load((release / "plugin.yaml").read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as error:
+        raise InstallError("installer-owned plugin release manifest is invalid") from error
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("name") != PLUGIN_NAME
+        or str(manifest.get("version", "")) != match.group("version")
+    ):
+        raise InstallError("installer-owned plugin release manifest does not match its name")
+    return expected_files, expected_directories
+
+
+def plan_release_migrations(
+    plugins_dir: Path,
+    release_store: Path,
+) -> list[ReleaseMigration]:
+    if not plugins_dir.exists():
+        return []
+    migrations: list[ReleaseMigration] = []
+    for source in sorted(plugins_dir.iterdir(), key=lambda path: path.name):
+        match = RELEASE_NAME_PATTERN.fullmatch(source.name)
+        if match is None:
+            continue
+        expected_files, expected_directories = validate_installer_owned_release(
+            source, match
+        )
+        destination = release_store / source.name
+        quarantine: Path | None = None
+        try:
+            destination.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            validate_release_manifest(
+                expected_files, expected_directories, destination
+            )
+            quarantine = release_store / (
+                f".{source.name}.migration-quarantine-{os.getpid()}-{len(migrations)}"
+            )
+            try:
+                quarantine.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstallError("refusing pre-existing release migration quarantine")
+        migrations.append(
+            ReleaseMigration(
+                source,
+                destination,
+                quarantine,
+                expected_files,
+                expected_directories,
+            )
+        )
+    return migrations
+
+
+def apply_release_migrations(
+    migrations: list[ReleaseMigration],
+    applied: list[ReleaseMigration],
+) -> None:
+    for migration in migrations:
+        match = RELEASE_NAME_PATTERN.fullmatch(migration.source.name)
+        if match is None:
+            raise InstallError("planned plugin release migration became invalid")
+        actual_files, actual_directories = validate_installer_owned_release(
+            migration.source, match
+        )
+        if (
+            actual_files != migration.expected_files
+            or actual_directories != migration.expected_directories
+        ):
+            raise InstallError("plugin release changed after migration planning")
+        migration.destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if migration.quarantine is None:
+            try:
+                migration.destination.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstallError("plugin release migration destination appeared after planning")
+            os.replace(migration.source, migration.destination)
+            applied.append(migration)
+            validate_release_manifest(
+                migration.expected_files,
+                migration.expected_directories,
+                migration.destination,
+            )
+        else:
+            validate_release_manifest(
+                migration.expected_files,
+                migration.expected_directories,
+                migration.destination,
+            )
+            try:
+                migration.quarantine.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstallError("release migration quarantine appeared after planning")
+            os.replace(migration.source, migration.quarantine)
+            applied.append(migration)
+            validate_release_manifest(
+                migration.expected_files,
+                migration.expected_directories,
+                migration.quarantine,
+            )
+
+
+def rollback_release_migrations(applied: list[ReleaseMigration]) -> None:
+    failures: list[tuple[str, BaseException]] = []
+    for index, migration in enumerate(reversed(applied)):
+        try:
+            try:
+                migration.source.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                raise InstallError("release migration rollback source is unexpectedly occupied")
+            carrier = (
+                migration.destination
+                if migration.quarantine is None
+                else migration.quarantine
+            )
+            validate_release_manifest(
+                migration.expected_files,
+                migration.expected_directories,
+                carrier,
+            )
+            os.replace(carrier, migration.source)
+            validate_release_manifest(
+                migration.expected_files,
+                migration.expected_directories,
+                migration.source,
+            )
+            if (
+                index == 0
+                and os.environ.get("HCO_INSTALLER_TEST_ROLLBACK_FAILPOINT")
+                == "release_migration"
+            ):
+                raise InstallError("injected failure during release migration rollback")
+        except BaseException as error:
+            failures.append((str(migration.source), error))
+    if failures:
+        details = "; ".join(
+            f"{path}: {str(error)[:300]}" for path, error in failures[:8]
+        )
+        if len(failures) > 8:
+            details += f"; {len(failures) - 8} additional failure(s)"
+        raise InstallError(f"release migration rollback failed ({details})")
+    applied.clear()
+
+
+def commit_release_migrations(applied: list[ReleaseMigration]) -> None:
+    for migration in applied:
+        if migration.quarantine is not None:
+            remove_path(migration.quarantine)
+    applied.clear()
 
 
 def create_release(
@@ -1616,7 +1924,7 @@ def activate_symlink(
         raise InstallError("refusing pre-existing stable symlink staging path")
     created_temporary = False
     try:
-        os.symlink(release.name, temporary)
+        os.symlink(os.path.relpath(release, stable.parent), temporary)
         created_temporary = True
         if inject_failures and os.environ.get("HCO_INSTALLER_TEST_FAILPOINT") == "stable_symlink":
             raise InstallError("injected failure during stable symlink creation")
@@ -1650,7 +1958,8 @@ def promote_stable_symlink(staged: Path, stable: Path, release: Path) -> None:
         raise InstallError(
             f"unmanaged plugin directory at {stable}; move it aside explicitly before installing"
         )
-    if not staged.is_symlink() or os.readlink(staged) != release.name:
+    expected_target = os.path.relpath(release, stable.parent)
+    if not staged.is_symlink() or os.readlink(staged) != expected_target:
         raise InstallError("staged stable plugin symlink is invalid")
     failpoint = os.environ.get("HCO_INSTALLER_TEST_FAILPOINT")
     if failpoint == "stable_symlink":
@@ -2103,11 +2412,13 @@ def stage_effective_hermes_layout(
         if profile_env_data is not None:
             atomic_write(profile_home / ".env", profile_env_data)
     plugins_dir = stage_root / "plugins"
+    release_store = stage_root / "plugin-releases"
     plugins_dir.mkdir(mode=0o700)
+    release_store.mkdir(mode=0o700)
     link_installed_plugin_siblings(installed_plugins, plugins_dir)
-    staged_candidate = plugins_dir / f".{PLUGIN_NAME}.candidate-{os.getpid()}"
+    staged_candidate = release_store / f".{PLUGIN_NAME}.candidate-{os.getpid()}"
     create_release(source_plugin, staged_candidate)
-    staged_release = plugins_dir / (
+    staged_release = release_store / (
         f"{PLUGIN_NAME}-{PLUGIN_VERSION}-{release_digest(staged_candidate)}"
     )
     os.replace(staged_candidate, staged_release)
@@ -2209,6 +2520,7 @@ def main() -> None:
     root_env = root / ".env"
     ingress_env = ingress_home / ".env"
     plugins_dir = root / "plugins"
+    release_store = root / "plugin-releases"
     profiles_dir = bridge_home.parent
     logs_dir = install_root / "logs"
     stable_link = plugins_dir / PLUGIN_NAME
@@ -2216,7 +2528,7 @@ def main() -> None:
         raise InstallError(
             f"unmanaged plugin directory at {stable_link}; move it aside explicitly before installing"
         )
-    release = plugins_dir / f"{PLUGIN_NAME}-{PLUGIN_VERSION}-{release_digest(source_plugin)}"
+    release = release_store / f"{PLUGIN_NAME}-{PLUGIN_VERSION}-{release_digest(source_plugin)}"
     root_config_path = root / "config.yaml"
     ingress_config_path = ingress_home / "config.yaml"
     ingress_reminder_path = ingress_home / "SOUL.md"
@@ -2273,6 +2585,7 @@ def main() -> None:
     for path, label, is_directory in (
         (root, "default Hermes root", True),
         (plugins_dir, "Hermes plugin directory", True),
+        (release_store, "Hermes plugin release store", True),
         (profiles_dir, "Hermes profiles directory", True),
         (ingress_home, "zulip-ingress profile directory", True),
         (bridge_home, "codex-bridge profile directory", True),
@@ -2292,6 +2605,8 @@ def main() -> None:
         (delivery_plist_path, "delivery LaunchAgent plist", False),
     ):
         validate_mutable_path(path, label, directory=is_directory)
+    if release_store.exists() and stat.S_IMODE(release_store.lstat().st_mode) != 0o700:
+        raise InstallError("existing Hermes plugin release store must have mode 0700")
     if stable_link.is_symlink() and stable_link.lstat().st_uid != uid:
         raise InstallError("stable plugin symlink must be owned by the invoking user")
     for path in runtime_paths:
@@ -2313,10 +2628,12 @@ def main() -> None:
         validate_mutable_path(path, "Hermes preflight directory", directory=True)
     for path in hermes_preflight_files:
         validate_mutable_path(path, "Hermes preflight file", directory=False)
+    release_migrations = plan_release_migrations(plugins_dir, release_store)
     external_profiles = discover_external_profiles(profiles_dir)
     touched_paths = list(dict.fromkeys([
         root,
         plugins_dir,
+        release_store,
         profiles_dir,
         ingress_home,
         bridge_home,
@@ -2392,119 +2709,251 @@ def main() -> None:
     mutation_started = False
     services_mutated = False
     gateway_mutated = False
+    applied_release_migrations: list[ReleaseMigration] = []
+    service_pids_requiring_exit: dict[str, set[int]] = {
+        HCO_LABEL: set(),
+        DELIVERY_LABEL: set(),
+    }
+
+    def retain_service_pid(label: str, state: ServiceState) -> None:
+        if state.pid is not None:
+            service_pids_requiring_exit[label].add(state.pid)
+
+    def drain_service_pids(label: str) -> None:
+        for pid in tuple(sorted(service_pids_requiring_exit[label])):
+            wait_process_exit(pid, label)
+            service_pids_requiring_exit[label].remove(pid)
 
     def rollback() -> None:
+        rollback_errors: list[tuple[str, BaseException]] = []
         rollback_produced_valid_attestation = False
         stopped_gateway_pid = prior_gateway.pid
+
+        def record_failure(label: str, error: BaseException) -> None:
+            rollback_errors.append((label, error))
+
+        def stop_affected_services() -> None:
+            if services_mutated:
+                stopping_services: dict[str, ServiceState] = {}
+                for label in (DELIVERY_LABEL, HCO_LABEL):
+                    try:
+                        state = service_state(
+                            bridge_launch_domain, label
+                        )
+                        stopping_services[label] = state
+                        retain_service_pid(label, state)
+                    except BaseException as error:
+                        record_failure(f"capture {label} before forced stop", error)
+                for label in (DELIVERY_LABEL, HCO_LABEL):
+                    try:
+                        bootout(label)
+                    except BaseException as error:
+                        record_failure(f"stop {label}", error)
+                for label in (DELIVERY_LABEL, HCO_LABEL):
+                    try:
+                        wait_service_state(
+                            bridge_launch_domain,
+                            label,
+                            ServiceState(bridge_launch_domain, False, False, None),
+                        )
+                    except BaseException as error:
+                        record_failure(f"verify stopped {label}", error)
+                for label in (DELIVERY_LABEL, HCO_LABEL):
+                    try:
+                        drain_service_pids(label)
+                    except BaseException as error:
+                        record_failure(f"verify exited {label}", error)
+            if gateway_mutated:
+                try:
+                    launchctl(
+                        "bootout",
+                        f"{prior_gateway.domain}/{GATEWAY_LABEL}",
+                        check=False,
+                    )
+                except BaseException as error:
+                    record_failure(f"stop {GATEWAY_LABEL}", error)
+                try:
+                    wait_service_state(
+                        prior_gateway.domain,
+                        GATEWAY_LABEL,
+                        ServiceState(prior_gateway.domain, False, False, None),
+                    )
+                except BaseException as error:
+                    record_failure(f"verify stopped {GATEWAY_LABEL}", error)
+
+        def raise_rollback_errors() -> None:
+            details = "; ".join(
+                f"{label}: {str(error)[:300]}"
+                for label, error in rollback_errors[:12]
+            )
+            if len(rollback_errors) > 12:
+                details += f"; {len(rollback_errors) - 12} additional failure(s)"
+            raise InstallError(details)
+
         if gateway_mutated:
-            current_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
-            if current_gateway.pid is not None:
-                stopped_gateway_pid = current_gateway.pid
+            try:
+                current_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
+                if current_gateway.pid is not None:
+                    stopped_gateway_pid = current_gateway.pid
+            except BaseException as error:
+                record_failure("capture activated Gateway state", error)
         if services_mutated:
+            stopping_services: dict[str, ServiceState] = {}
             for label in (DELIVERY_LABEL, HCO_LABEL):
-                bootout(label)
+                try:
+                    state = service_state(
+                        bridge_launch_domain, label
+                    )
+                    stopping_services[label] = state
+                    retain_service_pid(label, state)
+                except BaseException as error:
+                    record_failure(f"capture {label} before restoration", error)
             for label in (DELIVERY_LABEL, HCO_LABEL):
-                wait_service_state(
-                    bridge_launch_domain,
-                    label,
-                    ServiceState(bridge_launch_domain, False, False, None),
-                )
+                try:
+                    bootout(label)
+                except BaseException as error:
+                    record_failure(f"stop {label} before restoration", error)
+            for label in (DELIVERY_LABEL, HCO_LABEL):
+                try:
+                    wait_service_state(
+                        bridge_launch_domain,
+                        label,
+                        ServiceState(bridge_launch_domain, False, False, None),
+                    )
+                except BaseException as error:
+                    record_failure(f"verify stopped {label} before restoration", error)
+            for label in (DELIVERY_LABEL, HCO_LABEL):
+                try:
+                    drain_service_pids(label)
+                except BaseException as error:
+                    record_failure(f"verify exited {label} before restoration", error)
+        if rollback_errors:
+            stop_affected_services()
+            raise_rollback_errors()
+        try:
+            rollback_release_migrations(applied_release_migrations)
+        except BaseException as error:
+            record_failure("restore release migrations", error)
         for item in reversed(snapshots):
             if item.kind == "socket" and not services_mutated:
                 continue
-            restore(item)
+            try:
+                restore(item)
+            except BaseException as error:
+                record_failure(f"restore {item.path}", error)
         # Prove restoration before either service can legitimately mutate its
         # runtime state. Sockets are recreated by the restored HCO process and
         # are covered by the bridge readiness gate below.
         for item in snapshots:
-            if item.kind != "socket":
+            if item.kind == "socket":
+                continue
+            try:
                 verify_snapshot(item)
-        if services_mutated:
-            if prior_services[HCO_LABEL].loaded and hco_plist_path.exists():
-                bootstrap(hco_plist_path)
-                wait_service_state(
-                    bridge_launch_domain,
-                    HCO_LABEL,
-                    prior_services[HCO_LABEL],
+            except BaseException as error:
+                record_failure(f"verify {item.path}", error)
+        if rollback_errors:
+            stop_affected_services()
+            raise_rollback_errors()
+
+        try:
+            if services_mutated:
+                if prior_services[HCO_LABEL].loaded and hco_plist_path.exists():
+                    bootstrap(hco_plist_path)
+                    wait_service_state(
+                        bridge_launch_domain,
+                        HCO_LABEL,
+                        prior_services[HCO_LABEL],
+                    )
+                    if prior_services[HCO_LABEL].running:
+                        wait_bridge_gate(document, bearer)
+            if gateway_mutated:
+                launchctl(
+                    "kickstart",
+                    "-k",
+                    f"{prior_gateway.domain}/{GATEWAY_LABEL}",
                 )
-                if prior_services[HCO_LABEL].running:
-                    wait_bridge_gate(document, bearer)
-        if gateway_mutated:
-            launchctl(
-                "kickstart",
-                "-k",
-                f"{prior_gateway.domain}/{GATEWAY_LABEL}",
-            )
-            if prior_plugin_version is not None:
-                restored_gateway = wait_gateway_evidence(
-                    prior_gateway.domain,
-                    stopped_gateway_pid or 0,
-                    gateway_state_path,
-                    attestation_path,
-                    prior_plugin_release,
-                    prior_plugin_version,
-                    prior_runtime_profiles,
-                    prior_runtime_platforms,
-                )
-            else:
-                restored_gateway = wait_gateway_runtime_evidence(
-                    prior_gateway.domain,
-                    stopped_gateway_pid or 0,
-                    gateway_state_path,
-                    prior_runtime_profiles,
-                    prior_runtime_platforms,
-                )
-            time.sleep(0.2)
-            stable_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
-            if prior_plugin_version is not None:
-                validate_gateway_evidence(
-                    stable_gateway,
-                    gateway_state_path,
-                    attestation_path,
-                    prior_plugin_release,
-                    prior_plugin_version,
-                    prior_runtime_profiles,
-                    prior_runtime_platforms,
-                )
-            else:
-                validate_gateway_runtime_evidence(
-                    stable_gateway,
-                    gateway_state_path,
-                    prior_runtime_profiles,
-                    prior_runtime_platforms,
-                )
-                if prior_plugin_release is not None:
-                    try:
-                        validate_gateway_attestation(
-                            stable_gateway,
-                            attestation_path,
-                            prior_plugin_release,
-                            None,
-                        )
-                    except InstallError:
-                        pass
-                    else:
-                        rollback_produced_valid_attestation = True
-            if restored_gateway.pid == prior_gateway.pid:
-                raise InstallError("rollback did not restart the prior Hermes Gateway configuration")
-        if services_mutated and prior_services[DELIVERY_LABEL].loaded and delivery_plist_path.exists():
-            bootstrap(delivery_plist_path)
-        for item in snapshots:
-            if item.path in runtime_path_set:
-                continue
+                if prior_plugin_version is not None:
+                    restored_gateway = wait_gateway_evidence(
+                        prior_gateway.domain,
+                        stopped_gateway_pid or 0,
+                        gateway_state_path,
+                        attestation_path,
+                        prior_plugin_release,
+                        prior_plugin_version,
+                        prior_runtime_profiles,
+                        prior_runtime_platforms,
+                    )
+                else:
+                    restored_gateway = wait_gateway_runtime_evidence(
+                        prior_gateway.domain,
+                        stopped_gateway_pid or 0,
+                        gateway_state_path,
+                        prior_runtime_profiles,
+                        prior_runtime_platforms,
+                    )
+                time.sleep(0.2)
+                stable_gateway = service_state(prior_gateway.domain, GATEWAY_LABEL)
+                if prior_plugin_version is not None:
+                    validate_gateway_evidence(
+                        stable_gateway,
+                        gateway_state_path,
+                        attestation_path,
+                        prior_plugin_release,
+                        prior_plugin_version,
+                        prior_runtime_profiles,
+                        prior_runtime_platforms,
+                    )
+                else:
+                    validate_gateway_runtime_evidence(
+                        stable_gateway,
+                        gateway_state_path,
+                        prior_runtime_profiles,
+                        prior_runtime_platforms,
+                    )
+                    if prior_plugin_release is not None:
+                        try:
+                            validate_gateway_attestation(
+                                stable_gateway,
+                                attestation_path,
+                                prior_plugin_release,
+                                None,
+                            )
+                        except InstallError:
+                            pass
+                        else:
+                            rollback_produced_valid_attestation = True
+                if restored_gateway.pid == prior_gateway.pid:
+                    raise InstallError(
+                        "rollback did not restart the prior Hermes Gateway configuration"
+                    )
             if (
-                gateway_mutated
-                and item.path == attestation_path
-                and (
-                    prior_plugin_version is not None
-                    or rollback_produced_valid_attestation
-                )
+                services_mutated
+                and prior_services[DELIVERY_LABEL].loaded
+                and delivery_plist_path.exists()
             ):
-                continue
-            verify_snapshot(item)
-        if services_mutated:
-            for label in (HCO_LABEL, DELIVERY_LABEL):
-                wait_service_state(bridge_launch_domain, label, prior_services[label])
+                bootstrap(delivery_plist_path)
+            for item in snapshots:
+                if item.path in runtime_path_set:
+                    continue
+                if (
+                    gateway_mutated
+                    and item.path == attestation_path
+                    and (
+                        prior_plugin_version is not None
+                        or rollback_produced_valid_attestation
+                    )
+                ):
+                    continue
+                verify_snapshot(item)
+            if services_mutated:
+                for label in (HCO_LABEL, DELIVERY_LABEL):
+                    wait_service_state(
+                        bridge_launch_domain, label, prior_services[label]
+                    )
+        except BaseException as error:
+            record_failure("restore prior service state", error)
+            stop_affected_services()
+            raise_rollback_errors()
 
     old_handlers: dict[int, Any] = {}
 
@@ -2631,13 +3080,18 @@ def main() -> None:
                 raise InstallError("injected failure after staged Hermes probe")
 
             plugins_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            release_store.mkdir(mode=0o700, parents=True, exist_ok=True)
             ingress_home.mkdir(mode=0o700, parents=True, exist_ok=True)
             bridge_home.mkdir(mode=0o700, parents=True, exist_ok=True)
             general_home.mkdir(mode=0o700, parents=True, exist_ok=True)
             launch_agents_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
             logs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            for directory in (plugins_dir, profiles_dir, ingress_home, bridge_home, general_home, launch_agents_dir, logs_dir):
+            for directory in (plugins_dir, release_store, profiles_dir, ingress_home, bridge_home, general_home, launch_agents_dir, logs_dir):
                 os.chmod(directory, 0o700)
+            apply_release_migrations(
+                release_migrations,
+                applied_release_migrations,
+            )
             promote_release(staged_release, release)
             promote_stable_symlink(staged_stable, stable_link, release)
         finally:
@@ -2665,6 +3119,13 @@ def main() -> None:
             "activated",
         )
         services_mutated = True
+        stopping_services = {
+            label: service_state(bridge_launch_domain, label)
+            for label in (DELIVERY_LABEL, HCO_LABEL)
+            if prior_services[label].loaded
+        }
+        for label, state in stopping_services.items():
+            retain_service_pid(label, state)
         for label in (DELIVERY_LABEL, HCO_LABEL):
             if prior_services[label].loaded:
                 bootout(label)
@@ -2675,6 +3136,8 @@ def main() -> None:
                     label,
                     ServiceState(bridge_launch_domain, False, False, None),
                 )
+        for label in stopping_services:
+            drain_service_pids(label)
         bootstrap(hco_plist_path)
         # HCO starts first. Both launchd ownership and protocol readiness must
         # settle before the send-only delivery worker can consume an outbox row.
@@ -2683,7 +3146,7 @@ def main() -> None:
             HCO_LABEL,
             ServiceState(bridge_launch_domain, True, True, None),
         )
-        wait_bridge_gate(document, bearer)
+        wait_bridge_gate(document, bearer, require_app_server=True)
         gateway_mutated = True
         remove_path(attestation_path)
         launchctl(
@@ -2722,13 +3185,14 @@ def main() -> None:
             DELIVERY_LABEL,
             ServiceState(bridge_launch_domain, True, True, None),
         )
+        commit_release_migrations(applied_release_migrations)
     except BaseException:
         if mutation_started:
             try:
                 rollback()
             except BaseException as rollback_error:
                 raise InstallError(
-                    "rollback verification failed; bridge services were stopped but manual restoration is required"
+                    "rollback verification failed; affected services were stopped and manual restoration is required"
                     f" ({rollback_error})"
                 ) from rollback_error
         raise

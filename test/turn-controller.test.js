@@ -566,6 +566,35 @@ test("terminal output reduction prefers final_answer, excludes commentary, and h
   }), { text: "byte-for-byte\r\nlatest", itemIds: ["legacy-b"] });
 });
 
+test("terminal output reduction accepts current App Server agent messages without item status", () => {
+  assert.deepEqual(reduceTerminalOutput({
+    id: "turn-current-app-server",
+    status: "completed",
+    itemsView: "full",
+    items: [
+      { id: "commentary", type: "agentMessage", phase: "commentary", text: "ignore" },
+      { id: "final", type: "agentMessage", phase: "final_answer", text: "current protocol output" }
+    ]
+  }), { text: "current protocol output", itemIds: ["final"] });
+});
+
+test("terminal output reduction rejects agent messages with an explicit non-completed status", () => {
+  for (const status of [null, "inProgress", "failed", "cancelled"]) {
+    assert.equal(reduceTerminalOutput({
+      id: `turn-agent-${status}`,
+      status: "completed",
+      itemsView: "full",
+      items: [{
+        id: `agent-${status}`,
+        type: "agentMessage",
+        status,
+        phase: "final_answer",
+        text: "must not be emitted"
+      }]
+    }), null);
+  }
+});
+
 for (const itemsView of ["full", "summary", "notLoaded"]) {
   test(`${itemsView} terminal path stores raw output before rendering and replays idempotently`, async (t) => {
     let readCalls = 0;

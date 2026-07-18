@@ -174,7 +174,6 @@ function completedTurn(turnId, text) {
     items: [{
       id: `final-${turnId}`,
       type: "agentMessage",
-      status: "completed",
       phase: "final_answer",
       text
     }]

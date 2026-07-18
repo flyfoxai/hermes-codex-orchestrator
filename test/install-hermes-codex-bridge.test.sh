@@ -29,7 +29,11 @@ cleanup() {
     kill "$LOCK_SERVER_PID" 2>/dev/null || true
     wait "$LOCK_SERVER_PID" 2>/dev/null || true
   fi
-  rm -rf "$TMP_ROOT"
+  if [[ "${HCO_TEST_KEEP_TMP:-0}" == "1" ]]; then
+    printf 'kept installer test root: %s\n' "$TMP_ROOT" >&2
+  else
+    rm -rf "$TMP_ROOT"
+  fi
 }
 trap cleanup EXIT
 
@@ -150,6 +154,7 @@ pass "dry-run meaningfully inspects the stable lock without mutation"
 "$PYTHON" - "$ROOT" <<'PY'
 import json
 import plistlib
+import re
 import sys
 from pathlib import Path
 
@@ -167,6 +172,26 @@ assert "zulip_module.check_zulip_requirements(platform_config)" in installer_tex
 assert "zulip_module.ZulipAdapter(platform_config)" in installer_text
 assert "load_hermes_dotenv(hermes_home=ingress_home" not in installer_text
 
+bridge_timeout_match = re.search(
+    r"^BRIDGE_READINESS_TIMEOUT_SECONDS\s*=\s*([0-9.]+)$",
+    installer_text,
+    re.MULTILINE,
+)
+app_server_timeout_match = re.search(
+    r"^APP_SERVER_READINESS_TIMEOUT_SECONDS\s*=\s*([0-9.]+)$",
+    installer_text,
+    re.MULTILINE,
+)
+assert bridge_timeout_match is not None
+assert app_server_timeout_match is not None
+bridge_timeout = float(bridge_timeout_match.group(1))
+app_server_timeout = float(app_server_timeout_match.group(1))
+assert bridge_timeout == 8.0
+assert app_server_timeout >= 40.0
+assert app_server_timeout > bridge_timeout
+assert "timeout: float | None = None" in installer_text
+assert "APP_SERVER_READINESS_TIMEOUT_SECONDS if require_app_server" in installer_text
+
 with hco_path.open("rb") as stream:
     hco = plistlib.load(stream)
 with delivery_path.open("rb") as stream:
@@ -175,7 +200,11 @@ with delivery_path.open("rb") as stream:
 assert hco["Label"] == "com.hermes.codex-bridge-hco"
 assert delivery["Label"] == "com.hermes.codex-bridge-delivery"
 assert hco["ProgramArguments"] == ["/ABSOLUTE/PATH/TO/node", "/ABSOLUTE/PATH/TO/repository/hco/index.js"]
-assert hco["EnvironmentVariables"] == {"HCO_CONFIG_PATH": "/ABSOLUTE/PATH/TO/hco.json"}
+assert hco["EnvironmentVariables"] == {
+    "HCO_CONFIG_PATH": "/ABSOLUTE/PATH/TO/hco.json",
+    "HOME": "/ABSOLUTE/PATH/TO/home",
+    "PATH": "/ABSOLUTE/PATH/TO:/usr/bin:/bin:/usr/sbin:/sbin",
+}
 assert "HCO_CONFIG_PATH" not in delivery.get("EnvironmentVariables", {})
 
 delivery_args = delivery["ProgramArguments"]
@@ -458,18 +487,36 @@ FAKE_LAUNCHCTL="$MUTATE_ROOT/fake-launchctl"
 LAUNCHCTL_LOG="$MUTATE_ROOT/launchctl.log"
 LAUNCHCTL_STATE="$MUTATE_ROOT/launchctl-state"
 HCO_LIFECYCLE_LOG="$MUTATE_ROOT/hco-lifecycle.log"
+HCO_SQLITE_LIFECYCLE_LOG="$MUTATE_ROOT/hco-sqlite-lifecycle.jsonl"
 FAKE_HCO_SERVER="$MUTATE_ROOT/fake-hco-server"
 printf '%s\n' \
   '#!/Users/hula/Projects/hermesAgent/.venv/bin/python3' \
-  'import json, os, signal, socket, sys' \
+  'import json, os, signal, socket, sqlite3, sys, time' \
   'config = json.loads(open(sys.argv[1], encoding="utf-8").read())' \
   'socket_path = config["bridge"]["socketPath"]' \
-  'log_path = os.environ["HCO_TEST_HCO_LIFECYCLE_LOG"]' \
+  'database_path = config["databasePath"]' \
+  'log_path = sys.argv[2]' \
+  'sqlite_log_path = os.environ.get("HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG")' \
+  'sqlite_lifecycle = os.environ.get("HCO_TEST_SQLITE_LIFECYCLE") == "1"' \
+  'sqlite_stop_delay = float(os.environ.get("HCO_TEST_SQLITE_STOP_DELAY") or "0.8")' \
+  'database = None' \
   'server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)' \
+  'def log_sqlite(event):' \
+  '    if sqlite_log_path:' \
+  '        with open(sqlite_log_path, "a", encoding="utf-8") as stream: stream.write(json.dumps({"event": event, "pid": os.getpid()}) + "\n")' \
   'def stop(*_args):' \
   '    server.close()' \
   '    try: os.unlink(socket_path)' \
   '    except FileNotFoundError: pass' \
+  '    if sqlite_lifecycle:' \
+  '        log_sqlite("stop_requested")' \
+  '        time.sleep(sqlite_stop_delay)' \
+  '        assert database is not None' \
+  '        database.close()' \
+  '        for suffix in ("-wal", "-shm"):' \
+  '            try: os.unlink(database_path + suffix)' \
+  '            except FileNotFoundError: pass' \
+  '        log_sqlite("stopped")' \
   '    with open(log_path, "a", encoding="utf-8") as stream: stream.write("stopped\n")' \
   '    raise SystemExit(0)' \
   'signal.signal(signal.SIGTERM, stop)' \
@@ -479,6 +526,13 @@ printf '%s\n' \
   'server.bind(socket_path)' \
   'os.chmod(socket_path, 0o600)' \
   'server.listen(8)' \
+  'if sqlite_lifecycle:' \
+  '    database = sqlite3.connect(database_path, isolation_level=None)' \
+  '    database.execute("PRAGMA journal_mode=WAL")' \
+  '    database.execute("PRAGMA wal_autocheckpoint=0")' \
+  '    database.execute("CREATE TABLE IF NOT EXISTS lifecycle_markers (pid INTEGER PRIMARY KEY)")' \
+  '    database.execute("INSERT OR REPLACE INTO lifecycle_markers(pid) VALUES (?)", (os.getpid(),))' \
+  '    log_sqlite("started")' \
   'if os.environ.get("HCO_TEST_HCO_REWRITE_ROUTE_ON_START") == "1":' \
   '    route_path = config["bridge"]["routeSnapshotPath"]' \
   '    with open(route_path, "w", encoding="utf-8") as stream: stream.write("renewed-by-restored-hco\n")' \
@@ -492,14 +546,17 @@ printf '%s\n' \
   '            chunk = connection.recv(65536)' \
   '            if not chunk: break' \
   '            request += chunk' \
-  '        body = json.dumps({"compatibility":{"protocolVersion":1,"peerPluginVersion":"1.0.0","capabilities":[]}}, separators=(",", ":")).encode()' \
+  '        request_line = request.split(b"\r\n", 1)[0].split()' \
+  '        path = request_line[1] if len(request_line) >= 2 else b""' \
+  '        if path == b"/v1/health": body = json.dumps({"status":"ok","appServer":{"available":True}}, separators=(",", ":")).encode()' \
+  '        else: body = json.dumps({"compatibility":{"protocolVersion":1,"peerPluginVersion":"1.0.0","capabilities":[]}}, separators=(",", ":")).encode()' \
   '        connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n" + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)' \
   > "$FAKE_HCO_SERVER"
 chmod 700 "$FAKE_HCO_SERVER"
 FAKE_NODE="$MUTATE_ROOT/fake-node"
 printf '%s\n' \
   '#!/bin/bash' \
-  'exec "$HCO_TEST_FAKE_HCO_SERVER" "$HCO_CONFIG_PATH"' \
+  "exec \"$FAKE_HCO_SERVER\" \"\$HCO_CONFIG_PATH\" \"$HCO_LIFECYCLE_LOG\"" \
   > "$FAKE_NODE"
 chmod 700 "$FAKE_NODE"
 printf '%s\n' \
@@ -508,7 +565,7 @@ printf '%s\n' \
   'start_hco() {' \
   '  local pid_path="$HCO_TEST_LAUNCHCTL_STATE/com.hermes.codex-bridge-hco.pid"' \
   '  if [[ ! -S "$HCO_TEST_HCO_SOCKET" ]]; then' \
-  '    HCO_CONFIG_PATH="$HCO_TEST_HCO_CONFIG" HCO_TEST_HCO_LIFECYCLE_LOG="$HCO_TEST_HCO_LIFECYCLE_LOG" HCO_TEST_FAKE_HCO_SERVER="$HCO_TEST_FAKE_HCO_SERVER" "$HCO_TEST_FAKE_NODE" ignored </dev/null >/dev/null 2>&1 &' \
+  '    HCO_CONFIG_PATH="$HCO_TEST_HCO_CONFIG" HCO_TEST_HCO_LIFECYCLE_LOG="$HCO_TEST_HCO_LIFECYCLE_LOG" HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="${HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG:-}" HCO_TEST_SQLITE_LIFECYCLE="${HCO_TEST_SQLITE_LIFECYCLE:-}" HCO_TEST_SQLITE_STOP_DELAY="${HCO_TEST_SQLITE_STOP_DELAY:-}" HCO_TEST_FAKE_HCO_SERVER="$HCO_TEST_FAKE_HCO_SERVER" "$HCO_TEST_FAKE_NODE" ignored </dev/null >/dev/null 2>&1 &' \
   '    printf "%s" "$!" > "$pid_path"' \
   '    for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [[ -S "$HCO_TEST_HCO_SOCKET" ]] && return; sleep 0.05; done' \
   '    exit 93' \
@@ -549,7 +606,7 @@ printf '%s\n' \
   'case "$command_name" in' \
   '  print) if [[ "$label" == "ai.hermes.gateway" ]]; then if [[ "$target" == "$(< "$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.domain")/ai.hermes.gateway" ]]; then state_path="$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway"; pid_path="$state_path.pid"; elif [[ "$target" == "gui/$(id -u)/ai.hermes.gateway" && -f "$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.gui" ]]; then state_path="$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.gui"; pid_path="$state_path.pid"; else exit 1; fi; printf "domain = %s\nstate = %s\npid = %s\n" "${target%/*}" "$(< "$state_path")" "$(< "$pid_path")"; elif [[ -f "$HCO_TEST_LAUNCHCTL_STATE/$label" ]]; then printf "domain = %s\nstate = %s\n" "${target%/*}" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label")"; [[ ! -f "$HCO_TEST_LAUNCHCTL_STATE/$label.pid" ]] || printf "pid = %s\n" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label.pid")"; else exit 1; fi ;;' \
   '  bootstrap) plist="${3:?}"; label="$(basename "$plist" .plist)"; mkdir -p "$HCO_TEST_LAUNCHCTL_STATE"; [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label" ;;' \
-  '  bootout) label="${target##*/}"; if [[ "$label" == "com.hermes.codex-bridge-hco" && "${HCO_TEST_ASYNC_BOOTOUT:-}" == "1" ]]; then stop_hco; printf stopping > "$HCO_TEST_LAUNCHCTL_STATE/$label"; (sleep 0.2; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label") </dev/null >/dev/null 2>&1 & else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
+  '  bootout) label="${target##*/}"; if [[ "$label" == "com.hermes.codex-bridge-hco" && "${HCO_TEST_DETACHED_BOOTOUT:-}" == "1" ]]; then pid_path="$HCO_TEST_LAUNCHCTL_STATE/$label.pid"; [[ ! -f "$pid_path" ]] || kill "$(< "$pid_path")" 2>/dev/null || true; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label" "$pid_path"; elif [[ "$label" == "com.hermes.codex-bridge-hco" && "${HCO_TEST_ASYNC_BOOTOUT:-}" == "1" ]]; then stop_hco; printf stopping > "$HCO_TEST_LAUNCHCTL_STATE/$label"; (sleep 0.2; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label") </dev/null >/dev/null 2>&1 & else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  kickstart) mode=""; if [[ "$target" == "-k" ]]; then mode="-k"; target="${3:?}"; fi; label="${target##*/}"; if [[ "$label" == "ai.hermes.gateway" ]]; then restart_gateway "$mode"; else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  kill) target="${3:?}"; label="${target##*/}"; if [[ "$label" == "ai.hermes.gateway" ]]; then restart_gateway ""; else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; printf stopped > "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  *) exit 92 ;;' \
@@ -574,6 +631,10 @@ MUTATE_OUTPUT="$(
   HCO_TEST_HCO_CONFIG="$MUTATE_HCO_CONFIG" \
   HCO_TEST_HCO_SOCKET="$SOCKET_PATH" \
   HCO_TEST_HCO_LIFECYCLE_LOG="$HCO_LIFECYCLE_LOG" \
+  HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="${HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG:-}" \
+  HCO_TEST_SQLITE_LIFECYCLE="${HCO_TEST_SQLITE_LIFECYCLE:-}" \
+  HCO_TEST_SQLITE_STOP_DELAY="${HCO_TEST_SQLITE_STOP_DELAY:-}" \
+  HCO_TEST_DETACHED_BOOTOUT="${HCO_TEST_DETACHED_BOOTOUT:-}" \
   HCO_TEST_FAKE_HCO_SERVER="$FAKE_HCO_SERVER" \
   HCO_TEST_FAKE_NODE="$FAKE_NODE" \
   HCO_TEST_TURN_START_MARKER="$TURN_START_MARKER" \
@@ -602,7 +663,8 @@ assert_contains "$(< "$LAUNCHCTL_LOG")" "kickstart -k user/$(id -u)/ai.hermes.ga
 PLUGIN_LINK="$HERMES_HOME/plugins/hermes-codex-bridge"
 [[ -L "$PLUGIN_LINK" ]] || fail "stable plugin path is a symlink"
 PLUGIN_TARGET="$(readlink "$PLUGIN_LINK")"
-[[ "$PLUGIN_TARGET" == *"hermes-codex-bridge-1.0.0-"* ]] || fail "plugin uses immutable version directory"
+[[ "$PLUGIN_TARGET" == ../plugin-releases/hermes-codex-bridge-1.0.0-* ]] || fail "stable plugin link targets the non-discoverable immutable release store"
+[[ -z "$(find "$HERMES_HOME/plugins" -maxdepth 1 -type d -name 'hermes-codex-bridge-*' -print -quit)" ]] || fail "immutable HCO releases are not discoverable as sibling plugins"
 [[ -f "$PLUGIN_LINK/plugin.py" && -f "$PLUGIN_LINK/delivery_sidecar.py" && -f "$PLUGIN_LINK/plugin.yaml" ]] || fail "plugin release is complete"
 "$PYTHON" - "$HERMES_HOME" "$PLUGIN_LINK" <<'PY'
 import json
@@ -648,7 +710,7 @@ assert_not_contains "$(< "$HERMES_HOME/.env")" "ZULIP_CONTEXT_DEPTH=" "root dote
 [[ -f "$HERMES_HOME/profiles/zulip-ingress/SOUL.md" ]] || fail "zulip-ingress project-neutral reminder is installed"
 [[ ! -e "$HERMES_HOME/ai.hermes.gateway.plist" ]] || fail "generated Hermes gateway plist is untouched"
 
-PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$HERMES_HOME" "$LAUNCH_AGENTS" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" "$PYTHON" <<'PY'
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$HERMES_HOME" "$LAUNCH_AGENTS" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" "$PYTHON" "$(command -v node)" <<'PY'
 import inspect
 import json
 import os
@@ -680,6 +742,7 @@ hco_config_text = sys.argv[3]
 hco_config_path = Path(hco_config_text)
 configured_codex = sys.argv[4]
 expected_python = sys.argv[5]
+expected_node = sys.argv[6]
 assert hco_config_path.stat().st_mode & 0o777 == 0o600
 assert json.loads(hco_config_path.read_text())["codexExecutablePath"] == configured_codex
 root = yaml.safe_load((home / "config.yaml").read_text())
@@ -878,7 +941,12 @@ for label in ("com.hermes.codex-bridge-hco", "com.hermes.codex-bridge-delivery")
     assert plist["Label"] == label
     assert all(not isinstance(value, str) or "task9-mutating-secret" not in value for value in plist.values()), label
     if label == "com.hermes.codex-bridge-hco":
-        assert plist["EnvironmentVariables"] == {"HCO_CONFIG_PATH": hco_config_text}, plist["EnvironmentVariables"]
+        assert plist["ProgramArguments"][0] == expected_node
+        assert plist["EnvironmentVariables"] == {
+            "HCO_CONFIG_PATH": hco_config_text,
+            "HOME": os.environ["HOME"],
+            "PATH": f"{Path(expected_node).parent}:/usr/bin:/bin:/usr/sbin:/sbin",
+        }, plist["EnvironmentVariables"]
     else:
         assert plist["ProgramArguments"][0] == expected_python
         assert plist["ProgramArguments"][1] == "-B"
@@ -902,6 +970,10 @@ invoke_installer() {
   HCO_TEST_HCO_CONFIG="$MUTATE_HCO_CONFIG" \
   HCO_TEST_HCO_SOCKET="$SOCKET_PATH" \
   HCO_TEST_HCO_LIFECYCLE_LOG="$HCO_LIFECYCLE_LOG" \
+  HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="${HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG:-}" \
+  HCO_TEST_SQLITE_LIFECYCLE="${HCO_TEST_SQLITE_LIFECYCLE:-}" \
+  HCO_TEST_SQLITE_STOP_DELAY="${HCO_TEST_SQLITE_STOP_DELAY:-}" \
+  HCO_TEST_DETACHED_BOOTOUT="${HCO_TEST_DETACHED_BOOTOUT:-}" \
   HCO_TEST_FAKE_HCO_SERVER="$FAKE_HCO_SERVER" \
   HCO_TEST_FAKE_NODE="$FAKE_NODE" \
   HCO_TEST_TURN_START_MARKER="$TURN_START_MARKER" \
@@ -1451,16 +1523,277 @@ assert_contains "$(< "$LOCK_TEST_LOSER_A_OUTPUT")" "another installer transactio
 assert_contains "$(< "$LOCK_TEST_LOSER_B_OUTPUT")" "another installer transaction is active" "different-target loser reports global per-user contention"
 pass "persistent per-user lock serializes three contenders before target mutation"
 
-OLD_RELEASE="$HERMES_HOME/plugins/hermes-codex-bridge-0.9.0-previous"
-mkdir -p "$OLD_RELEASE"
-printf 'previous release\n' > "$OLD_RELEASE/installer-owned.marker"
+ACTIVE_RELEASE="$(cd "$PLUGIN_LINK" && pwd -P)"
+make_release_fixture() {
+  local source="$1"
+  local parent="$2"
+  local version="$3"
+  local staging="$parent/.hco-release-fixture-$version-$$-$RANDOM"
+  cp -R "$source" "$staging"
+  local digest
+  digest="$($PYTHON - "$staging" "$version" <<'PY'
+import hashlib
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+version = sys.argv[2]
+manifest = root / "plugin.yaml"
+lines = manifest.read_text().splitlines()
+manifest.write_text("\n".join(
+    f"version: {version}" if line.startswith("version:") else line
+    for line in lines
+) + "\n")
+digest = hashlib.sha256()
+for path in sorted(root.rglob("*")):
+    if "__pycache__" in path.parts or path.name.endswith(".pyc"):
+        continue
+    info = path.lstat()
+    if stat.S_ISREG(info.st_mode):
+        relative = str(path.relative_to(root))
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode())
+print(digest.hexdigest()[:12])
+PY
+)"
+  local destination="$parent/hermes-codex-bridge-$version-$digest"
+  mv "$staging" "$destination"
+  printf '%s\n' "$destination"
+}
+
+OLD_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.9.0)"
+OLDER_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.8.0)"
+NON_RELEASE_SIBLING="$HERMES_HOME/plugins/hermes-codex-bridge-operator-notes"
+mkdir -p "$NON_RELEASE_SIBLING"
+printf 'operator-owned sibling\n' > "$NON_RELEASE_SIBLING/keep.txt"
 rm "$PLUGIN_LINK"
 ln -s "$(basename "$OLD_RELEASE")" "$PLUGIN_LINK"
 UPGRADE_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)" || fail "upgrade succeeds: $UPGRADE_OUTPUT"
-[[ -d "$OLD_RELEASE" ]] || fail "upgrade retains prior release through commit"
-[[ "$(readlink "$PLUGIN_LINK")" == *"hermes-codex-bridge-1.0.0-"* ]] || fail "upgrade atomically selects current release"
+[[ ! -e "$OLD_RELEASE" && ! -e "$OLDER_RELEASE" ]] || fail "upgrade removes installer-owned releases from the discoverable plugin directory"
+[[ -d "$HERMES_HOME/plugin-releases/$(basename "$OLD_RELEASE")" ]] || fail "upgrade retains the prior active release outside plugin discovery"
+[[ -d "$HERMES_HOME/plugin-releases/$(basename "$OLDER_RELEASE")" ]] || fail "upgrade migrates every historical installer-owned release"
+[[ "$(readlink "$PLUGIN_LINK")" == ../plugin-releases/hermes-codex-bridge-1.0.0-* ]] || fail "upgrade atomically selects the current non-discoverable release"
+[[ "$(< "$NON_RELEASE_SIBLING/keep.txt")" == "operator-owned sibling" ]] || fail "upgrade leaves non-release plugin siblings untouched"
 [[ "$(rg -c '^HCO_CONFIG_PATH=' "$HERMES_HOME/.env")" == "1" ]] || fail "upgrade does not duplicate HCO_CONFIG_PATH"
-pass "upgrade preserves the prior release and atomically switches the stable symlink"
+pass "upgrade migrates multiple historical releases and atomically switches the stable symlink"
+
+CACHE_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.8.1)"
+mkdir -p "$CACHE_RELEASE/__pycache__"
+printf 'runtime-cache-fixture\n' > "$CACHE_RELEASE/__pycache__/plugin.cpython-312.pyc"
+chmod 755 "$CACHE_RELEASE/__pycache__"
+chmod 600 "$CACHE_RELEASE/__pycache__/plugin.cpython-312.pyc"
+CACHE_HASH_BEFORE="$(shasum -a 256 "$CACHE_RELEASE/__pycache__/plugin.cpython-312.pyc" | awk '{print $1}')"
+CACHE_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)" || fail "legacy release with Python runtime cache migrates: $CACHE_OUTPUT"
+CACHE_DESTINATION="$HERMES_HOME/plugin-releases/$(basename "$CACHE_RELEASE")"
+[[ ! -e "$CACHE_RELEASE" && -d "$CACHE_DESTINATION/__pycache__" ]] || fail "runtime cache migration removes the discoverable source and retains its cache"
+[[ "$(shasum -a 256 "$CACHE_DESTINATION/__pycache__/plugin.cpython-312.pyc" | awk '{print $1}')" == "$CACHE_HASH_BEFORE" ]] || fail "runtime cache migration preserves cache bytes"
+$PYTHON - "$CACHE_DESTINATION/__pycache__" "$CACHE_DESTINATION/__pycache__/plugin.cpython-312.pyc" <<'PY' || fail "runtime cache migration preserves realistic Python modes"
+import stat
+import sys
+from pathlib import Path
+
+directory, cache_file = map(Path, sys.argv[1:])
+assert stat.S_IMODE(directory.stat().st_mode) == 0o755
+assert stat.S_IMODE(cache_file.stat().st_mode) == 0o600
+PY
+pass "safe Python runtime caches are preserved outside plugin discovery"
+
+IDENTICAL_SOURCE="$HERMES_HOME/plugins/$(basename "$OLDER_RELEASE")"
+cp -R "$HERMES_HOME/plugin-releases/$(basename "$OLDER_RELEASE")" "$IDENTICAL_SOURCE"
+IDENTICAL_STORE_COUNT="$(find "$HERMES_HOME/plugin-releases" -maxdepth 1 -type d -name 'hermes-codex-bridge-*' | wc -l | tr -d ' ')"
+IDENTICAL_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)" || fail "identical legacy release migration succeeds: $IDENTICAL_OUTPUT"
+[[ ! -e "$IDENTICAL_SOURCE" ]] || fail "identical legacy source is removed from plugin discovery after commit"
+[[ "$(find "$HERMES_HOME/plugin-releases" -maxdepth 1 -type d -name 'hermes-codex-bridge-*' | wc -l | tr -d ' ')" == "$IDENTICAL_STORE_COUNT" ]] || fail "identical migration does not duplicate immutable releases"
+pass "identical release-store collisions are idempotent"
+
+CONFLICT_SOURCE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.7.0)"
+CONFLICT_DESTINATION="$HERMES_HOME/plugin-releases/$(basename "$CONFLICT_SOURCE")"
+cp -R "$CONFLICT_SOURCE" "$CONFLICT_DESTINATION"
+printf '\n# conflicting destination fixture\n' >> "$CONFLICT_DESTINATION/plugin.py"
+CONFLICT_DESTINATION_HASH="$(shasum -a 256 "$CONFLICT_DESTINATION/plugin.py" | awk '{print $1}')"
+CONFLICT_LAUNCH_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+CONFLICT_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+CONFLICT_STATUS=$?
+set -e
+[[ $CONFLICT_STATUS -ne 0 ]] || fail "conflicting release-store content fails closed"
+assert_contains "$CONFLICT_OUTPUT" "release" "conflicting release-store refusal is actionable"
+[[ -d "$CONFLICT_SOURCE" ]] || fail "conflicting migration preserves the discoverable source"
+[[ "$(shasum -a 256 "$CONFLICT_DESTINATION/plugin.py" | awk '{print $1}')" == "$CONFLICT_DESTINATION_HASH" ]] || fail "conflicting migration preserves the pre-existing destination"
+[[ "$(launchctl_mutation_count)" == "$CONFLICT_LAUNCH_MUTATIONS_BEFORE" ]] || fail "conflicting migration fails before service mutation"
+rm -rf "$CONFLICT_SOURCE" "$CONFLICT_DESTINATION"
+pass "conflicting release-store content is rejected without mutation"
+
+SYMLINK_RELEASE="$HERMES_HOME/plugins/hermes-codex-bridge-0.6.0-000000000000"
+ln -s "$HERMES_HOME/plugin-releases/$(basename "$OLD_RELEASE")" "$SYMLINK_RELEASE"
+SYMLINK_RELEASE_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+SYMLINK_RELEASE_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+SYMLINK_RELEASE_STATUS=$?
+set -e
+[[ $SYMLINK_RELEASE_STATUS -ne 0 ]] || fail "symlinked legacy release fails closed"
+assert_contains "$SYMLINK_RELEASE_OUTPUT" "release" "symlinked legacy release refusal is actionable"
+[[ -L "$SYMLINK_RELEASE" ]] || fail "symlinked legacy release is preserved on refusal"
+[[ "$(launchctl_mutation_count)" == "$SYMLINK_RELEASE_MUTATIONS_BEFORE" ]] || fail "symlinked legacy release fails before service mutation"
+rm "$SYMLINK_RELEASE"
+
+CACHE_SYMLINK_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.5.1)"
+mkdir -p "$CACHE_SYMLINK_RELEASE/__pycache__"
+ln -s "$CACHE_SYMLINK_RELEASE/plugin.py" "$CACHE_SYMLINK_RELEASE/__pycache__/plugin.cpython-312.pyc"
+CACHE_SYMLINK_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+CACHE_SYMLINK_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+CACHE_SYMLINK_STATUS=$?
+set -e
+[[ $CACHE_SYMLINK_STATUS -ne 0 ]] || fail "symlink hidden in Python runtime cache fails closed"
+assert_contains "$CACHE_SYMLINK_OUTPUT" "release" "cache symlink refusal is actionable"
+[[ -L "$CACHE_SYMLINK_RELEASE/__pycache__/plugin.cpython-312.pyc" ]] || fail "cache symlink is preserved on refusal"
+[[ "$(launchctl_mutation_count)" == "$CACHE_SYMLINK_MUTATIONS_BEFORE" ]] || fail "cache symlink fails before service mutation"
+rm -rf "$CACHE_SYMLINK_RELEASE"
+
+UNEXPECTED_CACHE_FILE_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.5.2)"
+mkdir -p "$UNEXPECTED_CACHE_FILE_RELEASE/__pycache__"
+printf 'runtime-cache-fixture\n' > "$UNEXPECTED_CACHE_FILE_RELEASE/__pycache__/unexpected.pyc"
+chmod 755 "$UNEXPECTED_CACHE_FILE_RELEASE/__pycache__"
+chmod 600 "$UNEXPECTED_CACHE_FILE_RELEASE/__pycache__/unexpected.pyc"
+UNEXPECTED_CACHE_FILE_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+UNEXPECTED_CACHE_FILE_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+UNEXPECTED_CACHE_FILE_STATUS=$?
+set -e
+[[ $UNEXPECTED_CACHE_FILE_STATUS -eq 0 ]] || fail "temporary valid Python cache control succeeds: $UNEXPECTED_CACHE_FILE_OUTPUT"
+rm -rf "$UNEXPECTED_CACHE_FILE_RELEASE"
+
+NON_PYC_CACHE_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.5.4)"
+mkdir -p "$NON_PYC_CACHE_RELEASE/__pycache__"
+printf 'not-a-python-cache\n' > "$NON_PYC_CACHE_RELEASE/__pycache__/payload.txt"
+chmod 755 "$NON_PYC_CACHE_RELEASE/__pycache__"
+chmod 600 "$NON_PYC_CACHE_RELEASE/__pycache__/payload.txt"
+NON_PYC_CACHE_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+NON_PYC_CACHE_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+NON_PYC_CACHE_STATUS=$?
+set -e
+[[ $NON_PYC_CACHE_STATUS -ne 0 ]] || fail "non-pyc file hidden in Python runtime cache fails closed"
+assert_contains "$NON_PYC_CACHE_OUTPUT" "release" "non-pyc cache refusal is actionable"
+[[ -f "$NON_PYC_CACHE_RELEASE/__pycache__/payload.txt" ]] || fail "non-pyc cache file is preserved on refusal"
+[[ "$(launchctl_mutation_count)" == "$NON_PYC_CACHE_MUTATIONS_BEFORE" ]] || fail "non-pyc cache file fails before service mutation"
+rm -rf "$NON_PYC_CACHE_RELEASE"
+
+ORPHAN_PYC_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.5.5)"
+printf 'orphan-python-cache\n' > "$ORPHAN_PYC_RELEASE/orphan.pyc"
+chmod 600 "$ORPHAN_PYC_RELEASE/orphan.pyc"
+ORPHAN_PYC_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+ORPHAN_PYC_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+ORPHAN_PYC_STATUS=$?
+set -e
+[[ $ORPHAN_PYC_STATUS -ne 0 ]] || fail "pyc file outside Python runtime cache fails closed"
+assert_contains "$ORPHAN_PYC_OUTPUT" "release" "orphan pyc refusal is actionable"
+[[ -f "$ORPHAN_PYC_RELEASE/orphan.pyc" ]] || fail "orphan pyc file is preserved on refusal"
+[[ "$(launchctl_mutation_count)" == "$ORPHAN_PYC_MUTATIONS_BEFORE" ]] || fail "orphan pyc file fails before service mutation"
+rm -rf "$ORPHAN_PYC_RELEASE"
+
+NESTED_CACHE_DIRECTORY_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.5.3)"
+mkdir -p "$NESTED_CACHE_DIRECTORY_RELEASE/__pycache__/nested"
+chmod 755 "$NESTED_CACHE_DIRECTORY_RELEASE/__pycache__"
+chmod 700 "$NESTED_CACHE_DIRECTORY_RELEASE/__pycache__/nested"
+NESTED_CACHE_DIRECTORY_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+NESTED_CACHE_DIRECTORY_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+NESTED_CACHE_DIRECTORY_STATUS=$?
+set -e
+[[ $NESTED_CACHE_DIRECTORY_STATUS -ne 0 ]] || fail "nested directory hidden in Python runtime cache fails closed"
+assert_contains "$NESTED_CACHE_DIRECTORY_OUTPUT" "release" "nested cache directory refusal is actionable"
+[[ -d "$NESTED_CACHE_DIRECTORY_RELEASE/__pycache__/nested" ]] || fail "nested cache directory is preserved on refusal"
+[[ "$(launchctl_mutation_count)" == "$NESTED_CACHE_DIRECTORY_MUTATIONS_BEFORE" ]] || fail "nested cache directory fails before service mutation"
+rm -rf "$NESTED_CACHE_DIRECTORY_RELEASE"
+
+BAD_MODE_RELEASE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.5.0)"
+chmod 644 "$BAD_MODE_RELEASE/plugin.py"
+BAD_MODE_RELEASE_MUTATIONS_BEFORE="$(launchctl_mutation_count)"
+set +e
+BAD_MODE_RELEASE_OUTPUT="$(invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+BAD_MODE_RELEASE_STATUS=$?
+set -e
+[[ $BAD_MODE_RELEASE_STATUS -ne 0 ]] || fail "permissive legacy release fails closed"
+assert_contains "$BAD_MODE_RELEASE_OUTPUT" "release" "legacy release mode refusal is actionable"
+[[ -d "$BAD_MODE_RELEASE" ]] || fail "invalid-mode legacy release is preserved on refusal"
+[[ "$(launchctl_mutation_count)" == "$BAD_MODE_RELEASE_MUTATIONS_BEFORE" ]] || fail "invalid-mode legacy release fails before service mutation"
+rm -rf "$BAD_MODE_RELEASE"
+pass "unsafe legacy release paths and modes fail closed"
+
+ROLLBACK_MIGRATION_ACTIVE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.4.0)"
+ROLLBACK_MIGRATION_SIBLING="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.3.0)"
+mkdir -p "$ROLLBACK_MIGRATION_ACTIVE/__pycache__"
+printf 'rollback-cache-fixture\n' > "$ROLLBACK_MIGRATION_ACTIVE/__pycache__/plugin.cpython-312.pyc"
+chmod 755 "$ROLLBACK_MIGRATION_ACTIVE/__pycache__"
+chmod 600 "$ROLLBACK_MIGRATION_ACTIVE/__pycache__/plugin.cpython-312.pyc"
+ROLLBACK_CACHE_HASH_BEFORE="$(shasum -a 256 "$ROLLBACK_MIGRATION_ACTIVE/__pycache__/plugin.cpython-312.pyc" | awk '{print $1}')"
+ROLLBACK_MIGRATION_TARGET_BEFORE="$(readlink "$PLUGIN_LINK")"
+rm "$PLUGIN_LINK"
+ln -s "$(basename "$ROLLBACK_MIGRATION_ACTIVE")" "$PLUGIN_LINK"
+control_launchctl kickstart -k "user/$(id -u)/ai.hermes.gateway"
+rm -f "$LAUNCHCTL_STATE/ai.hermes.gateway.attestation-failure-injected"
+set +e
+ROLLBACK_MIGRATION_OUTPUT="$(HCO_TEST_GATEWAY_ATTESTATION_FAILURE=missing HCO_TEST_NODE_BIN="$FAKE_NODE" invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
+ROLLBACK_MIGRATION_STATUS=$?
+set -e
+[[ $ROLLBACK_MIGRATION_STATUS -ne 0 ]] || fail "injected activation failure aborts migrated upgrade"
+assert_contains "$ROLLBACK_MIGRATION_OUTPUT" "attestation" "migration rollback preserves the activation failure: $ROLLBACK_MIGRATION_OUTPUT"
+assert_not_contains "$ROLLBACK_MIGRATION_OUTPUT" "rollback verification failed" "migration rollback completes without manual repair"
+[[ -d "$ROLLBACK_MIGRATION_ACTIVE" && -d "$ROLLBACK_MIGRATION_SIBLING" ]] || fail "migration rollback restores every legacy release to its original path"
+[[ "$(shasum -a 256 "$ROLLBACK_MIGRATION_ACTIVE/__pycache__/plugin.cpython-312.pyc" | awk '{print $1}')" == "$ROLLBACK_CACHE_HASH_BEFORE" ]] || fail "migration rollback restores Python runtime cache bytes"
+[[ ! -e "$HERMES_HOME/plugin-releases/$(basename "$ROLLBACK_MIGRATION_ACTIVE")" && ! -e "$HERMES_HOME/plugin-releases/$(basename "$ROLLBACK_MIGRATION_SIBLING")" ]] || fail "migration rollback removes transaction-created release-store destinations"
+[[ "$(readlink "$PLUGIN_LINK")" == "$(basename "$ROLLBACK_MIGRATION_ACTIVE")" ]] || fail "migration rollback restores the exact legacy stable target"
+rm "$PLUGIN_LINK"
+ln -s "$ROLLBACK_MIGRATION_TARGET_BEFORE" "$PLUGIN_LINK"
+rm -rf "$ROLLBACK_MIGRATION_ACTIVE" "$ROLLBACK_MIGRATION_SIBLING"
+control_launchctl kickstart -k "user/$(id -u)/ai.hermes.gateway"
+pass "activation failure restores the complete legacy plugin layout"
+
+PARTIAL_ROLLBACK_ACTIVE="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.2.0)"
+PARTIAL_ROLLBACK_SIBLING="$(make_release_fixture "$ACTIVE_RELEASE" "$HERMES_HOME/plugins" 0.1.0)"
+PARTIAL_ROLLBACK_SIBLING_DESTINATION="$HERMES_HOME/plugin-releases/$(basename "$PARTIAL_ROLLBACK_SIBLING")"
+PARTIAL_ROLLBACK_CONFIG_BEFORE="$MUTATE_ROOT/partial-rollback-config-before.yaml"
+cp "$HERMES_HOME/config.yaml" "$PARTIAL_ROLLBACK_CONFIG_BEFORE"
+PARTIAL_ROLLBACK_TARGET_BEFORE="$(readlink "$PLUGIN_LINK")"
+rm "$PLUGIN_LINK"
+ln -s "$(basename "$PARTIAL_ROLLBACK_ACTIVE")" "$PLUGIN_LINK"
+control_launchctl kickstart -k "user/$(id -u)/ai.hermes.gateway"
+rm -f "$LAUNCHCTL_STATE/ai.hermes.gateway.attestation-failure-injected"
+set +e
+PARTIAL_ROLLBACK_OUTPUT="$(
+  HCO_TEST_GATEWAY_ATTESTATION_FAILURE=missing \
+  HCO_INSTALLER_TEST_ROLLBACK_FAILPOINT=release_migration \
+  HCO_TEST_NODE_BIN="$FAKE_NODE" \
+    invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1
+)"
+PARTIAL_ROLLBACK_STATUS=$?
+set -e
+[[ $PARTIAL_ROLLBACK_STATUS -ne 0 ]] || fail "injected release migration rollback failure aborts installation"
+assert_contains "$PARTIAL_ROLLBACK_OUTPUT" "rollback verification failed" "partial migration rollback reports manual restoration"
+assert_contains "$PARTIAL_ROLLBACK_OUTPUT" "injected failure during release migration rollback" "partial migration rollback preserves the original rollback error"
+assert_not_contains "$PARTIAL_ROLLBACK_OUTPUT" "$MUTATE_SECRET" "partial migration rollback error remains redacted"
+cmp -s "$HERMES_HOME/config.yaml" "$PARTIAL_ROLLBACK_CONFIG_BEFORE" || fail "partial migration rollback still restores independent configuration snapshots"
+[[ -d "$PARTIAL_ROLLBACK_ACTIVE" ]] || fail "partial migration rollback preserves the release restored before the injected failure"
+[[ -d "$PARTIAL_ROLLBACK_SIBLING" ]] || fail "partial migration rollback continues restoring releases after an individual failure"
+[[ ! -e "$PARTIAL_ROLLBACK_SIBLING_DESTINATION" ]] || fail "partial migration rollback removes the remaining transaction-created release carrier"
+[[ "$(readlink "$PLUGIN_LINK")" == "$(basename "$PARTIAL_ROLLBACK_ACTIVE")" ]] || fail "partial migration rollback restores the exact legacy stable target"
+[[ ! -e "$LAUNCHCTL_STATE/com.hermes.codex-bridge-hco" ]] || fail "partial migration rollback leaves HCO stopped"
+[[ ! -e "$LAUNCHCTL_STATE/com.hermes.codex-bridge-delivery" ]] || fail "partial migration rollback leaves delivery stopped"
+[[ ! -e "$LAUNCHCTL_STATE/ai.hermes.gateway" ]] || fail "partial migration rollback leaves Gateway stopped"
+
+rm "$PLUGIN_LINK"
+ln -s "$PARTIAL_ROLLBACK_TARGET_BEFORE" "$PLUGIN_LINK"
+rm -rf "$PARTIAL_ROLLBACK_ACTIVE" "$PARTIAL_ROLLBACK_SIBLING"
+rm -f "$LAUNCHCTL_STATE/ai.hermes.gateway.attestation-failure-injected"
+control_launchctl kickstart -k "user/$(id -u)/ai.hermes.gateway"
+control_launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENTS/com.hermes.codex-bridge-hco.plist"
+control_launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENTS/com.hermes.codex-bridge-delivery.plist"
+pass "partial migration rollback restores other snapshots and stops affected services"
 
 ACTIVE_RELEASE="$(cd "$PLUGIN_LINK" && pwd -P)"
 cp "$ACTIVE_RELEASE/plugin.py" "$MUTATE_ROOT/plugin.py.clean"
@@ -2109,4 +2442,151 @@ set -e
 [[ -S "$SOCKET_PATH" ]] || fail "intended HCO socket is ready after handoff"
 pass "first install gates a temporary HCO and waits for the intended service before delivery"
 
-printf '1..28\n'
+HCO_TEST_SQLITE_LIFECYCLE=1 \
+HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="$HCO_SQLITE_LIFECYCLE_LOG" \
+  control_launchctl bootout "gui/$(id -u)/com.hermes.codex-bridge-hco"
+rm -f "$HCO_SQLITE_LIFECYCLE_LOG"
+HCO_TEST_SQLITE_LIFECYCLE=1 \
+HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="$HCO_SQLITE_LIFECYCLE_LOG" \
+  control_launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENTS/com.hermes.codex-bridge-hco.plist"
+SQLITE_OLD_PID="$(< "$LAUNCHCTL_STATE/com.hermes.codex-bridge-hco.pid")"
+for _ in {1..100}; do
+  [[ -f "$HCO_SQLITE_LIFECYCLE_LOG" ]] && rg -q '"event": "started"' "$HCO_SQLITE_LIFECYCLE_LOG" && break
+  sleep 0.05
+done
+[[ -f "$HCO_SQLITE_LIFECYCLE_LOG" ]] || fail "SQLite lifecycle fixture records the old HCO start"
+
+set +e
+SQLITE_HANDOFF_OUTPUT="$(
+  HCO_TEST_SQLITE_LIFECYCLE=1 \
+  HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="$HCO_SQLITE_LIFECYCLE_LOG" \
+  HCO_TEST_DETACHED_BOOTOUT=1 \
+  HCO_TEST_NODE_BIN="$FAKE_NODE" \
+    invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1
+)"
+SQLITE_HANDOFF_STATUS=$?
+set -e
+[[ $SQLITE_HANDOFF_STATUS -eq 0 ]] || fail "detached HCO handoff install succeeds: $SQLITE_HANDOFF_OUTPUT"
+SQLITE_NEW_PID="$(< "$LAUNCHCTL_STATE/com.hermes.codex-bridge-hco.pid")"
+[[ "$SQLITE_NEW_PID" != "$SQLITE_OLD_PID" ]] || fail "detached HCO handoff starts a new process"
+for _ in {1..100}; do
+  rg -q "\\\"event\\\": \\\"stopped\\\", \\\"pid\\\": $SQLITE_OLD_PID" "$HCO_SQLITE_LIFECYCLE_LOG" && break
+  sleep 0.05
+done
+
+"$PYTHON" - "$HCO_SQLITE_LIFECYCLE_LOG" "$SQLITE_OLD_PID" "$SQLITE_NEW_PID" <<'PY' || fail "old HCO fully stops before the replacement opens SQLite"
+import json
+import sys
+from pathlib import Path
+
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+old_pid, new_pid = map(int, sys.argv[2:])
+
+def position(pid, event):
+    expected = {"event": event, "pid": pid}
+    matches = [index for index, item in enumerate(events) if item == expected]
+    assert matches, (expected, events)
+    return matches[0]
+
+assert position(old_pid, "stop_requested") < position(old_pid, "stopped")
+assert position(old_pid, "stopped") < position(new_pid, "started"), events
+PY
+if kill -0 "$SQLITE_OLD_PID" 2>/dev/null; then
+  fail "detached HCO handoff leaves no old process alive"
+fi
+"$PYTHON" - "$DATABASE_PATH" "$SQLITE_NEW_PID" <<'PY' || fail "fresh SQLite readers observe the replacement HCO marker"
+import sqlite3
+import sys
+
+database_path, expected_pid = sys.argv[1], int(sys.argv[2])
+with sqlite3.connect(database_path) as database:
+    rows = {row[0] for row in database.execute("SELECT pid FROM lifecycle_markers")}
+assert expected_pid in rows, rows
+PY
+for suffix in -wal -shm; do
+  sidecar="$DATABASE_PATH$suffix"
+  [[ -f "$sidecar" ]] || fail "replacement HCO retains the SQLite $suffix pathname"
+done
+"$PYTHON" - "$SQLITE_NEW_PID" "$DATABASE_PATH-wal" "$DATABASE_PATH-shm" <<'PY' || fail "replacement HCO descriptors match the live SQLite sidecar inodes"
+import subprocess
+import sys
+from pathlib import Path
+
+pid = int(sys.argv[1])
+expected = {
+    str(Path(value).resolve()): Path(value).stat().st_ino
+    for value in sys.argv[2:]
+}
+output = subprocess.run(
+    ["/usr/sbin/lsof", "-a", "-p", str(pid), "-Fnfi"],
+    check=True,
+    stdout=subprocess.PIPE,
+    text=True,
+).stdout.splitlines()
+current_inode = None
+observed = {}
+for line in output:
+    if line.startswith("i") and line[1:].isdigit():
+        current_inode = int(line[1:])
+    elif line.startswith("n") and current_inode is not None:
+        observed[line[1:].removesuffix(" (deleted)")] = current_inode
+for path, inode in expected.items():
+    assert observed.get(path) == inode, (path, inode, observed.get(path))
+PY
+pass "HCO replacement waits for SQLite ownership to drain before restart"
+
+SQLITE_ACTIVE_PID="$SQLITE_NEW_PID"
+HCO_TEST_SQLITE_LIFECYCLE=1 \
+HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="$HCO_SQLITE_LIFECYCLE_LOG" \
+  control_launchctl bootout "gui/$(id -u)/com.hermes.codex-bridge-hco"
+for _ in {1..100}; do
+  kill -0 "$SQLITE_ACTIVE_PID" 2>/dev/null || break
+  sleep 0.05
+done
+if kill -0 "$SQLITE_ACTIVE_PID" 2>/dev/null; then
+  fail "SQLite timeout fixture drains the previous control process"
+fi
+rm -f "$HCO_SQLITE_LIFECYCLE_LOG"
+HCO_TEST_SQLITE_LIFECYCLE=1 \
+HCO_TEST_SQLITE_STOP_DELAY=2 \
+HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="$HCO_SQLITE_LIFECYCLE_LOG" \
+  control_launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENTS/com.hermes.codex-bridge-hco.plist"
+SQLITE_STUCK_PID="$(< "$LAUNCHCTL_STATE/com.hermes.codex-bridge-hco.pid")"
+for _ in {1..100}; do
+  [[ -f "$HCO_SQLITE_LIFECYCLE_LOG" ]] && rg -q '"event": "started"' "$HCO_SQLITE_LIFECYCLE_LOG" && break
+  sleep 0.05
+done
+
+set +e
+SQLITE_TIMEOUT_OUTPUT="$(
+  HCO_TEST_SQLITE_LIFECYCLE=1 \
+  HCO_TEST_SQLITE_STOP_DELAY=2 \
+  HCO_TEST_HCO_SQLITE_LIFECYCLE_LOG="$HCO_SQLITE_LIFECYCLE_LOG" \
+  HCO_TEST_DETACHED_BOOTOUT=1 \
+  HCO_INSTALLER_TEST_PROCESS_EXIT_TIMEOUT_SECONDS=0.2 \
+  HCO_TEST_NODE_BIN="$FAKE_NODE" \
+    invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1
+)"
+SQLITE_TIMEOUT_STATUS=$?
+set -e
+[[ $SQLITE_TIMEOUT_STATUS -ne 0 ]] || fail "an HCO that remains alive beyond the exit deadline fails closed"
+assert_contains "$SQLITE_TIMEOUT_OUTPUT" "stopped process did not exit" "exit-timeout failure identifies the surviving HCO PID"
+assert_contains "$SQLITE_TIMEOUT_OUTPUT" "rollback verification failed" "exit-timeout failure refuses unsafe snapshot restoration"
+[[ ! -e "$LAUNCHCTL_STATE/com.hermes.codex-bridge-hco" ]] || fail "exit-timeout failure leaves HCO unloaded"
+for _ in {1..100}; do
+  rg -q "\\\"event\\\": \\\"stopped\\\", \\\"pid\\\": $SQLITE_STUCK_PID" "$HCO_SQLITE_LIFECYCLE_LOG" && break
+  sleep 0.05
+done
+"$PYTHON" - "$HCO_SQLITE_LIFECYCLE_LOG" "$SQLITE_STUCK_PID" <<'PY' || fail "exit-timeout rollback starts no replacement while SQLite ownership is uncertain"
+import json
+import sys
+from pathlib import Path
+
+events = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines()]
+old_pid = int(sys.argv[2])
+assert {"event": "stopped", "pid": old_pid} in events, events
+assert not any(item["event"] == "started" and item["pid"] != old_pid for item in events), events
+PY
+pass "HCO exit timeout fails closed before SQLite snapshot restoration"
+
+printf '1..30\n'

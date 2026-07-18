@@ -278,6 +278,11 @@ class HcoClient:
         if type(document) is not dict or document.get("compatibility") != expected:
             raise HcoError(status, "HCO_INCOMPATIBLE", "HCO compatibility failed.")
 
+    def check_health(self) -> None:
+        document = self._request("GET", "/v1/health")
+        if document != {"status": "ok", "appServer": {"available": True}}:
+            raise HcoError(0, "HCO_APP_SERVER_UNAVAILABLE", "HCO App Server unavailable.")
+
     def claim(self) -> list:
         response = self._request(
             "POST",

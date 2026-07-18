@@ -802,7 +802,10 @@ test("bridge events validate exact fields, verify signed numeric bindings, and r
   const valid = fixture.event({ sourceMessageId: 100, senderId: 2, body: { type: "ROUTE", action: "SHOW" } });
   assert.deepEqual(await fixture.service.handleBridgeEvent(valid), {
     schemaVersion: 1, status: "ok", action: "route.show",
-    route: { streamId: 42, owner: "PROJECT", projectId: "alpha", source: "static" }
+    route: {
+      streamId: 42, owner: "PROJECT", projectId: "alpha", source: "static",
+      cwd: "/canonical/alpha"
+    }
   });
   assert.equal(Object.isFrozen(await fixture.service.handleBridgeEvent(
     fixture.event({ sourceMessageId: 101, senderId: 2, body: { type: "TOPIC", action: "SHOW" } })

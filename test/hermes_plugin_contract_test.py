@@ -636,7 +636,7 @@ async def test_private_handler_verifies_then_awaits_exact_hco_event(
 
     pending = handler(token)
     assert inspect.isawaitable(pending)
-    assert await pending == '{"accepted":true,"objectiveId":"obj-1"}'
+    assert await pending == "Codex 请求已提交。任务：obj-1。"
     assert calls == [
         {
             "schemaVersion": 1,
@@ -651,6 +651,240 @@ async def test_private_handler_verifies_then_awaits_exact_hco_event(
             "command": {"type": "RUN", "instruction": "ship it"},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_backend_unavailable_is_rendered_as_actionable_text_not_json(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    async def submit(_self, _event):
+        return {
+            "schemaVersion": 1,
+            "status": "backend_unavailable",
+            "action": "dispatch",
+            "projectId": "stockprofits",
+            "objectiveId": "objective-24cf35e8",
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _token_from_rewrite(
+        _invoke(manager, _event("/codex run install latest SpecCompass"))
+    )
+    handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
+    visible = await handler(token)
+
+    assert "stockprofits" in visible
+    assert "Codex 后端暂时不可用" in visible
+    assert "本次任务未执行" in visible
+    assert "objective-24cf35e8" in visible
+    assert "{" not in visible
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            {
+                "schemaVersion": 1,
+                "status": "ok",
+                "action": "topic.show",
+                "projectId": "stockprofits",
+                "mode": "CODEX_BOUND",
+                "objectiveId": "objective-1",
+            },
+            "当前话题模式：CODEX_BOUND。项目：stockprofits。任务：objective-1。",
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "ok",
+                "action": "topic.set",
+                "mode": "HERMES_ONLY",
+            },
+            "话题模式已更新：HERMES_ONLY。",
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "ok",
+                "action": "objective.status",
+                "projectId": "stockprofits",
+                "objectiveId": "objective-1",
+                "executionStatus": "running",
+                "backend": "app-server",
+                "threadId": "thread-1",
+            },
+            (
+                "任务：objective-1。项目：stockprofits。状态：running。"
+                "后端：app-server。会话：thread-1。"
+            ),
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "cancelled",
+                "action": "objective.cancel",
+                "projectId": "stockprofits",
+                "objectiveId": "objective-1",
+                "turnId": "turn-1",
+            },
+            "任务取消状态：cancelled。项目：stockprofits。任务：objective-1。轮次：turn-1。",
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "answered",
+                "action": "interaction.answer",
+                "projectId": "stockprofits",
+                "objectiveId": "objective-1",
+                "interactionId": "interaction-1",
+            },
+            (
+                "交互回复状态：answered。项目：stockprofits。任务：objective-1。"
+                "交互：interaction-1。"
+            ),
+        ),
+    ],
+)
+def test_bridge_result_renderer_preserves_management_command_details(
+    tmp_path: Path, monkeypatch, result: dict, expected: str
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    assert _plugin_globals(manager)["_render_bridge_result"](result) == expected
+
+
+def test_bridge_result_renderer_rejects_unknown_future_action_without_reflection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+    result = {
+        "schemaVersion": 1,
+        "status": "ok",
+        "action": "future.inspect",
+        "importantField": "must-survive",
+        "token": "must-not-leak",
+    }
+
+    visible = _plugin_globals(manager)["_render_bridge_result"](result)
+
+    assert visible == (
+        "Codex 返回了当前插件不支持的操作结果；"
+        "详细内容未显示，请检查插件与 HCO 版本。"
+    )
+    assert "future.inspect" not in visible
+    assert "must-survive" not in visible
+    assert "must-not-leak" not in visible
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "schemaVersion": 1,
+            "status": "private-dispatch-status",
+            "action": "dispatch",
+            "projectId": "stockprofits",
+            "objectiveId": "objective-1",
+        },
+        {
+            "schemaVersion": 1,
+            "status": "private-cancel-status",
+            "action": "objective.cancel",
+            "projectId": "stockprofits",
+            "objectiveId": "objective-1",
+        },
+        {
+            "schemaVersion": 1,
+            "status": "private-answer-status",
+            "action": "interaction.answer",
+            "projectId": "stockprofits",
+            "objectiveId": "objective-1",
+            "interactionId": "interaction-1",
+        },
+        {
+            "schemaVersion": 1,
+            "status": "ok",
+            "action": "objective.status",
+            "projectId": "stockprofits",
+            "objectiveId": "objective-1",
+            "executionStatus": "private-execution-status",
+            "backend": "app-server",
+            "threadId": "thread-1",
+        },
+    ],
+)
+def test_bridge_result_renderer_rejects_unknown_status_without_reflection(
+    tmp_path: Path, monkeypatch, result: dict
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    visible = _plugin_globals(manager)["_render_bridge_result"](result)
+
+    assert visible == (
+        "Codex 返回了当前插件不支持的操作结果；"
+        "详细内容未显示，请检查插件与 HCO 版本。"
+    )
+    reflected_status = result.get("executionStatus", result["status"])
+    assert reflected_status not in visible
+
+
+@pytest.mark.asyncio
+async def test_natural_route_query_uses_signed_route_show_without_llm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        RuntimeError("model must not run"),
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+    submitted = []
+
+    async def submit(_self, event):
+        submitted.append(event)
+        return {
+            "schemaVersion": 1,
+            "status": "ok",
+            "action": "route.show",
+            "route": {
+                "streamId": 42,
+                "owner": "PROJECT",
+                "projectId": "stockprofits",
+                "source": "static",
+                "cwd": "/Users/hula/Projects/stockprofits",
+            },
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _token_from_rewrite(
+        _invoke(manager, _event("请汇报当前工作文件夹。当前projectid。"))
+    )
+    handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
+    visible = await handler(token)
+
+    assert llm.calls == []
+    assert submitted[0]["command"] == {"type": "ROUTE", "action": "SHOW"}
+    assert "stockprofits" in visible
+    assert "/Users/hula/Projects/stockprofits" in visible
 
 
 @pytest.mark.asyncio
@@ -682,7 +916,7 @@ async def test_private_handler_rejects_tamper_expiry_replay_and_direct_invocatio
     assert await handler("user supplied text") == "Codex bridge request rejected."
     assert await handler(tampered) == "Codex bridge request rejected."
     assert await handler(expired) == "Codex bridge request rejected."
-    assert await handler(token) == '{"accepted":true}'
+    assert await handler(token) == "Codex 请求已提交。"
     assert await handler(token) == "Codex bridge request rejected."
     assert len(calls) == 1
 
@@ -714,7 +948,7 @@ async def test_private_handler_rejects_replay_when_active_nonce_cache_is_full(
     ]
 
     for token in tokens[:3]:
-        assert await handler(token) == '{"accepted":true}'
+        assert await handler(token) == "Codex 请求已提交。"
     calls_at_capacity = len(calls)
 
     saturated_result = await handler(tokens[3])
@@ -838,7 +1072,7 @@ async def test_natural_handler_submits_exact_event_and_rejects_authority_fields(
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
     result = await handler(token)
 
-    assert result == '{"accepted":true,"objectiveId":"obj-1"}'
+    assert result == "Codex 请求已提交。任务：obj-1。"
     assert len(llm.calls) == 1
     assert len(calls) == 1
     submitted = calls[0]
@@ -1025,7 +1259,7 @@ async def test_natural_vault_isolates_concurrent_project_topics(
         run("Beta", 101),
     )
 
-    assert results == ['{"accepted":true}', '{"accepted":true}']
+    assert results == ["Codex 请求已提交。", "Codex 请求已提交。"]
     assert len(llm.calls) == 2
     assert {(call["binding"]["topic"], call["binding"]["sourceMessageId"]) for call in calls} == {
         ("Alpha", 100),
@@ -1331,11 +1565,11 @@ def test_project_natural_language_uses_short_one_shot_capability_without_user_te
 @pytest.mark.parametrize(
     ("semantic", "bridge_failure", "visible", "hco_calls"),
     [
-        (_dispatch(objective=None), None, '{"accepted":true}', 1),
+        (_dispatch(objective=None), None, "Codex 请求已提交。", 1),
         (
             {"type": "CONTROL", "action": "SET_TOPIC_MODE", "mode": "AUTO"},
             None,
-            '{"accepted":true}',
+            "Codex 请求已提交。",
             1,
         ),
         (
@@ -1563,12 +1797,12 @@ async def test_hermes_only_natural_dispatch_requires_auto_but_control_reaches_hc
 
     llm.parsed = _dispatch(topic_mode_action="AUTO")
     auto = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=302)))
-    assert await handler(auto) == '{"accepted":true}'
+    assert await handler(auto) == "Codex 请求已提交。"
     assert len(submissions) == 1
 
     llm.parsed = {"type": "CONTROL", "action": "SET_TOPIC_MODE", "mode": "AUTO"}
     control = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=303)))
-    assert await handler(control) == '{"accepted":true}'
+    assert await handler(control) == "Codex 请求已提交。"
     assert len(submissions) == 2
     assert len(llm.calls) == 3
 
@@ -1681,7 +1915,7 @@ async def test_nlp_capability_boundary_matrix_has_stable_counts(
     monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
     handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
 
-    expected = '{"accepted":true}' if accepted else "Codex bridge request rejected."
+    expected = "Codex 请求已提交。" if accepted else "Codex bridge request rejected."
     assert await handler(altered) == expected
     assert len(llm.calls) == (1 if accepted else 0)
     assert len(submissions) == (1 if accepted else 0)
@@ -1898,7 +2132,7 @@ async def test_semantic_utf8_count_and_total_json_exact_plus_one_boundaries(
     assert exact_agent_entries == []
     assert plus_agent_entries == []
     if exact_submits:
-        assert exact_result == '{"accepted":true}'
+        assert exact_result == "Codex 请求已提交。"
     elif exact["type"] == "CLARIFY":
         assert exact_result.startswith(exact["question"])
     else:
