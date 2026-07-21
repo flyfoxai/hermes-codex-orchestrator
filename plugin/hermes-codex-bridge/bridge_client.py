@@ -15,8 +15,43 @@ class BridgeUnavailableError(Exception):
     pass
 
 
+class BridgeUncertainError(Exception):
+    """Request may have been written, but response was lost or timed out."""
+    pass
+
+
 class BridgeProtocolError(Exception):
     pass
+
+
+USER_FACING_ERROR_CODES = frozenset(
+    {
+        "INTERACTION_DECISION_INVALID",
+        "INTERACTION_COMMAND_MISMATCH",
+        "INTERACTION_QUESTION_ID_INVALID",
+        "INTERACTION_NOT_FOUND",
+        "INTERACTION_TARGET_MISMATCH",
+        "OBJECTIVE_REQUIRED",
+        "OBJECTIVE_NOT_FOUND",
+        "OBJECTIVE_PROJECT_MISMATCH",
+        "ACL_FORBIDDEN",
+        "INTERACTION_ORPHANED",
+        "INTERACTION_EXPIRED",
+        "INTERACTION_UNAUTHORIZED",
+        "INTERACTION_ANSWER_CONFLICT",
+        "INTERACTION_ANSWER_INVALID",
+        "INTERACTION_APPROVAL_RESTRICTED",
+    }
+)
+
+
+class BridgeUserError(Exception):
+    """An error with a user-readable message, returned as 4xx from the bridge."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.user_message = message
 
 
 async def _read_bounded_response(reader: asyncio.StreamReader) -> bytes:
@@ -68,6 +103,7 @@ class BridgeClient:
         ).encode("ascii") + body
 
         writer = None
+        write_succeeded = False
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(self.socket_path),
@@ -75,10 +111,15 @@ class BridgeClient:
             )
             writer.write(request)
             await asyncio.wait_for(writer.drain(), timeout=IO_TIMEOUT_SECONDS)
+            write_succeeded = True
             response = await asyncio.wait_for(
                 _read_bounded_response(reader), timeout=IO_TIMEOUT_SECONDS
             )
         except (OSError, asyncio.TimeoutError, ConnectionError) as exc:
+            if write_succeeded:
+                # Request may have been written; response lost or timed out
+                raise BridgeUncertainError("response unavailable after write") from exc
+            # Prewrite failure: connection or write failed
             raise BridgeUnavailableError("bridge unavailable") from exc
         finally:
             if writer is not None:
@@ -130,6 +171,8 @@ def _parse_response(response: bytes) -> dict:
             or type(error.get("message")) is not str
         ):
             raise BridgeProtocolError("invalid error response")
+        if 400 <= status < 500 and error["code"] in USER_FACING_ERROR_CODES:
+            raise BridgeUserError(error["code"], error["message"])
         raise BridgeProtocolError("bridge rejected request")
     if set(body) != {"result"} or type(body["result"]) is not dict:
         raise BridgeProtocolError("invalid response")

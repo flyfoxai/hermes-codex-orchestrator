@@ -16,10 +16,22 @@ function requiredMethod(client, method) {
   }
 }
 
-async function callClient(operation) {
+function isRequestedThreadMissing(error, threadId) {
+  return error?.code === "APP_SERVER_RPC_REMOTE_ERROR" &&
+    error.rpcCode === -32600 &&
+    error.rpcMessage === `thread not loaded: ${threadId}`;
+}
+
+async function callClient(operation, { threadId } = {}) {
   try {
     return await operation();
   } catch (error) {
+    if (threadId !== undefined && isRequestedThreadMissing(error, threadId)) {
+      throw executionBackendError(
+        "EXECUTION_BACKEND_OBJECTIVE_MISSING",
+        "Execution backend objective does not exist."
+      );
+    }
     throw executionBackendError(
       PREWRITE_CODES.has(error?.code) ? "EXECUTION_BACKEND_UNAVAILABLE" : "EXECUTION_BACKEND_REQUEST_UNCERTAIN",
       PREWRITE_CODES.has(error?.code) ? "Execution backend is unavailable." : "Execution backend request outcome is uncertain.",
@@ -49,7 +61,10 @@ export function createAppServerBackend({ client } = {}) {
       return Object.freeze({ threadId: resultId(result, "thread", "thread") });
     },
     async startTurn({ threadId, text, clientUserMessageId }) {
-      const result = await callClient(() => client.startTurn({ threadId, text, clientUserMessageId }));
+      const result = await callClient(
+        () => client.startTurn({ threadId, text, clientUserMessageId }),
+        { threadId }
+      );
       return Object.freeze({ turnId: resultId(result, "turn", "turn") });
     },
     interruptTurn({ threadId, turnId }) {

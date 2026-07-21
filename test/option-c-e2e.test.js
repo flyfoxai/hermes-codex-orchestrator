@@ -340,6 +340,14 @@ test("pending App Server approval survives restart and only its authorized bound
     }
   });
 
+  const prompts = runtime.store.claimOutbox({ workerId: "approval-prompt", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, new RegExp(pending.interactionId));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+  assert.match(prompt.payload.content, /npm test/);
+
   await assert.rejects(() => runtime.service.handleBridgeEvent(fixture.event({
     topic: "Approval",
     senderId: 2,
@@ -361,7 +369,7 @@ test("pending App Server approval survives restart and only its authorized bound
   assert.equal(answered.status, "answered");
   assert.deepEqual(fixture.calls.app.filter(([method]) => method === "respondToInteraction"), [[
     "respondToInteraction",
-    { interactionId: pending.interactionId, wireRequestId: 7, result: { choice: "accept" } }
+    { interactionId: pending.interactionId, wireRequestId: 7, result: { decision: "accept" } }
   ]]);
 });
 

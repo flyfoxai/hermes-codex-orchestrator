@@ -4,6 +4,7 @@ import { performance } from "node:perf_hooks";
 import { createAcl } from "./acl.js";
 import { verifyContext } from "./contracts/envelope.js";
 import { createRouteResolver, publishRouteSnapshot } from "./routes.js";
+import { stateError } from "./state/reducer.js";
 
 const MAX_INSTRUCTION_BYTES = 16 * 1024;
 const MAX_LIST_ENTRY_BYTES = 2 * 1024;
@@ -14,6 +15,17 @@ const APP_SERVER_REVERSE_METHODS = new Set([
   "item/fileChange/requestApproval",
   "item/tool/requestUserInput"
 ]);
+const EXTENDED_PERMISSION_FIELDS = [
+  "networkApprovalContext",
+  "additionalPermissions",
+  "proposedNetworkPolicyAmendments",
+  "proposedExecpolicyAmendment",
+  "grantRoot"
+];
+const KNOWN_SIMPLE_DECISIONS = Object.freeze(
+  new Set(["accept", "acceptForSession", "decline", "cancel"])
+);
+const SAFE_APPROVAL_KEYS = new Set(["decline", "cancel"]);
 const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = (2n ** 63n) - 1n;
 
@@ -29,6 +41,51 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
+// Align with plugin.py's _is_safe_question_id and renderer CLI-token rules.
+// Explicitly reject U+0085 (NEL) which Python isspace() rejects but ECMAScript \s accepts.
+function isSafeQuestionId(id) {
+  return typeof id === "string" && id.trim() !== "" &&
+    Buffer.byteLength(id, "utf8") <= 256 &&
+    !/[\s\x00-\x1F\x7F\x85`"'<>[\]{}()|;\\/]/u.test(id);
+}
+
+function approvalChoiceKey(decision) {
+  if (typeof decision === "string") return decision;
+  if (isPlainObject(decision)) {
+    const keys = Object.keys(decision);
+    if (keys.length === 1 && typeof keys[0] === "string") return keys[0];
+  }
+  return null;
+}
+
+function isObjectApprovalDecision(decision) {
+  return isPlainObject(decision) && approvalChoiceKey(decision) !== null;
+}
+
+function hasExtendedPermissions(request) {
+  return EXTENDED_PERMISSION_FIELDS.some((field) => request?.[field] != null);
+}
+
+function validateQuestions(rawQuestions) {
+  if (!Array.isArray(rawQuestions) || rawQuestions.length === 0) return null;
+
+  const ids = [];
+  for (const question of rawQuestions) {
+    if (!isPlainObject(question)) {
+      return "One or more questions are malformed. Use App Server UI to answer.";
+    }
+    const id = question.id;
+    if (!isSafeQuestionId(id)) {
+      return `Question ID '${String(id).slice(0, 40)}' is invalid (empty, contains whitespace/control chars, or exceeds 256 bytes). Use App Server UI.`;
+    }
+    if (ids.includes(id)) {
+      return `Duplicate question ID '${id.slice(0, 40)}'. Use App Server UI to answer.`;
+    }
+    ids.push(id);
+  }
+  return null;
+}
+
 function exact(value, required, optional = []) {
   if (!isPlainObject(value)) return false;
   const allowed = new Set([...required, ...optional]);
@@ -42,6 +99,10 @@ function positive(value) {
 
 function boundedText(value, maximum = MAX_INSTRUCTION_BYTES) {
   return typeof value === "string" && value.trim().length > 0 && Buffer.byteLength(value, "utf8") <= maximum;
+}
+
+function singleToken(value, maximum = 512) {
+  return boundedText(value, maximum) && !/\s/u.test(value);
 }
 
 function appServerRequestId(value) {
@@ -96,6 +157,10 @@ function validateCommand(command) {
     case "OBJECTIVE_CONTINUE":
       if (!exact(command, ["type", "objectiveId", "instruction"]) || !boundedText(command.objectiveId, 512) ||
           !boundedText(command.instruction)) invalidBridge();
+      break;
+    case "THREAD_BIND":
+      if (!exact(command, ["type", "objectiveId", "threadId"]) ||
+          !singleToken(command.objectiveId) || !singleToken(command.threadId)) invalidBridge();
       break;
     case "APPROVE":
       if (!exact(command, ["type", "replyToken", "choice"]) || !boundedText(command.replyToken, 512) ||
@@ -179,7 +244,7 @@ export function createHcoService({
     "readAppServerTurnContext"
   ];
   const controllerMethods = [
-    "acceptIntent", "continueObjective", "cancelObjective", "answerInteraction",
+    "acceptIntent", "continueObjective", "resolveObjectiveThread", "cancelObjective", "answerInteraction",
     "handleInteractionRequest", "handleTurnCompleted"
   ];
   if (!isPlainObject(config) || !Array.isArray(config.projects) || !Array.isArray(config.admins) ||
@@ -298,8 +363,8 @@ export function createHcoService({
 
   function requireObjectiveProject(objectiveId, projectId) {
     const ownedProjectId = store.readObjectiveProject(objectiveId);
-    if (ownedProjectId === null) throw serviceError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
-    if (ownedProjectId !== projectId) throw serviceError("OBJECTIVE_PROJECT_MISMATCH", "Objective belongs to another project.");
+    if (ownedProjectId === null) throw stateError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
+    if (ownedProjectId !== projectId) throw stateError("OBJECTIVE_PROJECT_MISMATCH", "Objective belongs to another project.");
   }
 
   function executionOptions({ binding, project, objectiveId, text }) {
@@ -440,14 +505,36 @@ export function createHcoService({
     const objectiveId = command.objectiveId ?? store.readCurrentTopicObjective({
       streamId: binding.streamId, topic: binding.topic, projectId: project.projectId
     });
-    if (!objectiveId) throw serviceError("OBJECTIVE_REQUIRED", "An objective is required.");
+    if (!objectiveId) throw stateError("OBJECTIVE_REQUIRED", "An objective is required.");
     requireObjectiveProject(objectiveId, project.projectId);
     acl.require({ userId: binding.senderId, projectId: project.projectId, permission: "objective.status" });
     const execution = store.readObjectiveExecution(objectiveId);
-    if (!execution) throw serviceError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
+    if (!execution) throw stateError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
     return deepFreeze({
       schemaVersion: 1, status: "ok", action: "objective.status", projectId: project.projectId,
       objectiveId, executionStatus: execution.executionStatus, backend: execution.backend, threadId: execution.threadId
+    });
+  }
+
+  async function threadBindCommand(command, binding) {
+    const { project } = requireProjectRoute(binding);
+    requireObjectiveProject(command.objectiveId, project.projectId);
+    acl.require({
+      userId: binding.senderId,
+      projectId: project.projectId,
+      permission: "backend.recover"
+    });
+    const result = await turnController.resolveObjectiveThread({
+      objectiveId: command.objectiveId,
+      threadId: command.threadId,
+      sourceType: "zulip-message",
+      sourceId: String(binding.sourceMessageId)
+    });
+    return deepFreeze({
+      schemaVersion: 1,
+      action: "objective.thread.bind",
+      projectId: project.projectId,
+      ...result
     });
   }
 
@@ -456,7 +543,7 @@ export function createHcoService({
     const objectiveId = command.objectiveId ?? store.readCurrentTopicObjective({
       streamId: binding.streamId, topic: binding.topic, projectId: project.projectId
     });
-    if (!objectiveId) throw serviceError("OBJECTIVE_REQUIRED", "An objective is required.");
+    if (!objectiveId) throw stateError("OBJECTIVE_REQUIRED", "An objective is required.");
     requireObjectiveProject(objectiveId, project.projectId);
     acl.require({ userId: binding.senderId, projectId: project.projectId, permission: "objective.cancel" });
     const result = await turnController.cancelObjective({
@@ -465,19 +552,159 @@ export function createHcoService({
     return deepFreeze({ schemaVersion: 1, action: "objective.cancel", projectId: project.projectId, ...result });
   }
 
+  function resolveApprovalDecision(interaction, choiceKey) {
+    const available = interaction?.request?.availableDecisions;
+    if (Array.isArray(available) && available.length > 0) {
+      for (const decision of available) {
+        const key = approvalChoiceKey(decision);
+        if (key === choiceKey) return { key, decision, objectDecision: isObjectApprovalDecision(decision) };
+      }
+      const valid = available.map(approvalChoiceKey).filter(Boolean);
+      throw stateError(
+        "INTERACTION_DECISION_INVALID",
+        `Invalid decision '${choiceKey}'. Valid choices: ${valid.join(", ")}.`
+      );
+    }
+    if (KNOWN_SIMPLE_DECISIONS.has(choiceKey)) return { key: choiceKey, decision: choiceKey, objectDecision: false };
+    throw stateError(
+      "INTERACTION_DECISION_INVALID",
+      `Invalid decision '${choiceKey}'. Without available decisions, valid choices are: ${[
+        ...KNOWN_SIMPLE_DECISIONS
+      ].join(", ")}.`
+    );
+  }
+
+  function userInputQuestions(interaction) {
+    const questions = interaction?.request?.questions;
+    return Array.isArray(questions)
+      ? questions.filter(
+          (question) =>
+            isPlainObject(question) &&
+            typeof question.id === "string" &&
+            question.id.trim() &&
+            !/\s/.test(question.id)
+        )
+      : [];
+  }
+
   async function interactionCommand(command, binding) {
     const interaction = store.readInteraction(command.replyToken);
-    if (!interaction) throw serviceError("INTERACTION_NOT_FOUND", "Interaction does not exist.");
+    if (!interaction) throw stateError("INTERACTION_NOT_FOUND", "Interaction does not exist.");
     const projectId = store.readObjectiveProject(interaction.objectiveId);
-    if (!projectId) throw serviceError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
+    if (!projectId) throw stateError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
     if (interaction.targetSnapshot?.platform !== "zulip" || interaction.targetSnapshot.streamId !== binding.streamId ||
         interaction.targetSnapshot.topic !== binding.topic) {
-      throw serviceError("INTERACTION_TARGET_MISMATCH", "Interaction target does not match.");
+      throw stateError("INTERACTION_TARGET_MISMATCH", "Interaction target does not match.");
     }
     acl.require({
       userId: binding.senderId, projectId, permission: "interaction.answer", responderIds: interaction.allowedResponderIds
     });
-    const answer = command.type === "APPROVE" ? { choice: command.choice } : { text: command.text };
+    const approvalMethods = new Set([
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval"
+    ]);
+    const isApprovalInteraction = approvalMethods.has(interaction.method);
+    const isUserInputInteraction = interaction.method === "item/tool/requestUserInput";
+    if (command.type === "APPROVE" && !isApprovalInteraction) {
+      throw stateError(
+        "INTERACTION_COMMAND_MISMATCH",
+        `Cannot use /codex approve on a '${interaction.method}' interaction.`
+      );
+    }
+    if (command.type === "ANSWER" && !isUserInputInteraction) {
+      throw stateError(
+        "INTERACTION_COMMAND_MISMATCH",
+        `Cannot use /codex answer on a '${interaction.method}' interaction.`
+      );
+    }
+    if (command.type === "ANSWER") {
+      const rawQuestions = Array.isArray(interaction?.request?.questions)
+        ? interaction.request.questions
+        : [];
+      const validationError = validateQuestions(rawQuestions);
+      if (validationError) {
+        throw stateError("INTERACTION_QUESTION_ID_INVALID", validationError);
+      }
+      const questions = userInputQuestions(interaction);
+      // Reject answer commands for any interaction containing isSecret questions
+      const hasSecretQuestion = rawQuestions.some(
+        (question) => isPlainObject(question) && question.isSecret === true
+      );
+      if (hasSecretQuestion) {
+        throw stateError(
+          "INTERACTION_SECRET_ANSWER_FORBIDDEN",
+          "Cannot answer interactions containing secret questions via Zulip commands. Use App Server UI."
+        );
+      }
+      if (questions.length === 1) {
+        const answer = { answers: { [questions[0].id]: { answers: [command.text] } } };
+        const result = await turnController.answerInteraction({
+          interactionId: interaction.interactionId,
+          responderId: binding.senderId,
+          targetSnapshot: interaction.targetSnapshot,
+          answer
+        });
+        return deepFreeze({ schemaVersion: 1, action: "interaction.answer", projectId, ...result });
+      }
+      if (questions.length > 1) {
+        const match = /^(\S+)\s+([\s\S]+)$/.exec(command.text);
+        const questionId = match?.[1];
+        const questionAnswer = match?.[2];
+        const questionIds = questions.map((question) => question.id);
+        if (!questionId || !questionIds.includes(questionId) || !questionAnswer) {
+          throw stateError(
+            "INTERACTION_QUESTION_ID_INVALID",
+            `Answer must start with one of these question IDs: ${questionIds.join(", ")}.`
+          );
+        }
+        const partialAnswers = {
+          ...(isPlainObject(interaction.partialAnswers) ? interaction.partialAnswers : {}),
+          [questionId]: { answers: [questionAnswer] }
+        };
+        const missingQuestionIds = questionIds.filter((id) => !Object.hasOwn(partialAnswers, id));
+        if (missingQuestionIds.length > 0) {
+          store.persistInteractionPartialAnswers({
+            interactionId: interaction.interactionId,
+            partialAnswers
+          });
+          return deepFreeze({
+            schemaVersion: 1,
+            action: "interaction.answer",
+            status: "partial",
+            projectId,
+            objectiveId: interaction.objectiveId,
+            interactionId: interaction.interactionId,
+            missingQuestionIds
+          });
+        }
+        const answer = { answers: partialAnswers };
+        const result = await turnController.answerInteraction({
+          interactionId: interaction.interactionId,
+          responderId: binding.senderId,
+          targetSnapshot: interaction.targetSnapshot,
+          answer
+        });
+        return deepFreeze({ schemaVersion: 1, action: "interaction.answer", projectId, ...result });
+      }
+    }
+    if (command.type === "APPROVE") {
+      const resolved = resolveApprovalDecision(interaction, command.choice);
+      if ((hasExtendedPermissions(interaction.request) || resolved.objectDecision) && !SAFE_APPROVAL_KEYS.has(resolved.key)) {
+        throw stateError(
+          "INTERACTION_APPROVAL_RESTRICTED",
+          "This approval contains extended permissions. Only decline/cancel permitted via command. Use App Server UI."
+        );
+      }
+      const answer = { decision: resolved.decision };
+      const result = await turnController.answerInteraction({
+        interactionId: interaction.interactionId,
+        responderId: binding.senderId,
+        targetSnapshot: interaction.targetSnapshot,
+        answer
+      });
+      return deepFreeze({ schemaVersion: 1, action: "interaction.answer", projectId, ...result });
+    }
+    const answer = { text: command.text };
     const result = await turnController.answerInteraction({
       interactionId: interaction.interactionId,
       responderId: binding.senderId,
@@ -496,6 +723,7 @@ export function createHcoService({
       case "OBJECTIVE_CONTINUE": return dispatch({
         binding, text: command.instruction, selection: { mode: "CONTINUE", objectiveId: command.objectiveId }
       });
+      case "THREAD_BIND": return threadBindCommand(command, binding);
       case "STATUS": return statusCommand(command, binding);
       case "CANCEL": return cancelCommand(command, binding);
       case "APPROVE":

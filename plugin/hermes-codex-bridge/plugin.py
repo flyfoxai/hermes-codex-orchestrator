@@ -7,12 +7,20 @@ import hmac
 import inspect
 import json
 import os
+import re
 import secrets
 import stat
+import threading
 import time
 from dataclasses import dataclass
 
-from .bridge_client import BridgeClient, BridgeProtocolError, BridgeUnavailableError
+from .bridge_client import (
+    BridgeClient,
+    BridgeProtocolError,
+    BridgeUnavailableError,
+    BridgeUncertainError,
+    BridgeUserError,
+)
 from .route_snapshot import MAX_SAFE_INTEGER, find_route, load_route_snapshot
 
 
@@ -24,9 +32,24 @@ MAX_CLOCK_SKEW_SECONDS = 30
 MAX_REPLAY_ENTRIES = 4_096
 CONTEXT_LIFETIME_SECONDS = 60
 PRIVATE_COMMAND = "/hermes-codex-bridge-internal"
-NLP_PRIVATE_COMMAND = "/hermes-codex-bridge-natural"
 ROUTE_UNAVAILABLE_COMMAND = "/hermes-codex-bridge-route-unavailable"
 ROUTE_UNAVAILABLE_TEXT = "项目路由暂不可用，请稍后重试。"
+REGISTRATION_COMMAND = "/hermes-codex-bridge-registration"
+REGISTRATION_TEXT = (
+    "当前频道尚未登记 Codex 项目。请确认："
+    "1）projectId；2）canonical 绝对工作目录；"
+    "3）是否将当前数字 stream 登记到该项目；"
+    "4）新建 objective，还是继续已有 objective（继续时请提供 objectiveId）。"
+    "如果没有 Codex thread，会在首次执行时自动创建；"
+    "无法确认旧 thread 已丢失时，不会自动重建，以免重复执行。"
+)
+UNMAPPED_STREAM_PROMPT = (
+    "当前 Zulip 数字 stream 尚未登记 Codex 项目。"
+    "不要根据话题名称或消息内容猜测 projectId，也不要沿用其他项目。"
+    "普通对话正常回答；如果用户要求执行项目工作、查询项目进度或工作目录，"
+    "必须原样回复以下模板：\n"
+    f"{REGISTRATION_TEXT}"
+)
 PLUGIN_VERSION = "1.0.0"
 ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
 NLP_CAPABILITY_PURPOSE = "codex-nlp-dispatch"
@@ -37,6 +60,7 @@ MAX_PENDING_ENTRIES = 256
 MAX_PENDING_BYTES = 1024 * 1024
 MAX_PENDING_PER_SENDER = 8
 MAX_VISIBLE_TEXT_BYTES = 8 * 1024
+ROUTE_MARKER_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def _now_seconds() -> int:
@@ -64,43 +88,174 @@ class PendingRequest:
     request: str
     request_bytes: int
     expires_at: int
+    session_key: str
+    context_token: str
 
 
 class PendingVault:
     def __init__(self) -> None:
         self._entries: dict[str, PendingRequest] = {}
+        self._turn_nonces: dict[tuple[str, str], str] = {}
+        self._authorized_entries: dict[tuple[str, str], PendingRequest] = {}
+        self._authorized_turns: dict[tuple[str, str], tuple[str, str]] = {}
         self._total_bytes = 0
+        self._lock = threading.Lock()
+
+    def _drop_nonce(self, nonce: str) -> PendingRequest | None:
+        entry = self._entries.pop(nonce, None)
+        if entry is None:
+            return None
+        self._total_bytes -= entry.request_bytes
+        for turn, bound_nonce in list(self._turn_nonces.items()):
+            if bound_nonce == nonce:
+                self._turn_nonces.pop(turn, None)
+        return entry
+
+    def _drop_authorized(
+        self, key: tuple[str, str]
+    ) -> PendingRequest | None:
+        entry = self._authorized_entries.pop(key, None)
+        if entry is None:
+            return None
+        self._total_bytes -= entry.request_bytes
+        for turn, authorized_key in list(self._authorized_turns.items()):
+            if authorized_key == key:
+                self._authorized_turns.pop(turn, None)
+        return entry
 
     def _cleanup(self, now: int) -> None:
         for nonce, entry in list(self._entries.items()):
             if entry.expires_at < now - MAX_CLOCK_SKEW_SECONDS:
-                self._entries.pop(nonce)
-                self._total_bytes -= entry.request_bytes
+                self._drop_nonce(nonce)
+        for key, entry in list(self._authorized_entries.items()):
+            if entry.expires_at < now - MAX_CLOCK_SKEW_SECONDS:
+                self._drop_authorized(key)
 
     def add(self, nonce: str, entry: PendingRequest, now: int) -> bool:
-        self._cleanup(now)
-        sender_entries = sum(
-            pending.context.provenance.sender_id
-            == entry.context.provenance.sender_id
-            for pending in self._entries.values()
-        )
-        if (
-            nonce in self._entries
-            or len(self._entries) >= MAX_PENDING_ENTRIES
-            or self._total_bytes + entry.request_bytes > MAX_PENDING_BYTES
-            or sender_entries >= MAX_PENDING_PER_SENDER
-        ):
-            return False
-        self._entries[nonce] = entry
-        self._total_bytes += entry.request_bytes
-        return True
+        with self._lock:
+            self._cleanup(now)
+            sender_entries = sum(
+                pending.context.provenance.sender_id
+                == entry.context.provenance.sender_id
+                for pending in (
+                    *self._entries.values(),
+                    *self._authorized_entries.values(),
+                )
+            )
+            if (
+                nonce in self._entries
+                or len(self._entries) + len(self._authorized_entries)
+                >= MAX_PENDING_ENTRIES
+                or self._total_bytes + entry.request_bytes > MAX_PENDING_BYTES
+                or sender_entries >= MAX_PENDING_PER_SENDER
+            ):
+                return False
+            self._entries[nonce] = entry
+            self._total_bytes += entry.request_bytes
+            return True
 
     def consume(self, nonce: str, now: int) -> PendingRequest | None:
-        self._cleanup(now)
-        entry = self._entries.pop(nonce, None)
-        if entry is not None:
-            self._total_bytes -= entry.request_bytes
-        return entry
+        with self._lock:
+            self._cleanup(now)
+            return self._drop_nonce(nonce)
+
+    def get(self, nonce: str, now: int) -> PendingRequest | None:
+        with self._lock:
+            self._cleanup(now)
+            return self._entries.get(nonce)
+
+    def bind_turn(
+        self,
+        session_key: str,
+        session_id: str,
+        turn_id: str,
+        request: str,
+        source_message_id: str,
+        now: int,
+    ) -> bool:
+        if not all(type(value) is str and value for value in (session_key, session_id, turn_id)):
+            return False
+        if type(request) is not str or type(source_message_id) is not str:
+            return False
+        try:
+            message_id = int(source_message_id)
+        except ValueError:
+            return False
+        if not _positive_integer(message_id) or source_message_id != str(message_id):
+            return False
+        turn = (session_id, turn_id)
+        with self._lock:
+            self._cleanup(now)
+            if turn in self._turn_nonces:
+                return False
+            bound_nonces = set(self._turn_nonces.values())
+            for nonce, entry in self._entries.items():
+                if (
+                    nonce not in bound_nonces
+                    and entry.session_key == session_key
+                    and entry.request == request
+                    and entry.context.provenance.message_id == message_id
+                ):
+                    self._turn_nonces[turn] = nonce
+                    return True
+        return False
+
+    def bound_entry(
+        self, session_id: str, turn_id: str, now: int
+    ) -> tuple[str, PendingRequest] | None:
+        turn = (session_id, turn_id)
+        with self._lock:
+            self._cleanup(now)
+            nonce = self._turn_nonces.get(turn)
+            if nonce is None:
+                return None
+            entry = self._entries.get(nonce)
+            return None if entry is None else (nonce, entry)
+
+    def authorize(
+        self,
+        nonce: str,
+        session_id: str,
+        turn_id: str,
+        semantic_digest: str,
+        now: int,
+    ) -> bool:
+        turn = (session_id, turn_id)
+        key = (session_id, semantic_digest)
+        with self._lock:
+            self._cleanup(now)
+            if (
+                self._turn_nonces.get(turn) != nonce
+                or nonce not in self._entries
+                or key in self._authorized_entries
+                or turn in self._authorized_turns
+            ):
+                return False
+            entry = self._entries.pop(nonce)
+            self._turn_nonces.pop(turn, None)
+            self._authorized_entries[key] = entry
+            self._authorized_turns[turn] = key
+            return True
+
+    def consume_authorized(
+        self, session_id: str, semantic_digest: str, now: int
+    ) -> PendingRequest | None:
+        key = (session_id, semantic_digest)
+        with self._lock:
+            self._cleanup(now)
+            return self._drop_authorized(key)
+
+    def revoke_turn(self, session_id: str, turn_id: str, now: int) -> None:
+        with self._lock:
+            self._cleanup(now)
+            nonce = self._turn_nonces.pop((session_id, turn_id), None)
+            if nonce is not None:
+                self._drop_nonce(nonce)
+            authorized_key = self._authorized_turns.pop(
+                (session_id, turn_id), None
+            )
+            if authorized_key is not None:
+                self._drop_authorized(authorized_key)
 
 
 def _positive_integer(value: object) -> bool:
@@ -243,6 +398,148 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _load_project_cwd_map(
+    config_path: str,
+) -> dict[str, tuple[str | None, str | None]]:
+    """Return configured and canonical CWDs for every project (best-effort)."""
+    try:
+        raw = _read_owner_file(config_path, MAX_CONFIG_BYTES)
+        config = json.loads(raw.decode("utf-8"))
+        projects = config.get("projects", [])
+        if not isinstance(projects, list):
+            return {}
+        result: dict[str, tuple[str | None, str | None]] = {}
+        for p in projects:
+            if not isinstance(p, dict):
+                continue
+            pid = p.get("projectId")
+            cwd = p.get("cwd")
+            if isinstance(pid, str) and pid and isinstance(cwd, str) and cwd:
+                config_normalized = os.path.normpath(cwd)
+                try:
+                    canonical = os.path.normpath(os.path.realpath(cwd))
+                except Exception:
+                    canonical = config_normalized
+                if config_normalized == os.sep:
+                    result[pid] = (None, None)
+                elif canonical == os.sep:
+                    result[pid] = (config_normalized, None)
+                else:
+                    result[pid] = (
+                        config_normalized,
+                        canonical if canonical != config_normalized else None,
+                    )
+        return result
+    except Exception:
+        return {}
+
+
+_PROJECT_CONTEXT_WORDS_BEFORE = (
+    r"(?:project|repo|repository|cwd|working directory|项目|仓库|工作目录)"
+)
+_PROJECT_CONTEXT_WORDS_AFTER = r"(?:project|repo|repository|项目|仓库)"
+
+
+def _mentions_project_id(text: str, project_id: str) -> bool:
+    escaped = re.escape(project_id)
+    # Include dot in boundary to handle projectIds like "foo.bar"
+    project_boundary_before = r"(?<![A-Za-z0-9_.-])"
+    project_boundary_after = r"(?![A-Za-z0-9_.-])"
+    before = (
+        rf"(?<![A-Za-z0-9_.-]){_PROJECT_CONTEXT_WORDS_BEFORE}"
+        rf"\s*[:：]?\s*{project_boundary_before}{escaped}{project_boundary_after}"
+    )
+    after = (
+        rf"{project_boundary_before}{escaped}{project_boundary_after}"
+        rf"\s*{_PROJECT_CONTEXT_WORDS_AFTER}"
+    )
+    chinese_preposition = (
+        rf"(?:在|到|切换到|切到|使用|用|检查|查看|查|操作|进入)\s*"
+        rf"{project_boundary_before}{escaped}{project_boundary_after}"
+        rf"\s*(?:的\s*)?(?:中|里|下|执行|操作|运行|仓库|项目|代码|目录)?"
+    )
+    english_preposition = (
+        rf"(?i:(?<![A-Za-z])(?:in|into|to|use|using|switch\s+to|check|inspect|open|enter))\s+"
+        rf"{project_boundary_before}{escaped}{project_boundary_after}"
+    )
+    english_possessive = (
+        rf"{project_boundary_before}{escaped}{project_boundary_after}'s\b"
+    )
+    # Extended verb list with handle/investigate/edit/change. Apply it to every legal
+    # project id, including short ids such as "api" or "test", because fail-safe
+    # project containment is more important than accepting ambiguous verb-object text.
+    english_verb_object = (
+        rf"(?i:(?<![A-Za-z])(?:fix|work on|work in|update|test|check|run|debug|deploy|build|lint|review|handle|investigate|edit|change|modify)\s+)"
+        rf"{project_boundary_before}{escaped}{project_boundary_after}"
+    )
+    chinese_possessive = (
+        rf"{project_boundary_before}{escaped}{project_boundary_after}\s*的"
+    )
+    # Extended Chinese patterns including edit/change verbs
+    chinese_verb_context = (
+        rf"(?:修复|修改|更新|检查|处理|调查|编辑|改动)\s*{project_boundary_before}{escaped}{project_boundary_after}"
+        rf"(?:\s*(?:中的|里的|并|的))?"
+    )
+    # file:// URI pattern: file:///workspace/project-id/...
+    file_uri_pattern = (
+        rf"file://[^\s]*{project_boundary_before}{escaped}{project_boundary_after}"
+    )
+
+    patterns = [
+        before,
+        after,
+        chinese_preposition,
+        english_preposition,
+        english_possessive,
+        chinese_possessive,
+        chinese_verb_context,
+        file_uri_pattern,
+    ]
+    patterns.append(english_verb_object)
+
+    return any(
+        re.search(pattern, text) is not None
+        for pattern in patterns
+    )
+
+
+def _cwd_referenced(text: str, cwd: str) -> bool:
+    if not cwd or not text:
+        return False
+    escaped = re.escape(cwd)
+    pattern = rf"(?<![A-Za-z0-9_./-]){escaped}(?:/|(?![A-Za-z0-9_./-]))"
+    return re.search(pattern, text) is not None
+
+
+def _semantic_references_foreign_project(
+    semantic: dict,
+    trusted_pid: str,
+    project_cwd_map: dict[str, tuple[str | None, str | None]],
+) -> tuple[str, str] | None:
+    if semantic.get("type") != "DISPATCH":
+        return None
+    texts = [("instruction", semantic.get("instruction", ""))]
+    for field in ("constraints", "acceptanceCriteria", "reminders"):
+        texts.extend((field, item) for item in semantic.get(field, []))
+    for pid, (config_cwd, canonical_cwd) in project_cwd_map.items():
+        if pid == trusted_pid:
+            continue
+        for field, text in texts:
+            if not isinstance(text, str):
+                continue
+            if config_cwd and _cwd_referenced(text, config_cwd):
+                return pid, field
+            if canonical_cwd and _cwd_referenced(text, canonical_cwd):
+                return pid, field
+            if _mentions_project_id(text, pid):
+                return pid, field
+    return None
+
+
+def _semantic_digest(semantic: dict) -> str:
+    return hashlib.sha256(_canonical_json(semantic)).hexdigest()
+
+
 def _base64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
@@ -326,20 +623,18 @@ def _valid_semantic_value(value: object) -> bool:
         return (
             set(value)
             == {
-            "type",
-            "instruction",
-            "constraints",
-            "acceptanceCriteria",
-            "reminders",
-            "objective",
-            "topicModeAction",
+                "type",
+                "instruction",
+                "constraints",
+                "acceptanceCriteria",
+                "reminders",
+                "objective",
             }
             and _bounded_text(value["instruction"])
             and _valid_text_list(value["constraints"], 16)
             and _valid_text_list(value["acceptanceCriteria"], 16)
             and _valid_text_list(value["reminders"], 8)
             and _valid_objective(value["objective"])
-            and value["topicModeAction"] in (None, "AUTO")
         )
     if value["type"] == "CLARIFY":
         return (
@@ -370,15 +665,6 @@ def _valid_semantic(value: object) -> bool:
         return False
 
 
-NLP_INSTRUCTIONS = (
-    "Classify the untrusted user request into exactly one strict semantic result. "
-    "Use DISPATCH for executable Codex work, CONTROL only for topic mode changes, "
-    "CLARIFY for one bounded question, BUSINESS_REPLY for a direct non-execution "
-    "answer, or REJECT for a stable refusal. Never infer or emit identity, route, "
-    "project, filesystem, credentials, permissions, profiles, or other authority."
-)
-
-
 SEMANTIC_SCHEMA = {
     "oneOf": [
         {
@@ -401,7 +687,6 @@ SEMANTIC_SCHEMA = {
                 "acceptanceCriteria",
                 "reminders",
                 "objective",
-                "topicModeAction",
             ],
             "properties": {
                 "type": {"const": "DISPATCH"},
@@ -429,7 +714,6 @@ SEMANTIC_SCHEMA = {
                         },
                     ]
                 },
-                "topicModeAction": {"enum": [None, "AUTO"]},
             },
         },
         {
@@ -533,6 +817,21 @@ def _parse_command(text: object) -> dict | None:
             return None
         return {"type": "ROUTE", "action": "SET", "projectId": project_id}
 
+    if args.startswith("thread bind "):
+        tail = args[len("thread bind ") :]
+        objective_id, separator, thread_id = tail.partition(" ")
+        if (
+            not separator
+            or not _single_token(objective_id)
+            or not _single_token(thread_id)
+        ):
+            return None
+        return {
+            "type": "THREAD_BIND",
+            "objectiveId": objective_id,
+            "threadId": thread_id,
+        }
+
     for prefix, command_type, tail_field in (
         ("objective continue ", "OBJECTIVE_CONTINUE", "instruction"),
         ("approve ", "APPROVE", "choice"),
@@ -554,7 +853,7 @@ def _is_route_query(text: object) -> bool:
     normalized = text.strip().lower()
     for character in " \t，,。.!！?？:：;；、":
         normalized = normalized.replace(character, "")
-    return normalized in {
+    route_query_bases = {
         "当前工作文件夹当前projectid",
         "当前工作目录当前projectid",
         "当前项目目录当前projectid",
@@ -565,7 +864,57 @@ def _is_route_query(text: object) -> bool:
         "请告诉我当前工作目录和当前projectid",
         "当前projectid当前工作文件夹",
         "当前projectid当前工作目录",
+        "请回复当前projectid工作目录并用一句话汇报项目进度",
+        "请回复当前projectid工作目录",
     }
+    if normalized in route_query_bases:
+        return True
+
+    metadata_query_bases = {
+        "当前项目的projectid",
+        "当前项目projectid",
+        "本项目的projectid",
+        "所属项目的projectid",
+        "请告诉我当前项目的projectid",
+        "请问当前项目的projectid",
+        "当前projectid是多少",
+        "projectid是多少",
+        "projectid",
+        "请告诉我projectid",
+        "currentprojectid",
+        "whatisthecurrentprojectid",
+        "tellmethecurrentprojectid",
+        "whatistheprojectid",
+    }
+
+    # Live acceptance messages append a bounded marker so independent reads can
+    # identify the reply. Keep the marker syntax narrow so ordinary project
+    # requests never become trusted route queries accidentally.
+    marker = r"(?:(?:并)?回显(?:测试编号)?[a-z0-9._-]{1,64})?"
+    return any(
+        re.fullmatch(re.escape(base) + marker, normalized) is not None
+        for base in route_query_bases
+    ) or any(
+        re.fullmatch(re.escape(base) + marker, normalized) is not None
+        for base in metadata_query_bases
+    ) or re.fullmatch(
+        r"请用一句话汇报当前项目进度" + marker,
+        normalized,
+    ) is not None
+
+
+def _route_query_marker(text: object) -> str | None:
+    if not _is_route_query(text):
+        return None
+    match = re.search(
+        r"(?:并)?回显(?:测试编号)?[ \t，,。.!！?？:：;；、]*"
+        r"([A-Za-z0-9._-]{1,64})[ \t，,。.!！?？:：;；、]*$",
+        text.strip(),
+    )
+    if match is None:
+        return None
+    marker = match.group(1).rstrip(".")
+    return marker or None
 
 
 def _unsupported_bridge_result() -> str:
@@ -575,7 +924,54 @@ def _unsupported_bridge_result() -> str:
     )
 
 
-def _render_bridge_result(result: object) -> str:
+# ECMAScript \s extra characters (Python isspace() doesn't fully cover)
+_ECMASCRIPT_EXTRA_WHITESPACE = frozenset({
+    '\xa0',  # NBSP
+    ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+    ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+    '　', '﻿'  # BOM/ZWNBSP
+})
+
+
+# Characters rejected by Node isSafeCliToken that are not whitespace/control:
+# `"'<>[]{}()|;\/ — mirrors the regex [\s\x00-\x1F\x7F`"'<>[\]{}()|;\\/]
+_UNSAFE_QUESTION_ID_CHARS = frozenset('`"\'<>[]{}()|;\\/')
+
+
+def _is_safe_question_id(value: object) -> bool:
+    """Mirror Node isSafeCliToken: non-empty, max 256 bytes UTF-8, no whitespace
+    (Python isspace + ECMAScript \\s union), no control chars, and none of the
+    shell/Markdown special characters rejected by Node (backtick, quotes,
+    angle brackets, brackets, braces, pipe, semicolon, backslash, slash)."""
+    if type(value) is not str or not value.strip():
+        return False
+    # Union: reject if EITHER Python isspace() OR ECMAScript \s
+    if any(c.isspace() or c in _ECMASCRIPT_EXTRA_WHITESPACE for c in value):
+        return False
+    try:
+        if len(value.encode("utf-8")) > 256:
+            return False
+    except Exception:
+        return False
+    if any(c in _UNSAFE_QUESTION_ID_CHARS for c in value):
+        return False
+    return all(ord(c) >= 32 and c != "\x7f" for c in value)
+
+
+def _escape_markdown_inline(text: str) -> str:
+    """Escape Markdown inline special characters to prevent injection."""
+    if not isinstance(text, str):
+        return str(text)
+    # Escape common Markdown inline chars: * _ ` [ ] ( ) # + - . !
+    # and Zulip-specific: @ ** ~~
+    escape_chars = ['\\', '*', '_', '`', '[', ']', '(', ')', '#', '+', '-', '.', '!', '@']
+    result = text
+    for char in escape_chars:
+        result = result.replace(char, '\\' + char)
+    return result
+
+
+def _render_bridge_result(result: object, reply_marker: object = None) -> str:
     if type(result) is not dict:
         return "Codex bridge protocol error."
     if result.get("accepted") is True and set(result).issubset(
@@ -585,7 +981,7 @@ def _render_bridge_result(result: object) -> str:
         if objective_id is None:
             return "Codex 请求已提交。"
         if type(objective_id) is str and objective_id:
-            return f"Codex 请求已提交。任务：{objective_id}。"
+            return f"Codex 请求已提交。任务：{_escape_markdown_inline(objective_id)}。"
         return "Codex bridge protocol error."
     if result.get("schemaVersion") != 1:
         return "Codex bridge protocol error."
@@ -610,13 +1006,13 @@ def _render_bridge_result(result: object) -> str:
         if not all(type(value) is str and value for value in (project_id, objective_id)):
             return "Codex bridge protocol error."
         if status == "accepted":
-            return f"Codex 请求已提交。项目：{project_id}。任务：{objective_id}。"
+            return f"Codex 请求已提交。项目：{_escape_markdown_inline(project_id)}。任务：{_escape_markdown_inline(objective_id)}。"
         if status == "backend_unavailable":
             return (
-                f"已识别项目 {project_id}，但 Codex 后端暂时不可用；"
-                f"本次任务未执行。任务记录：{objective_id}。"
+                f"已识别项目 {_escape_markdown_inline(project_id)}，但 Codex 后端暂时不可用；"
+                f"本次任务未执行。任务记录：{_escape_markdown_inline(objective_id)}。"
             )
-        return f"Codex 请求状态：{status}。项目：{project_id}。任务：{objective_id}。"
+        return f"Codex 请求状态：{status}。项目：{_escape_markdown_inline(project_id)}。任务：{_escape_markdown_inline(objective_id)}。"
     if action == "route.show" and status == "ok":
         route = result.get("route")
         if type(route) is not dict or type(route.get("owner")) is not str:
@@ -626,7 +1022,18 @@ def _render_bridge_result(result: object) -> str:
             cwd = route.get("cwd")
             if not all(type(value) is str and value for value in (project_id, cwd)):
                 return "Codex bridge protocol error."
-            return f"当前项目：{project_id}。工作目录：{cwd}。"
+            visible = (
+                f"当前项目：{_escape_markdown_inline(project_id)}。工作目录：{_escape_markdown_inline(cwd)}。"
+                "项目进度：本次仅核验项目路由，未执行项目工作区进度扫描。"
+            )
+            if reply_marker is not None:
+                if (
+                    type(reply_marker) is not str
+                    or ROUTE_MARKER_PATTERN.fullmatch(reply_marker) is None
+                ):
+                    return "Codex bridge protocol error."
+                visible += f"回显：{_escape_markdown_inline(reply_marker)}。"
+            return visible
         if route["owner"] == "HERMES":
             return "当前频道由 Hermes 管理，没有关联 Codex 项目。"
         return "Codex bridge protocol error."
@@ -638,7 +1045,7 @@ def _render_bridge_result(result: object) -> str:
             project_id = route.get("projectId")
             if type(project_id) is not str or not project_id:
                 return "Codex bridge protocol error."
-            return f"频道路由已更新。当前项目：{project_id}。"
+            return f"频道路由已更新。当前项目：{_escape_markdown_inline(project_id)}。"
         if route["owner"] == "HERMES":
             return "频道路由已更新。当前由 Hermes 管理。"
         return "Codex bridge protocol error."
@@ -655,11 +1062,11 @@ def _render_bridge_result(result: object) -> str:
         ):
             return "Codex bridge protocol error."
         objective = (
-            f"任务：{objective_id}。"
+            f"任务：{_escape_markdown_inline(objective_id)}。"
             if objective_id is not None
             else "当前没有绑定任务。"
         )
-        return f"当前话题模式：{mode}。项目：{project_id}。{objective}"
+        return f"当前话题模式：{mode}。项目：{_escape_markdown_inline(project_id)}。{objective}"
     if action == "topic.set" and status == "ok":
         mode = result.get("mode")
         if type(mode) is not str or not mode:
@@ -693,10 +1100,39 @@ def _render_bridge_result(result: object) -> str:
             "terminal_error",
         }:
             return _unsupported_bridge_result()
-        thread = thread_id if thread_id is not None else "尚未建立"
+        thread = _escape_markdown_inline(thread_id) if thread_id is not None else "尚未建立"
         return (
-            f"任务：{objective_id}。项目：{project_id}。状态：{execution_status}。"
+            f"任务：{_escape_markdown_inline(objective_id)}。项目：{_escape_markdown_inline(project_id)}。状态：{execution_status}。"
             f"后端：{backend}。会话：{thread}。"
+        )
+    if action == "objective.thread.bind":
+        if status not in {
+            "ready",
+            "started",
+            "submitting",
+            "running",
+            "submission_unknown",
+            "reconciliation_needed",
+        }:
+            return _unsupported_bridge_result()
+        project_id = result.get("projectId")
+        objective_id = result.get("objectiveId")
+        thread_id = result.get("threadId")
+        turn_id = result.get("turnId")
+        duplicate = result.get("duplicate")
+        if (
+            not all(
+                type(value) is str and value
+                for value in (project_id, objective_id, thread_id)
+            )
+            or (turn_id is not None and (type(turn_id) is not str or not turn_id))
+            or type(duplicate) is not bool
+        ):
+            return "Codex bridge protocol error."
+        turn = f"轮次：{_escape_markdown_inline(turn_id)}。" if turn_id is not None else ""
+        return (
+            f"Codex 会话绑定完成。项目：{_escape_markdown_inline(project_id)}。任务：{_escape_markdown_inline(objective_id)}。"
+            f"会话：{_escape_markdown_inline(thread_id)}。状态：{status}。{turn}"
         )
     if action == "objective.cancel":
         if status not in {"cancelled", "reconciliation_needed", "backend_unavailable"}:
@@ -709,12 +1145,36 @@ def _render_bridge_result(result: object) -> str:
             or (turn_id is not None and (type(turn_id) is not str or not turn_id))
         ):
             return "Codex bridge protocol error."
-        turn = f"轮次：{turn_id}。" if turn_id is not None else ""
+        turn = f"轮次：{_escape_markdown_inline(turn_id)}。" if turn_id is not None else ""
         return (
-            f"任务取消状态：{status}。项目：{project_id}。"
-            f"任务：{objective_id}。{turn}"
+            f"任务取消状态：{status}。项目：{_escape_markdown_inline(project_id)}。"
+            f"任务：{_escape_markdown_inline(objective_id)}。{turn}"
         )
     if action == "interaction.answer":
+        if status == "partial":
+            project_id = result.get("projectId")
+            interaction_id = result.get("interactionId")
+            missing = result.get("missingQuestionIds")
+            if (
+                type(project_id) is str
+                and project_id
+                and type(interaction_id) is str
+                and interaction_id
+                and type(missing) is list
+                and missing
+            ):
+                valid_missing = [question_id for question_id in missing if _is_safe_question_id(question_id)]
+                if len(valid_missing) != len(missing):
+                    return "Codex bridge protocol error."
+                if not valid_missing:
+                    return "Codex bridge protocol error."
+                missing_list = "、".join(valid_missing)
+                return (
+                    f"已记录部分回答。项目：{_escape_markdown_inline(project_id)}。交互：{_escape_markdown_inline(interaction_id)}。"
+                    f"还需回答：{missing_list}。"
+                    f"继续用 /codex answer {_escape_markdown_inline(interaction_id)} <questionId> <你的回答> 提交。"
+                )
+            return "Codex bridge protocol error."
         if status not in {"answered", "response_uncertain", "response_retryable"}:
             return _unsupported_bridge_result()
         project_id = result.get("projectId")
@@ -726,8 +1186,8 @@ def _render_bridge_result(result: object) -> str:
         ):
             return "Codex bridge protocol error."
         return (
-            f"交互回复状态：{status}。项目：{project_id}。任务：{objective_id}。"
-            f"交互：{interaction_id}。"
+            f"交互回复状态：{status}。项目：{_escape_markdown_inline(project_id)}。任务：{_escape_markdown_inline(objective_id)}。"
+            f"交互：{_escape_markdown_inline(interaction_id)}。"
         )
     return _unsupported_bridge_result()
 
@@ -744,6 +1204,7 @@ def _valid_command(command: object) -> bool:
         "ROUTE": {"type", "action"},
         "OBJECTIVE_NEW": {"type", "instruction"},
         "OBJECTIVE_CONTINUE": {"type", "objectiveId", "instruction"},
+        "THREAD_BIND": {"type", "objectiveId", "threadId"},
         "APPROVE": {"type", "replyToken", "choice"},
         "ANSWER": {"type", "replyToken", "text"},
     }
@@ -763,7 +1224,7 @@ def _valid_command(command: object) -> bool:
         return False
     if command_type == "ROUTE" and command["action"] not in {"SHOW", "SET", "NONE", "UNSET"}:
         return False
-    for field in ("objectiveId", "replyToken", "projectId"):
+    for field in ("objectiveId", "threadId", "replyToken", "projectId"):
         if field in command and not _single_token(command[field]):
             return False
     return True
@@ -786,7 +1247,8 @@ def _verify_context(token: object, key: bytes, used_nonces: dict[str, int]) -> d
     payload = json.loads(raw_payload.decode("utf-8"))
     if type(payload) is not dict or _canonical_json(payload) != raw_payload:
         raise ValueError("invalid context")
-    if set(payload) != {"version", "issuedAt", "expiresAt", "nonce", "binding", "command"}:
+    expected_fields = {"version", "issuedAt", "expiresAt", "nonce", "binding", "command"}
+    if not set(payload).issubset(expected_fields | {"replyMarker"}) or not expected_fields.issubset(payload):
         raise ValueError("invalid context")
     issued_at = payload["issuedAt"]
     expires_at = payload["expiresAt"]
@@ -803,6 +1265,14 @@ def _verify_context(token: object, key: bytes, used_nonces: dict[str, int]) -> d
         or not _valid_command(payload["command"])
     ):
         raise ValueError("invalid context")
+    reply_marker = payload.get("replyMarker")
+    if reply_marker is not None:
+        if (
+            payload["command"] != {"type": "ROUTE", "action": "SHOW"}
+            or type(reply_marker) is not str
+            or ROUTE_MARKER_PATTERN.fullmatch(reply_marker) is None
+        ):
+            raise ValueError("invalid context")
     nonce = payload["nonce"]
     if (
         type(nonce) is not str
@@ -839,7 +1309,7 @@ def _verified_payload(token: object, key: bytes) -> dict:
     return payload
 
 
-def _verify_nlp_capability(
+def _validate_nlp_capability(
     token: object, key: bytes, vault: PendingVault
 ) -> tuple[dict, PendingRequest]:
     payload = _verified_payload(token, key)
@@ -889,7 +1359,7 @@ def _verify_nlp_capability(
         or not 0 < payload["messageBytes"] <= MAX_INSTRUCTION_BYTES
     ):
         raise ValueError("invalid context")
-    entry = vault.consume(nonce, now)
+    entry = vault.get(nonce, now)
     if entry is None:
         raise ValueError("invalid context")
     request_bytes = entry.request.encode("utf-8")
@@ -902,6 +1372,44 @@ def _verify_nlp_capability(
     ):
         raise ValueError("invalid context")
     return payload, entry
+
+
+def _authorize_nlp_semantic(
+    semantic: dict,
+    key: bytes,
+    vault: PendingVault,
+    session_id: str,
+    turn_id: str,
+) -> None:
+    now = _now_seconds()
+    bound = vault.bound_entry(session_id, turn_id, now)
+    if bound is None:
+        raise ValueError("invalid context")
+    nonce, entry = bound
+    payload, validated_entry = _validate_nlp_capability(
+        entry.context_token, key, vault
+    )
+    if validated_entry is not entry or payload["nonce"] != nonce:
+        raise ValueError("invalid context")
+    if not vault.authorize(
+        nonce,
+        session_id,
+        turn_id,
+        _semantic_digest(semantic),
+        now,
+    ):
+        raise ValueError("invalid context")
+
+
+def _consume_nlp_semantic(
+    semantic: dict, vault: PendingVault, session_id: str
+) -> PendingRequest:
+    entry = vault.consume_authorized(
+        session_id, _semantic_digest(semantic), _now_seconds()
+    )
+    if entry is None:
+        raise ValueError("invalid context")
+    return entry
 
 
 def _install_zulip_secret_scope_compatibility() -> None:
@@ -1046,12 +1554,16 @@ def register(ctx) -> None:
     except Exception:
         return
 
+    project_cwd_map = _load_project_cwd_map(os.environ.get("HCO_CONFIG_PATH", ""))
     client = BridgeClient(socket_path, token)
-    llm = ctx.llm
     used_nonces: dict[str, int] = {}
     pending_vault = PendingVault()
+    runtime_session_store = None
+    runtime_session_store_lock = threading.Lock()
 
-    def signed_command_rewrite(command: dict, provenance: Provenance) -> dict:
+    def signed_command_rewrite(
+        command: dict, provenance: Provenance, reply_marker: str | None = None
+    ) -> dict:
         now = _now_seconds()
         payload = {
             "version": 1,
@@ -1061,6 +1573,8 @@ def register(ctx) -> None:
             "binding": _binding(provenance),
             "command": command,
         }
+        if reply_marker is not None:
+            payload["replyMarker"] = reply_marker
         try:
             context_token = _sign_context(payload, key)
         except Exception:
@@ -1068,6 +1582,7 @@ def register(ctx) -> None:
         return {"action": "rewrite", "text": f"{PRIVATE_COMMAND} {context_token}"}
 
     def hook(**kwargs):
+        nonlocal runtime_session_store
         event = kwargs.get("event")
         source = getattr(event, "source", None)
         if source is None:
@@ -1082,19 +1597,24 @@ def register(ctx) -> None:
         snapshot = load_route_snapshot(snapshot_path)
         if snapshot is None:
             return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
-        if (
-            type(getattr(event, "text", None)) is str
-            and event.text.startswith(NLP_PRIVATE_COMMAND)
-        ):
-            source.profile = "codex-bridge"
-            return {"action": "rewrite", "text": f"{NLP_PRIVATE_COMMAND} invalid"}
+        route = find_route(snapshot, provenance.stream_id)
         if type(getattr(event, "text", None)) is str and event.text.startswith("/codex"):
-            source.profile = "codex-bridge"
             command = _parse_command(event.text)
             if command is None:
+                source.profile = "codex-bridge"
                 return {"action": "rewrite", "text": f"{PRIVATE_COMMAND} invalid"}
+            if route is None and command["type"] in {
+                "RUN",
+                "OBJECTIVE_NEW",
+                "OBJECTIVE_CONTINUE",
+                "STATUS",
+                "CANCEL",
+                "TOPIC",
+            }:
+                source.profile = "hermes-general"
+                return {"action": "rewrite", "text": REGISTRATION_COMMAND}
+            source.profile = "codex-bridge"
             return signed_command_rewrite(command, provenance)
-        route = find_route(snapshot, provenance.stream_id)
         if (
             route is not None
             and route.owner == "PROJECT"
@@ -1102,7 +1622,9 @@ def register(ctx) -> None:
         ):
             source.profile = "codex-bridge"
             return signed_command_rewrite(
-                {"type": "ROUTE", "action": "SHOW"}, provenance
+                {"type": "ROUTE", "action": "SHOW"},
+                provenance,
+                _route_query_marker(getattr(event, "text", None)),
             )
         if route is not None and route.owner == "HERMES":
             source.profile = "hermes-general"
@@ -1113,6 +1635,11 @@ def register(ctx) -> None:
             and type(event.text) is str
             and not event.text.startswith("/")
         ):
+            if getattr(source, "message_id", None) is None:
+                try:
+                    source.message_id = str(provenance.message_id)
+                except Exception:
+                    return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
             context = RouteContext(
                 provenance=provenance,
                 project_id=route.project_id,
@@ -1121,7 +1648,34 @@ def register(ctx) -> None:
             source.profile = "codex-bridge"
             request_bytes = event.text.encode("utf-8")
             if not request_bytes or len(request_bytes) > MAX_INSTRUCTION_BYTES:
-                return {"action": "rewrite", "text": f"{NLP_PRIVATE_COMMAND} invalid"}
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            gateway = kwargs.get("gateway")
+            session_store = kwargs.get("session_store")
+            session_key_for_source = getattr(gateway, "_session_key_for_source", None)
+            lookup_by_session_id = getattr(session_store, "lookup_by_session_id", None)
+            if not callable(session_key_for_source) or not callable(lookup_by_session_id):
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            is_user_authorized = getattr(gateway, "_is_user_authorized", None)
+            if callable(is_user_authorized):
+                try:
+                    if not is_user_authorized(source):
+                        return {"action": "allow"}
+                except Exception:
+                    return {"action": "allow"}
+            try:
+                session_key = session_key_for_source(source)
+            except Exception:
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            if type(session_key) is not str or not session_key:
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            with runtime_session_store_lock:
+                if runtime_session_store is None:
+                    runtime_session_store = session_store
+                elif runtime_session_store is not session_store:
+                    return {
+                        "action": "rewrite",
+                        "text": ROUTE_UNAVAILABLE_COMMAND,
+                    }
             now = _now_seconds()
             nonce = secrets.token_urlsafe(24)
             payload = {
@@ -1136,28 +1690,135 @@ def register(ctx) -> None:
                 "messageSha256": hashlib.sha256(request_bytes).hexdigest(),
                 "messageBytes": len(request_bytes),
             }
-            entry = PendingRequest(context, event.text, len(request_bytes), payload["expiresAt"])
             try:
                 context_token = _sign_context(payload, key)
             except Exception:
-                return {"action": "rewrite", "text": f"{NLP_PRIVATE_COMMAND} invalid"}
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            entry = PendingRequest(
+                context,
+                event.text,
+                len(request_bytes),
+                payload["expiresAt"],
+                session_key,
+                context_token,
+            )
             if not pending_vault.add(nonce, entry, now):
-                return {"action": "rewrite", "text": f"{NLP_PRIVATE_COMMAND} invalid"}
-            return {
-                "action": "rewrite",
-                "text": f"{NLP_PRIVATE_COMMAND} {context_token}",
-            }
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            try:
+                _configured_cwd, _canonical_cwd = project_cwd_map.get(
+                    context.project_id, (None, None)
+                )
+                _cwd = _configured_cwd or _canonical_cwd
+                _cwd_hint = f"Working directory: {_cwd}. " if _cwd else ""
+                _no_other = (
+                    f"Do NOT reference any other project name or path in the instruction. "
+                ) if project_cwd_map else ""
+                event.channel_prompt = (
+                    f"Hermes Codex bridge context. "
+                    f"Current project: {context.project_id}. {_cwd_hint}"
+                    f"When generating hco_dispatch instruction, you MUST reference this project "
+                    f"({context.project_id}) and its working directory. {_no_other}\n"
+                    "For executable project work, call hco_dispatch exactly once with the "
+                    "strict semantic object. For ordinary conversation, answer normally without "
+                    "calling hco_dispatch."
+                )
+            except Exception:
+                pending_vault.consume(nonce, now)
+                return {"action": "rewrite", "text": ROUTE_UNAVAILABLE_COMMAND}
+            return {"action": "allow"}
         elif route is not None and route.owner == "PROJECT":
             source.profile = "codex-bridge"
         elif route is None and snapshot.default_owner == "HERMES":
             source.profile = "hermes-general"
+            try:
+                event.channel_prompt = UNMAPPED_STREAM_PROMPT
+            except Exception:
+                pass
         return {"action": "allow"}
+
+    def pre_llm_call(**kwargs):
+        try:
+            from gateway.session_context import get_session_env
+
+            source_message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        except Exception:
+            return None
+        session_id = kwargs.get("session_id")
+        turn_id = kwargs.get("turn_id")
+        user_message = kwargs.get("user_message")
+        with runtime_session_store_lock:
+            session_store = runtime_session_store
+        lookup_by_session_id = getattr(session_store, "lookup_by_session_id", None)
+        if not callable(lookup_by_session_id):
+            return None
+        try:
+            session_entry = lookup_by_session_id(session_id)
+        except Exception:
+            return None
+        session_key = getattr(session_entry, "session_key", None)
+        pending_vault.bind_turn(
+            session_key,
+            session_id,
+            turn_id,
+            user_message,
+            source_message_id,
+            _now_seconds(),
+        )
+        return None
+
+    def pre_tool_call(**kwargs):
+        if kwargs.get("tool_name") != "hco_dispatch":
+            return None
+        args = kwargs.get("args")
+        session_id = kwargs.get("session_id")
+        turn_id = kwargs.get("turn_id")
+        if type(args) is not dict or set(args) != {"semantic"}:
+            return {
+                "action": "block",
+                "message": "Codex bridge request rejected.",
+            }
+        try:
+            semantic = args["semantic"]
+            if not _valid_semantic(semantic):
+                return {
+                    "action": "block",
+                    "message": "Hermes model protocol error.",
+                }
+        except Exception:
+            return {
+                "action": "block",
+                "message": "Hermes model protocol error.",
+            }
+        try:
+            _authorize_nlp_semantic(
+                semantic,
+                key,
+                pending_vault,
+                session_id,
+                turn_id,
+            )
+        except Exception:
+            return {
+                "action": "block",
+                "message": "Codex bridge request rejected.",
+            }
+        return None
+
+    def post_llm_call(**kwargs):
+        pending_vault.revoke_turn(
+            kwargs.get("session_id"),
+            kwargs.get("turn_id"),
+            _now_seconds(),
+        )
 
     async def public_command_handler(_raw_args: str):
         return "Invalid /codex command."
 
     async def route_unavailable_handler(_raw_args: str):
         return ROUTE_UNAVAILABLE_TEXT
+
+    async def registration_handler(_raw_args: str):
+        return REGISTRATION_TEXT
 
     async def private_command_handler(raw_args: str):
         if raw_args == "invalid":
@@ -1177,41 +1838,33 @@ def register(ctx) -> None:
             result = await client.submit(event)
         except BridgeUnavailableError:
             return "Codex bridge unavailable."
+        except BridgeUncertainError:
+            return (
+                "Codex bridge response unavailable. The request may have been written. "
+                "Check App Server UI before retrying."
+            )
+        except BridgeUserError as exc:
+            return str(exc)
         except BridgeProtocolError:
             return "Codex bridge protocol error."
-        return _render_bridge_result(result)
+        return _render_bridge_result(result, payload.get("replyMarker"))
 
-    async def natural_command_handler(raw_args: str):
-        try:
-            _payload, entry = _verify_nlp_capability(raw_args, key, pending_vault)
-        except Exception:
+    async def hco_dispatch_handler(args, **_kwargs):
+        if type(args) is not dict or set(args) != {"semantic"}:
             return "Codex bridge request rejected."
+        semantic = args["semantic"]
+        if not _valid_semantic(semantic):
+            return "Hermes model protocol error."
         try:
-            completion = await llm.acomplete_structured(
-                instructions=NLP_INSTRUCTIONS,
-                input=[{"type": "text", "text": entry.request}],
-                json_schema=SEMANTIC_SCHEMA,
-                json_mode=True,
-                schema_name="hco_semantic_result",
-                temperature=0,
-                max_tokens=2_048,
-                timeout=30,
-                purpose=NLP_CAPABILITY_PURPOSE,
+            entry = _consume_nlp_semantic(
+                semantic, pending_vault, _kwargs.get("session_id")
             )
         except Exception:
-            return "Hermes model unavailable."
-        semantic = getattr(completion, "parsed", None)
-        try:
-            valid_semantic = _valid_semantic(semantic)
-        except Exception:
-            return "Hermes model protocol error."
-        if not valid_semantic:
-            return "Hermes model protocol error."
+            return "Codex bridge request rejected."
         context = entry.context
         if (
             context.topic_mode == "HERMES_ONLY"
             and semantic["type"] == "DISPATCH"
-            and semantic["topicModeAction"] != "AUTO"
         ):
             return "Codex bridge request rejected."
         if semantic["type"] == "CLARIFY":
@@ -1219,22 +1872,64 @@ def register(ctx) -> None:
             return f'{semantic["question"]}{choices}'
         if semantic["type"] in {"BUSINESS_REPLY", "REJECT"}:
             return semantic["text"]
+        wire_semantic = copy.deepcopy(semantic)
+        if wire_semantic["type"] == "DISPATCH":
+            wire_semantic["topicModeAction"] = None
+            conflict = _semantic_references_foreign_project(
+                wire_semantic, context.project_id, project_cwd_map
+            )
+            if conflict is not None:
+                foreign, field = conflict
+                return (
+                    f"⚠️ 指令上下文冲突：任务路由到 **{context.project_id}**，"
+                    f"但 {field} 引用了 **{foreign}**。已拒绝执行。\n"
+                    "请重新在正确的项目频道发起请求，或联系 Jarvis PM。"
+                )
         event = {
             "schemaVersion": 1,
             "kind": "SEMANTIC",
-            "contextToken": raw_args,
+            "contextToken": entry.context_token,
             "binding": _binding(context.provenance),
-            "semantic": semantic,
+            "semantic": wire_semantic,
         }
         try:
             result = await client.submit(event)
         except BridgeUnavailableError:
-            return "Codex bridge unavailable."
+            _obj_hint = ""
+            _obj = wire_semantic.get("objective")
+            if (
+                isinstance(_obj, dict)
+                and _obj.get("mode") == "CONTINUE"
+                and isinstance(_obj.get("objectiveId"), str)
+            ):
+                _obj_hint = f" 任务：{_obj['objectiveId']}。"
+            return (
+                f"Codex bridge 响应异常，任务可能已提交但响应丢失。{_obj_hint}"
+                "请稍后用 `/codex status` 查询状态，如任务未出现请重新发起。"
+            )
+        except BridgeUncertainError:
+            _obj_hint = ""
+            _obj = wire_semantic.get("objective")
+            if (
+                isinstance(_obj, dict)
+                and _obj.get("mode") == "CONTINUE"
+                and isinstance(_obj.get("objectiveId"), str)
+            ):
+                _obj_hint = f" 任务：{_obj['objectiveId']}。"
+            return (
+                f"Codex bridge 响应超时，任务可能已提交但响应丢失。{_obj_hint}"
+                "请稍后用 `/codex status` 查询状态，如任务未出现请重新发起。"
+            )
+        except BridgeUserError as exc:
+            return str(exc)
         except BridgeProtocolError:
             return "Codex bridge protocol error."
         return _render_bridge_result(result)
 
     ctx.register_hook("pre_gateway_dispatch", hook)
+    ctx.register_hook("pre_llm_call", pre_llm_call)
+    ctx.register_hook("pre_tool_call", pre_tool_call)
+    ctx.register_hook("post_llm_call", post_llm_call)
     ctx.register_command("codex", public_command_handler, description="Codex bridge")
     ctx.register_command(
         "hermes-codex-bridge-internal",
@@ -1242,9 +1937,30 @@ def register(ctx) -> None:
         description="Internal Codex bridge dispatch",
     )
     ctx.register_command(
-        "hermes-codex-bridge-natural",
-        natural_command_handler,
-        description="Internal natural-language Codex dispatch",
+        "hermes-codex-bridge-registration",
+        registration_handler,
+        description="Codex project registration guidance",
+    )
+    ctx.register_tool(
+        name="hco_dispatch",
+        toolset="hco_bridge",
+        schema={
+            "name": "hco_dispatch",
+            "description": (
+                "Dispatch executable project work through the trusted Hermes Codex bridge."
+            ),
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["semantic"],
+                "properties": {
+                    "semantic": SEMANTIC_SCHEMA,
+                },
+            },
+        },
+        handler=hco_dispatch_handler,
+        is_async=True,
+        return_direct=True,
     )
     ctx.register_command(
         "hermes-codex-bridge-route-unavailable",

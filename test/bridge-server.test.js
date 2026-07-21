@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { createBearerAuthenticatorFromToken } from "../hco/bridge/auth.js";
 import { createBridge } from "../hco/bridge/server.js";
+import { stateError } from "../hco/state/reducer.js";
 import { openStore } from "../hco/state/store.js";
 
 const TOKEN = "bridge-test-token";
@@ -45,7 +46,8 @@ async function startTcp(t, store, options = {}) {
     store,
     tokenPath: paths.tokenPath,
     hcoVersion: "0.1.0-test",
-    ...(options.healthProvider ? { healthProvider: options.healthProvider } : {})
+    ...(options.healthProvider ? { healthProvider: options.healthProvider } : {}),
+    ...(options.eventHandler ? { eventHandler: options.eventHandler } : {})
   });
   const running = await bridge.start({ host: options.host ?? "127.0.0.1", port: 0 });
   t.after(() => running.close());
@@ -88,6 +90,53 @@ test("health provider failures return a stable error without leaking details", a
     error: { code: "BRIDGE_INTERNAL", message: "Bridge request failed." }
   });
   assert.equal(JSON.stringify(result).includes("private-health-secret"), false);
+});
+
+test("plain ACL_FORBIDDEN errors are not trusted or exposed", async (t) => {
+  const { store } = countingStore();
+  const { url } = await startTcp(t, store, {
+    eventHandler() {
+      const error = new Error("private-acl-secret");
+      error.code = "ACL_FORBIDDEN";
+      throw error;
+    }
+  });
+
+  const result = await jsonRequest(url, "/v1/events", {
+    body: { ...META, event: {} }
+  });
+  assert.equal(result.status, 500);
+  assert.deepEqual(result.body, {
+    error: { code: "BRIDGE_INTERNAL", message: "Bridge request failed." }
+  });
+  assert.equal(JSON.stringify(result).includes("private-acl-secret"), false);
+});
+
+test("trusted objective project mismatch is user-visible while plain errors remain internal", async (t) => {
+  const { store } = countingStore();
+  const { url } = await startTcp(t, store, {
+    eventHandler() {
+      throw stateError("OBJECTIVE_PROJECT_MISMATCH", "Objective belongs to another project.");
+    }
+  });
+
+  const result = await jsonRequest(url, "/v1/events", { body: { ...META, event: {} } });
+  assert.equal(result.status, 409);
+  assert.deepEqual(result.body, {
+    error: { code: "OBJECTIVE_PROJECT_MISMATCH", message: "Objective belongs to another project." }
+  });
+
+  const { url: untrustedUrl } = await startTcp(t, store, {
+    eventHandler() {
+      const error = new Error("private-project-secret");
+      error.code = "OBJECTIVE_PROJECT_MISMATCH";
+      throw error;
+    }
+  });
+  const untrusted = await jsonRequest(untrustedUrl, "/v1/events", { body: { ...META, event: {} } });
+  assert.equal(untrusted.status, 500);
+  assert.equal(untrusted.body.error.code, "BRIDGE_INTERNAL");
+  assert.equal(JSON.stringify(untrusted).includes("private-project-secret"), false);
 });
 
 async function jsonRequest(url, route, { body, headers = {}, method = "POST" } = {}) {

@@ -166,6 +166,10 @@ hco_path = root / "deploy/com.hermes.codex-bridge-hco.plist.example"
 delivery_path = root / "deploy/com.hermes.codex-bridge-delivery.plist.example"
 config_path = root / "config/hco.json.example"
 
+assert "with only a `semantic` object" in installer_text
+assert "capability supplied in the current channel context" not in installer_text
+assert '"hermes-codex-bridge-registration",' in installer_text
+assert "bridge dispatch tool schema is not semantic-only" in installer_text
 assert "_without_secondary_profile_platform_env" in installer_text
 assert "_profile_runtime_scope" in installer_text
 assert "zulip_module.check_zulip_requirements(platform_config)" in installer_text
@@ -252,7 +256,9 @@ MUTATE_HCO_CONFIG="$MUTATE_ROOT/source-hco.json"
 MUTATE_ZULIP_CONFIG="$MUTATE_ROOT/source-zuliprc"
 MUTATE_SECRET="task9-mutating-secret-must-never-appear"
 FAKE_CODEX="$MUTATE_ROOT/fake-codex"
-mkdir -p "$MUTATE_ROOT" "$HERMES_HOME"
+mkdir -p "$MUTATE_ROOT" "$HERMES_HOME" "$LAUNCH_AGENTS"
+LAUNCH_AGENTS_NORMALIZED="$("$PYTHON" -c 'import pathlib, sys; print(pathlib.Path(sys.argv[1]))' "$LAUNCH_AGENTS")"
+printf '%s\n' '<?xml version="1.0"?><plist version="1.0"><dict><key>Label</key><string>ai.hermes.gateway</string></dict></plist>' > "$LAUNCH_AGENTS/ai.hermes.gateway.plist"
 mkdir -p "$HERMES_HOME/plugins/unrelated-fixture" "$HERMES_HOME/profiles/codex-bridge" "$HERMES_HOME/profiles/hermes-general" "$HERMES_HOME/profiles/ask-jarvis-pm"
 printf '%s\n' \
   'name: unrelated-fixture' \
@@ -312,8 +318,32 @@ printf '%s\n' \
   '  enabled: true' \
   '  ledger: /Users/hula/.hermes/task_guard/tasks.json' \
   'model:' \
-  '  provider: openai' \
+  '  provider: iotwq' \
   '  name: ask-model' \
+  'custom_providers:' \
+  '  - name: iotwq' \
+  '    base_url: https://selected-provider.example.invalid/v1' \
+  '    api_key: inline-selected-key-must-not-copy' \
+  '    key_env: HERMES_API_KEY_SELECTED' \
+  '    api_mode: chat_completions' \
+  '    model: ask-model' \
+  '  - name: unrelated-provider' \
+  '    base_url: https://unrelated-provider.example.invalid/v1' \
+  '    api_key: inline-unrelated-key-must-not-copy' \
+  '    key_env: HERMES_API_KEY_UNRELATED' \
+  '    model: unrelated-model' \
+  'providers:' \
+  '  iotwq:' \
+  '    name: keyed-iotwq' \
+  '    api: https://keyed-provider.example.invalid/v1' \
+  '    api_key: inline-keyed-key-must-not-copy' \
+  '    key_env: HERMES_API_KEY_KEYED' \
+  '    default_model: ask-model' \
+  '    request_timeout_seconds: 41' \
+  '    stale_timeout_seconds: 42' \
+  '  unrelated-provider:' \
+  '    request_timeout_seconds: 91' \
+  '    stale_timeout_seconds: 92' \
   'context:' \
   '  engine: lcm' > "$HERMES_HOME/config.yaml"
 printf '%s\n' \
@@ -324,13 +354,23 @@ printf '%s\n' \
   'mcp_servers:' \
   '  qmd: {enabled: true}' \
   '  stockdata: {enabled: true}' \
+  'cwd: /Users/hula/workspace/ASK' \
+  'system_prompt: stale ASK bridge prompt' \
+  'memory: {enabled: true, namespace: ask-project-memory}' \
   'context:' \
   '  engine: lcm' > "$HERMES_HOME/profiles/codex-bridge/config.yaml"
+printf '%s\n' 'legacy bridge identity fixture' > "$HERMES_HOME/profiles/codex-bridge/SOUL.md"
+printf '%s\n' 'BRIDGE_OPERATOR_SETTING=must-be-replaced' > "$HERMES_HOME/profiles/codex-bridge/.env"
 printf '%s\n' \
   'platform_toolsets:' \
   '  zulip: [hermes-zulip, hco_bridge, no_mcp]' \
   'known_plugin_toolsets:' \
   '  zulip: [hco_bridge, operator-known]' \
+  'model: {provider: stale-provider, name: stale-model}' \
+  'custom_providers:' \
+  '  - name: stale-provider' \
+  '    base_url: https://stale-provider.example.invalid/v1' \
+  '    key_env: STALE_PROVIDER_KEY' \
   'mcp_servers:' \
   '  qmd: {enabled: true}' \
   '  stockdata: {enabled: true}' > "$HERMES_HOME/profiles/hermes-general/config.yaml"
@@ -357,6 +397,9 @@ printf '%064d' 0 > "$CONTEXT_KEY_PATH"
 printf '%s\n' \
   'UNRELATED_SETTING=preserved' \
   'OPENAI_API_KEY=root-model-credential' \
+  'HERMES_API_KEY_SELECTED=selected-model-credential' \
+  'HERMES_API_KEY_KEYED=keyed-model-credential' \
+  'HERMES_API_KEY_UNRELATED=unrelated-model-credential' \
   'FEISHU_APP_ID=root-feishu-id' \
   'FEISHU_APP_SECRET=root-feishu-secret' \
   'ZULIP_BOT_EMAIL=root-zulip@example.invalid' \
@@ -395,6 +438,7 @@ printf '%s\n' \
   'site=https://zulip.example.invalid' > "$MUTATE_ZULIP_CONFIG"
 chmod 600 "$BEARER_PATH" "$CONTEXT_KEY_PATH" "$MUTATE_HCO_CONFIG" "$MUTATE_ZULIP_CONFIG" \
   "$HERMES_HOME/.env" "$HERMES_HOME/profiles/zulip-ingress/.env" \
+  "$HERMES_HOME/profiles/codex-bridge/.env" \
   "$HERMES_HOME/profiles/ask-jarvis-pm/config.yaml" "$HERMES_HOME/profiles/ask-jarvis-pm/.env"
 
 "$PYTHON" - "$SOCKET_PATH" <<'PY' &
@@ -604,8 +648,8 @@ printf '%s\n' \
   'target="${2:-}"' \
   'label="${target##*/}"' \
   'case "$command_name" in' \
-  '  print) if [[ "$label" == "ai.hermes.gateway" ]]; then if [[ "$target" == "$(< "$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.domain")/ai.hermes.gateway" ]]; then state_path="$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway"; pid_path="$state_path.pid"; elif [[ "$target" == "gui/$(id -u)/ai.hermes.gateway" && -f "$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.gui" ]]; then state_path="$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.gui"; pid_path="$state_path.pid"; else exit 1; fi; printf "domain = %s\nstate = %s\npid = %s\n" "${target%/*}" "$(< "$state_path")" "$(< "$pid_path")"; elif [[ -f "$HCO_TEST_LAUNCHCTL_STATE/$label" ]]; then printf "domain = %s\nstate = %s\n" "${target%/*}" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label")"; [[ ! -f "$HCO_TEST_LAUNCHCTL_STATE/$label.pid" ]] || printf "pid = %s\n" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label.pid")"; else exit 1; fi ;;' \
-  '  bootstrap) plist="${3:?}"; label="$(basename "$plist" .plist)"; mkdir -p "$HCO_TEST_LAUNCHCTL_STATE"; [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label" ;;' \
+  '  print) if [[ "$label" == "ai.hermes.gateway" ]]; then if [[ "$target" == "$(< "$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.domain")/ai.hermes.gateway" ]]; then state_path="$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway"; pid_path="$state_path.pid"; elif [[ "$target" == "gui/$(id -u)/ai.hermes.gateway" && -f "$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.gui" ]]; then state_path="$HCO_TEST_LAUNCHCTL_STATE/ai.hermes.gateway.gui"; pid_path="$state_path.pid"; else exit 1; fi; [[ -f "$state_path" ]] || exit 1; printf "domain = %s\nstate = %s\npid = %s\n" "${target%/*}" "$(< "$state_path")" "$(< "$pid_path")"; elif [[ -f "$HCO_TEST_LAUNCHCTL_STATE/$label" ]]; then printf "domain = %s\nstate = %s\n" "${target%/*}" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label")"; [[ ! -f "$HCO_TEST_LAUNCHCTL_STATE/$label.pid" ]] || printf "pid = %s\n" "$(< "$HCO_TEST_LAUNCHCTL_STATE/$label.pid")"; else exit 1; fi ;;' \
+  '  bootstrap) plist="${3:?}"; label="$(basename "$plist" .plist)"; mkdir -p "$HCO_TEST_LAUNCHCTL_STATE"; if [[ "$label" == "ai.hermes.gateway" ]]; then restart_gateway ""; else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  bootout) label="${target##*/}"; if [[ "$label" == "com.hermes.codex-bridge-hco" && "${HCO_TEST_DETACHED_BOOTOUT:-}" == "1" ]]; then pid_path="$HCO_TEST_LAUNCHCTL_STATE/$label.pid"; [[ ! -f "$pid_path" ]] || kill "$(< "$pid_path")" 2>/dev/null || true; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label" "$pid_path"; elif [[ "$label" == "com.hermes.codex-bridge-hco" && "${HCO_TEST_ASYNC_BOOTOUT:-}" == "1" ]]; then stop_hco; printf stopping > "$HCO_TEST_LAUNCHCTL_STATE/$label"; (sleep 0.2; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label") </dev/null >/dev/null 2>&1 & else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; rm -f "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  kickstart) mode=""; if [[ "$target" == "-k" ]]; then mode="-k"; target="${3:?}"; fi; label="${target##*/}"; if [[ "$label" == "ai.hermes.gateway" ]]; then restart_gateway "$mode"; else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || start_hco; printf running > "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
   '  kill) target="${3:?}"; label="${target##*/}"; if [[ "$label" == "ai.hermes.gateway" ]]; then restart_gateway ""; else [[ "$label" != "com.hermes.codex-bridge-hco" ]] || stop_hco; printf stopped > "$HCO_TEST_LAUNCHCTL_STATE/$label"; fi ;;' \
@@ -655,7 +699,8 @@ set -e
 [[ ! -e "$TURN_START_MARKER" ]] || fail "App Server compatibility canary must not consume a model turn"
 assert_contains "$MUTATE_OUTPUT" "bridge protocol compatibility: passed" "bridge gate is distinct"
 assert_contains "$MUTATE_OUTPUT" "installed Hermes compatibility: passed" "Hermes gate is distinct"
-assert_contains "$MUTATE_OUTPUT" "staged valid PROJECT route rewrite fixture: passed" "effective Hermes probe covers a valid routed PROJECT rewrite"
+assert_contains "$MUTATE_OUTPUT" "staged valid PROJECT route allow fixture: passed" "effective Hermes probe covers normal-agent PROJECT routing"
+assert_contains "$MUTATE_OUTPUT" "staged bridge inference provider: passed" "staged probe resolves the bridge inference provider"
 assert_contains "$MUTATE_OUTPUT" "installed Codex App Server compatibility: passed" "App Server gate is distinct"
 assert_not_contains "$MUTATE_OUTPUT" "$MUTATE_SECRET" "mutating output masks secrets"
 assert_contains "$(< "$LAUNCHCTL_LOG")" "kickstart -k user/$(id -u)/ai.hermes.gateway" "activation restarts the discovered user-domain Hermes Gateway"
@@ -708,13 +753,15 @@ assert_not_contains "$(< "$HERMES_HOME/.env")" "ZULIP_CONTEXT_DEPTH=" "root dote
 [[ -f "$HERMES_HOME/profiles/zulip-ingress/config.yaml" ]] || fail "zulip-ingress config is installed"
 [[ -f "$HERMES_HOME/profiles/zulip-ingress/.env" ]] || fail "zulip-ingress credentials are installed"
 [[ -f "$HERMES_HOME/profiles/zulip-ingress/SOUL.md" ]] || fail "zulip-ingress project-neutral reminder is installed"
+[[ -f "$HERMES_HOME/profiles/codex-bridge/SOUL.md" ]] || fail "codex-bridge Jarvis PM soul is installed"
+[[ -f "$HERMES_HOME/profiles/codex-bridge/.env" ]] || fail "codex-bridge inference credential is installed"
 [[ ! -e "$HERMES_HOME/ai.hermes.gateway.plist" ]] || fail "generated Hermes gateway plist is untouched"
 
 PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$HERMES_HOME" "$LAUNCH_AGENTS" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" "$PYTHON" "$(command -v node)" <<'PY'
-import inspect
 import json
 import os
 import plistlib
+import stat
 import sys
 from pathlib import Path
 
@@ -733,9 +780,11 @@ import hermes_cli.plugins as plugin_module
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.run import (
     _profile_runtime_scope,
+    _resolve_runtime_agent_kwargs,
     _without_secondary_profile_platform_env,
 )
 import gateway.platforms.zulip as zulip_module
+from tools.registry import registry
 
 launch_agents = Path(sys.argv[2])
 hco_config_text = sys.argv[3]
@@ -765,7 +814,7 @@ assert root["task_guard"] == {
     "enabled": True,
     "ledger": "/Users/hula/.hermes/task_guard/tasks.json",
 }
-assert root["model"] == {"provider": "openai", "name": "ask-model"}
+assert root["model"] == {"provider": "iotwq", "name": "ask-model"}
 assert root["mcp_servers"]["qmd"]["enabled"] is True
 assert root["mcp_servers"]["stockdata"]["enabled"] is True
 assert ingress["platforms"]["zulip"]["enabled"] is True
@@ -808,29 +857,51 @@ assert ingress.get("plugins") is None
 assert ingress.get("mcp_servers", {}) == {}
 assert ingress.get("context", {}).get("engine") in (None, "none", "disabled")
 assert "zulip-history" in ingress["agent"]["disabled_toolsets"]
-assert bridge["platform_toolsets"]["zulip"] == ["zulip-history"]
+assert bridge["platform_toolsets"]["zulip"] == ["zulip-history", "hco_bridge"]
 assert bridge.get("cwd") is None
+assert bridge.get("system_prompt") is None
 assert bridge.get("memory") is None
 assert bridge.get("task_guard") is None
-assert bridge["mcp_servers"]["qmd"]["enabled"] is False
-assert bridge["mcp_servers"]["stockdata"]["enabled"] is False
+assert bridge["model"] == root["model"]
+assert bridge["providers"] == {"iotwq": {
+    key: value
+    for key, value in root["providers"]["iotwq"].items()
+    if key != "api_key"
+}}
+assert bridge.get("custom_providers") is None
+assert "api_key" not in bridge["providers"]["iotwq"]
+assert "unrelated-provider" not in str(bridge)
+assert bridge["mcp_servers"] == {}
 assert validate_platform_toolsets(ingress["platform_toolsets"], validate_toolset) == []
-assert validate_platform_toolsets(bridge["platform_toolsets"], validate_toolset) == []
 assert "zulip-history" in bridge["agent"]["disabled_toolsets"]
 assert "hco_bridge" in root.get("known_plugin_toolsets", {}).get("zulip", [])
-assert "hco_bridge" not in ingress.get("known_plugin_toolsets", {}).get("zulip", [])
-assert "hco_bridge" not in bridge.get("known_plugin_toolsets", {}).get("zulip", [])
+assert "hco_bridge" in ingress.get("known_plugin_toolsets", {}).get("zulip", [])
+assert "hco_bridge" in bridge.get("known_plugin_toolsets", {}).get("zulip", [])
 assert "operator-known" in root["known_plugin_toolsets"]["zulip"]
 assert "unrelated_fixture" in ingress["known_plugin_toolsets"]["zulip"]
 assert "unrelated_fixture" in bridge["known_plugin_toolsets"]["zulip"]
 assert "hco_bridge" not in general["platform_toolsets"]["zulip"]
-assert "hco_bridge" not in general.get("known_plugin_toolsets", {}).get("zulip", [])
+assert "hco_bridge" in general.get("known_plugin_toolsets", {}).get("zulip", [])
 assert "operator-known" in general["known_plugin_toolsets"]["zulip"]
 assert general["platform_toolsets"]["zulip"]
 assert "no_mcp" not in general["platform_toolsets"]["zulip"]
+assert general["model"] == root["model"]
+assert general["providers"] == {"iotwq": {
+    key: value
+    for key, value in root["providers"]["iotwq"].items()
+    if key != "api_key"
+}}
+assert general.get("custom_providers") is None
+assert "api_key" not in general["providers"]["iotwq"]
+assert general.get("cwd") is None
+assert general.get("system_prompt") is None
+assert general.get("memory") is None
+assert general.get("task_guard") is None
 assert validate_platform_toolsets(general["platform_toolsets"], validate_toolset) == []
 assert general["mcp_servers"]["qmd"]["enabled"] is False
 assert general["mcp_servers"]["stockdata"]["enabled"] is False
+general_env = (home / "profiles/hermes-general/.env").read_text()
+assert general_env == "HERMES_API_KEY_KEYED=keyed-model-credential\n"
 assert ask_jarvis == {
     "platforms": {
         "zulip": {
@@ -866,6 +937,13 @@ assert set(ingress_env_lines) == {
     "ZULIP_CATCHUP=true",
 }
 assert all(line.startswith("ZULIP_") for line in ingress_env_lines)
+bridge_env_lines = [
+    line
+    for line in (home / "profiles/codex-bridge/.env").read_text().splitlines()
+    if line and not line.startswith("#")
+]
+assert bridge_env_lines == ["HERMES_API_KEY_KEYED=keyed-model-credential"]
+assert stat.S_IMODE((home / "profiles/codex-bridge/.env").stat().st_mode) == 0o600
 reminder = (home / "profiles/zulip-ingress/SOUL.md").read_text()
 assert "project-neutral" in reminder
 assert "Codex" in reminder
@@ -874,26 +952,50 @@ assert "integrity-checked HCO route snapshot" in reminder
 assert "channel name" in reminder
 assert "topic" in reminder
 assert "/Users/hula/workspace/ASK" not in reminder
+bridge_soul = (home / "profiles/codex-bridge/SOUL.md").read_text()
+assert "Jarvis PM" in bridge_soul
+assert "hco_dispatch" in bridge_soul
+assert "with only a `semantic` object" in bridge_soul
+assert "capability supplied in the current channel context" not in bridge_soul
+assert "evidence" in bridge_soul.lower()
+assert "legacy bridge identity fixture" not in bridge_soul
+for forbidden in (
+    "/Users/hula/workspace/ASK",
+    "ask-project-memory",
+    "projectId",
+    "alpha",
+    "root-model-credential",
+    "root-zulip-api-key",
+):
+    assert forbidden not in bridge_soul
 
 load_hermes_dotenv(hermes_home=home)
 manager = plugin_module.PluginManager()
 plugin_module._plugin_manager = manager
 manager.discover_and_load()
+assert validate_platform_toolsets(bridge["platform_toolsets"], validate_toolset) == []
 assert "unrelated_fixture_tool" in manager._plugin_tool_names
 assert set(manager._plugin_commands) == {
     "codex",
     "hermes-codex-bridge-internal",
-    "hermes-codex-bridge-natural",
+    "hermes-codex-bridge-registration",
     "hermes-codex-bridge-route-unavailable",
 }
 callbacks = manager._hooks.get("pre_gateway_dispatch", [])
 assert callbacks and callbacks[0].__module__.startswith(
     "hermes_plugins.hermes_codex_bridge"
 )
-natural_handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
-plugin_llm = inspect.getclosurevars(natural_handler).nonlocals["llm"]
-assert callable(plugin_llm.acomplete_structured)
-assert manager._plugins["hermes-codex-bridge"].tools_registered == []
+assert manager._plugins["hermes-codex-bridge"].tools_registered == ["hco_dispatch"]
+dispatch_entry = registry.get_entry("hco_dispatch")
+assert dispatch_entry is not None
+assert dispatch_entry.is_async is True
+assert dispatch_entry.return_direct is True
+assert dispatch_entry.schema["parameters"] == {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["semantic"],
+    "properties": {"semantic": dispatch_entry.schema["parameters"]["properties"]["semantic"]},
+}
 
 ingress_home = get_profile_dir("zulip-ingress")
 conflicting_zulip_env = {
@@ -933,7 +1035,11 @@ assert root_effective["mcp_servers"]["qmd"]["enabled"] is True
 os.environ["HERMES_HOME"] = str(get_profile_dir("zulip-ingress"))
 assert _get_platform_tools(load_config(), "zulip") == set()
 os.environ["HERMES_HOME"] = str(get_profile_dir("codex-bridge"))
-assert _get_platform_tools(load_config(), "zulip") == set()
+assert _get_platform_tools(load_config(), "zulip") == {"hco_bridge"}
+with _profile_runtime_scope(get_profile_dir("codex-bridge")):
+    runtime = _resolve_runtime_agent_kwargs()
+assert runtime["provider"] == "custom"
+assert runtime["api_key"] == "keyed-model-credential"
 for label in ("com.hermes.codex-bridge-hco", "com.hermes.codex-bridge-delivery"):
     path = launch_agents / f"{label}.plist"
     with path.open("rb") as stream:
@@ -1004,6 +1110,18 @@ control_launchctl() {
 seed_gateway_runtime_state() {
   local hermes_home="$1"
   mkdir -p "$hermes_home"
+  printf '%s\n' \
+    'model:' \
+    '  provider: iotwq' \
+    '  name: fixture-model' \
+    'custom_providers:' \
+    '  - name: iotwq' \
+    '    base_url: https://selected-provider.example.invalid/v1' \
+    '    key_env: HERMES_API_KEY_SELECTED' \
+    '    model: fixture-model' > "$hermes_home/config.yaml"
+  printf '%s\n' \
+    'HERMES_API_KEY_SELECTED=selected-model-credential' > "$hermes_home/.env"
+  chmod 600 "$hermes_home/config.yaml" "$hermes_home/.env"
   printf '{"pid":%s,"gateway_state":"running","served_profiles":["default"],"platforms":{"feishu":{"state":"connected"}}}\n' \
     "$(< "$LAUNCHCTL_STATE/ai.hermes.gateway.pid")" > "$hermes_home/gateway_state.json"
   chmod 600 "$hermes_home/gateway_state.json"
@@ -1173,7 +1291,7 @@ assert_contains "$ROLLBACK_GATEWAY_OUTPUT" "attestation" "Gateway attestation fa
 [[ "$(< "$LAUNCHCTL_STATE/ai.hermes.gateway")" == "running" ]] || fail "Gateway failure rollback restores running intent"
 [[ "$(< "$LAUNCHCTL_STATE/ai.hermes.gateway.pid")" != "$ROLLBACK_GATEWAY_PID_BEFORE" ]] || fail "Gateway rollback restarts the prior configuration with a fresh PID"
 assert_not_contains "$(< "$LAUNCHCTL_LOG")" "kill SIGTERM user/$(id -u)/ai.hermes.gateway" "Gateway rollback does not wait for a KeepAlive service to stop"
-assert_contains "$(< "$LAUNCHCTL_LOG")" "kickstart -k user/$(id -u)/ai.hermes.gateway" "Gateway rollback atomically restarts the prior configuration"
+assert_contains "$(< "$LAUNCHCTL_LOG")" "bootstrap user/$(id -u) $LAUNCH_AGENTS_NORMALIZED/ai.hermes.gateway.plist" "Gateway rollback reloads the prior configuration from its original plist"
 pass "Gateway activation failure rolls back files and restores running intent"
 
 rm -f "$LAUNCHCTL_STATE/ai.hermes.gateway.attestation-failure-injected"
@@ -1903,6 +2021,7 @@ pass "effective Zulip context depth requires explicit correction authorization"
 
 printf '%s\n' \
   'UNRELATED_SETTING=preserved' \
+  'HERMES_API_KEY_KEYED=keyed-model-credential' \
   'HCO_CONFIG_PATH=/operator/dotenv/path.json' \
   'ZULIP_CONTEXT_DEPTH=7' > "$HERMES_HOME/.env"
 chmod 600 "$HERMES_HOME/.env"
@@ -1928,6 +2047,7 @@ set -e
 assert_contains "$CONFLICTING_HCO_OUTPUT" "process HCO_CONFIG_PATH" "HCO environment conflict is actionable"
 printf '%s\n' \
   'UNRELATED_SETTING=preserved' \
+  'HERMES_API_KEY_KEYED=keyed-model-credential' \
   "HCO_CONFIG_PATH=$MUTATE_HCO_CONFIG" \
   'ZULIP_CONTEXT_DEPTH=0' > "$HERMES_HOME/.env"
 chmod 600 "$HERMES_HOME/.env"
@@ -2100,23 +2220,50 @@ ROLLBACK_CONFIG_BEFORE="$(< "$HERMES_HOME/config.yaml")"
 ROLLBACK_INGRESS_CONFIG_BEFORE="$(< "$HERMES_HOME/profiles/zulip-ingress/config.yaml")"
 ROLLBACK_INGRESS_ENV_BEFORE="$(< "$HERMES_HOME/profiles/zulip-ingress/.env")"
 ROLLBACK_INGRESS_REMINDER_BEFORE="$(< "$HERMES_HOME/profiles/zulip-ingress/SOUL.md")"
+printf '%s\n' 'operator bridge soul before rollback' > "$HERMES_HOME/profiles/codex-bridge/SOUL.md"
+printf '%s\n' 'ROLLBACK_BRIDGE_SECRET=operator-bridge-dotenv-before-rollback' > "$HERMES_HOME/profiles/codex-bridge/.env"
+ROLLBACK_BRIDGE_SOUL_BEFORE="$(< "$HERMES_HOME/profiles/codex-bridge/SOUL.md")"
 ROLLBACK_BRIDGE_CONFIG_BEFORE="$(< "$HERMES_HOME/profiles/codex-bridge/config.yaml")"
+ROLLBACK_BRIDGE_ENV_BEFORE="$(< "$HERMES_HOME/profiles/codex-bridge/.env")"
 ROLLBACK_GENERAL_CONFIG_BEFORE="$(< "$HERMES_HOME/profiles/hermes-general/config.yaml")"
 ROLLBACK_ASK_CONFIG_HASH_BEFORE="$(shasum -a 256 "$HERMES_HOME/profiles/ask-jarvis-pm/config.yaml")"
 ROLLBACK_ASK_ENV_HASH_BEFORE="$(shasum -a 256 "$HERMES_HOME/profiles/ask-jarvis-pm/.env")"
 ROLLBACK_LINK_BEFORE="$(readlink "$PLUGIN_LINK")"
+ROLLBACK_LAUNCH_LINES_BEFORE="$(wc -l < "$LAUNCHCTL_LOG")"
 set +e
 ROLLBACK_OUTPUT="$(HCO_TEST_ASYNC_BOOTOUT=1 HCO_TEST_NODE_BIN="$FAKE_NODE" HCO_INSTALLER_TEST_FAILPOINT=after_hco_bootstrap invoke_installer "$HERMES_HOME" "$MUTATE_HCO_CONFIG" "$FAKE_CODEX" 2>&1)"
 ROLLBACK_STATUS=$?
 set -e
 [[ $ROLLBACK_STATUS -ne 0 ]] || fail "injected post-HCO failure aborts installation"
 assert_contains "$ROLLBACK_OUTPUT" "injected failure" "rollback test reaches injected failure: $ROLLBACK_OUTPUT"
+ROLLBACK_GATEWAY_LAUNCH_LOG="$(tail -n "+$((ROLLBACK_LAUNCH_LINES_BEFORE + 1))" "$LAUNCHCTL_LOG")"
+"$PYTHON" - "$ROLLBACK_GATEWAY_LAUNCH_LOG" "user/$(id -u)/ai.hermes.gateway" "$LAUNCH_AGENTS_NORMALIZED/ai.hermes.gateway.plist" <<'PY' || fail "rollback stops the activated Gateway before restoring its prior configuration"
+import sys
+
+target = sys.argv[2]
+mutations = [
+    line
+    for line in sys.argv[1].splitlines()
+    if line in {
+        f"bootout {target}",
+        f"kickstart -k {target}",
+        f"bootstrap {target.rsplit('/', 1)[0]} {sys.argv[3]}",
+    }
+]
+assert mutations == [
+    f"kickstart -k {target}",
+    f"bootout {target}",
+    f"bootstrap {target.rsplit('/', 1)[0]} {sys.argv[3]}",
+], mutations
+PY
 [[ "$(< "$HERMES_HOME/.env")" == "$ROLLBACK_ENV_BEFORE" ]] || fail "rollback restores root dotenv exactly"
 [[ "$(< "$HERMES_HOME/config.yaml")" == "$ROLLBACK_CONFIG_BEFORE" ]] || fail "rollback restores root config exactly"
 [[ "$(< "$HERMES_HOME/profiles/zulip-ingress/config.yaml")" == "$ROLLBACK_INGRESS_CONFIG_BEFORE" ]] || fail "rollback restores zulip-ingress config exactly"
 [[ "$(< "$HERMES_HOME/profiles/zulip-ingress/.env")" == "$ROLLBACK_INGRESS_ENV_BEFORE" ]] || fail "rollback restores zulip-ingress dotenv exactly"
 [[ "$(< "$HERMES_HOME/profiles/zulip-ingress/SOUL.md")" == "$ROLLBACK_INGRESS_REMINDER_BEFORE" ]] || fail "rollback restores zulip-ingress reminder exactly"
+[[ "$(< "$HERMES_HOME/profiles/codex-bridge/SOUL.md")" == "$ROLLBACK_BRIDGE_SOUL_BEFORE" ]] || fail "rollback restores codex-bridge soul exactly"
 [[ "$(< "$HERMES_HOME/profiles/codex-bridge/config.yaml")" == "$ROLLBACK_BRIDGE_CONFIG_BEFORE" ]] || fail "rollback restores codex-bridge config exactly"
+[[ "$(< "$HERMES_HOME/profiles/codex-bridge/.env")" == "$ROLLBACK_BRIDGE_ENV_BEFORE" ]] || fail "rollback restores codex-bridge dotenv exactly"
 [[ "$(< "$HERMES_HOME/profiles/hermes-general/config.yaml")" == "$ROLLBACK_GENERAL_CONFIG_BEFORE" ]] || fail "rollback restores hermes-general config exactly"
 [[ "$(shasum -a 256 "$HERMES_HOME/profiles/ask-jarvis-pm/config.yaml")" == "$ROLLBACK_ASK_CONFIG_HASH_BEFORE" ]] || fail "rollback restores external profile config byte-for-byte"
 [[ "$(shasum -a 256 "$HERMES_HOME/profiles/ask-jarvis-pm/.env")" == "$ROLLBACK_ASK_ENV_HASH_BEFORE" ]] || fail "rollback leaves external profile dotenv byte-for-byte unchanged"
@@ -2172,6 +2319,8 @@ paths = [
     root / "profiles/zulip-ingress/.env",
     root / "profiles/zulip-ingress/SOUL.md",
     root / "profiles/codex-bridge/config.yaml",
+    root / "profiles/codex-bridge/.env",
+    root / "profiles/codex-bridge/SOUL.md",
     root / "profiles/hermes-general/config.yaml",
 ]
 state = {
@@ -2215,6 +2364,8 @@ paths = [
     root / "profiles/zulip-ingress/.env",
     root / "profiles/zulip-ingress/SOUL.md",
     root / "profiles/codex-bridge/config.yaml",
+    root / "profiles/codex-bridge/.env",
+    root / "profiles/codex-bridge/SOUL.md",
     root / "profiles/hermes-general/config.yaml",
 ]
 state = {
@@ -2358,6 +2509,8 @@ set -e
 assert_contains "$FAILED_FIRST_PROFILE_OUTPUT" "injected failure" "failed first profile install preserves the original failure"
 [[ "$(< "$FAILED_FIRST_PROFILE_HOME/operator-marker")" == "pre-existing Hermes home" ]] || fail "failed first profile install preserves the pre-existing Hermes home"
 [[ ! -e "$FAILED_FIRST_PROFILE_HOME/profiles/zulip-ingress" ]] || fail "failed first profile install removes its transaction-created ingress profile"
+[[ ! -e "$FAILED_FIRST_PROFILE_HOME/profiles/codex-bridge" ]] || fail "failed first profile install removes its transaction-created bridge profile and soul"
+[[ ! -e "$FAILED_FIRST_PROFILE_HOME/profiles/codex-bridge/.env" ]] || fail "failed first profile install removes its transaction-created bridge dotenv"
 [[ "$(< "$LAUNCHCTL_STATE/ai.hermes.gateway")" == "running" ]] || fail "failed first profile install restores Gateway running intent"
 [[ "$(< "$LAUNCHCTL_STATE/ai.hermes.gateway.pid")" != "$FAILED_FIRST_PROFILE_GATEWAY_PID_BEFORE" ]] || fail "failed first profile install restarts the prior Gateway with a fresh PID"
 [[ ! -e "$FAILED_FIRST_PROFILE_HOME/plugins/hermes-codex-bridge" ]] || fail "failed first profile install leaves the prior plugin absent"
@@ -2589,4 +2742,149 @@ assert not any(item["event"] == "started" and item["pid"] != old_pid for item in
 PY
 pass "HCO exit timeout fails closed before SQLite snapshot restoration"
 
-printf '1..30\n'
+BUILTIN_PROVIDER_HOME="$MUTATE_ROOT/builtin-provider-hermes"
+seed_gateway_runtime_state "$BUILTIN_PROVIDER_HOME"
+printf '%s\n' \
+  'model:' \
+  '  provider: openrouter' \
+  '  name: openrouter/fixture-model' \
+  'providers:' \
+  '  openrouter:' \
+  '    name: openrouter' \
+  '    api: https://keyed-shadow.example.invalid/v1' \
+  '    key_env: KEYED_SHADOW_OPENROUTER_KEY' \
+  '    default_model: keyed-shadow-model' \
+  'custom_providers:' \
+  '  - name: openrouter' \
+  '    base_url: https://shadow.example.invalid/v1' \
+  '    key_env: SHADOW_OPENROUTER_KEY' \
+  '    model: shadow-model' > "$BUILTIN_PROVIDER_HOME/config.yaml"
+printf '%s\n' \
+  'KEYED_SHADOW_OPENROUTER_KEY=keyed-shadow-openrouter-credential' \
+  'SHADOW_OPENROUTER_KEY=shadow-openrouter-credential' > "$BUILTIN_PROVIDER_HOME/.env"
+printf '%s\n' \
+  '{' \
+  '  "version": 1,' \
+  '  "credential_pool": {' \
+  '    "openrouter": [{' \
+  '      "id": "global-openrouter-fixture",' \
+  '      "label": "global-openrouter-fixture",' \
+  '      "auth_type": "api_key",' \
+  '      "priority": 0,' \
+  '      "source": "manual",' \
+  '      "access_token": "builtin-openrouter-credential"' \
+  '    }]' \
+  '  }' \
+  '}' > "$BUILTIN_PROVIDER_HOME/auth.json"
+chmod 600 \
+  "$BUILTIN_PROVIDER_HOME/config.yaml" \
+  "$BUILTIN_PROVIDER_HOME/.env" \
+  "$BUILTIN_PROVIDER_HOME/auth.json"
+BUILTIN_PROVIDER_OUTPUT="$(
+  HCO_TEST_NODE_BIN="$FAKE_NODE" \
+  invoke_installer \
+    "$BUILTIN_PROVIDER_HOME" \
+    "$MUTATE_HCO_CONFIG" \
+    "$FAKE_CODEX" 2>&1
+)" || fail "canonical built-in Provider install succeeds: $BUILTIN_PROVIDER_OUTPUT"
+assert_contains \
+  "$BUILTIN_PROVIDER_OUTPUT" \
+  "staged bridge inference provider: passed" \
+  "canonical built-in Provider passes the staged runtime probe"
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$BUILTIN_PROVIDER_HOME" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+from gateway.run import _profile_runtime_scope, _resolve_runtime_agent_kwargs
+
+root = Path(sys.argv[1])
+bridge_home = root / "profiles/codex-bridge"
+bridge = yaml.safe_load((bridge_home / "config.yaml").read_text())
+bridge_env = (bridge_home / ".env").read_text()
+
+assert bridge["model"]["provider"] == "openrouter"
+assert bridge.get("custom_providers") is None
+assert bridge.get("providers") is None
+assert "KEYED_SHADOW_OPENROUTER_KEY" not in bridge_env
+assert "keyed-shadow-openrouter-credential" not in bridge_env
+assert "SHADOW_OPENROUTER_KEY" not in bridge_env
+assert "shadow-openrouter-credential" not in bridge_env
+
+os.environ["HERMES_HOME"] = str(bridge_home)
+with _profile_runtime_scope(bridge_home):
+    runtime = _resolve_runtime_agent_kwargs()
+assert runtime["provider"] == "openrouter"
+assert runtime["api_key"] == "builtin-openrouter-credential"
+PY
+pass "canonical built-in Provider ignores same-named custom shadow declarations"
+
+PRODUCTION_PROVIDER_HOME="$MUTATE_ROOT/production-provider-hermes"
+seed_gateway_runtime_state "$PRODUCTION_PROVIDER_HOME"
+printf '%s\n' \
+  'model:' \
+  '  provider: iotwq' \
+  '  default: gpt-5.5' \
+  'providers:' \
+  '  iotwq: {}' \
+  'custom_providers:' \
+  '  - name: iotwq' \
+  '    base_url: https://api.iotwq.example.invalid/v1' \
+  '    key_env: HERMES_API_KEY_GPT_BACKUP' \
+  '    api_key: inline-production-key-must-not-copy' > "$PRODUCTION_PROVIDER_HOME/config.yaml"
+printf '%s\n' \
+  'HERMES_API_KEY_GPT_BACKUP=production-provider-credential' \
+  'UNRELATED_PROVIDER_KEY=unrelated-provider-credential' > "$PRODUCTION_PROVIDER_HOME/.env"
+chmod 600 \
+  "$PRODUCTION_PROVIDER_HOME/config.yaml" \
+  "$PRODUCTION_PROVIDER_HOME/.env"
+PRODUCTION_PROVIDER_OUTPUT="$(
+  HCO_TEST_NODE_BIN="$FAKE_NODE" \
+  invoke_installer \
+    "$PRODUCTION_PROVIDER_HOME" \
+    "$MUTATE_HCO_CONFIG" \
+    "$FAKE_CODEX" 2>&1
+)" || fail "production-shaped custom Provider install succeeds: $PRODUCTION_PROVIDER_OUTPUT"
+assert_contains \
+  "$PRODUCTION_PROVIDER_OUTPUT" \
+  "staged bridge inference provider: passed" \
+  "production-shaped custom Provider passes the staged runtime probe"
+PYTHONDONTWRITEBYTECODE=1 "$PYTHON" - "$PRODUCTION_PROVIDER_HOME" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import yaml
+
+from gateway.run import _profile_runtime_scope, _resolve_runtime_agent_kwargs
+
+root = Path(sys.argv[1])
+bridge_home = root / "profiles/codex-bridge"
+bridge = yaml.safe_load((bridge_home / "config.yaml").read_text())
+bridge_env = (bridge_home / ".env").read_text()
+
+assert bridge["model"] == {"provider": "iotwq", "default": "gpt-5.5"}
+assert bridge.get("providers") is None
+assert bridge["custom_providers"] == [{
+    "name": "iotwq",
+    "base_url": "https://api.iotwq.example.invalid/v1",
+    "key_env": "HERMES_API_KEY_GPT_BACKUP",
+}]
+assert "api_key" not in str(bridge)
+assert bridge_env == "HERMES_API_KEY_GPT_BACKUP=production-provider-credential\n"
+assert "inline-production-key-must-not-copy" not in bridge_env
+assert "UNRELATED_PROVIDER_KEY" not in bridge_env
+assert "unrelated-provider-credential" not in bridge_env
+
+os.environ["HERMES_HOME"] = str(bridge_home)
+with _profile_runtime_scope(bridge_home):
+    runtime = _resolve_runtime_agent_kwargs()
+assert runtime["provider"] == "custom"
+assert runtime["base_url"] == "https://api.iotwq.example.invalid/v1"
+assert runtime["api_key"] == "production-provider-credential"
+PY
+pass "production-shaped custom Provider installs a minimal resolvable inference closure"
+
+printf '1..32\n'

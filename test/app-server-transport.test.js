@@ -362,8 +362,10 @@ test("routes RPC error responses and diagnoses malformed or ambiguous messages",
     assert.equal(error.code, "APP_SERVER_RPC_REMOTE_ERROR");
     assert.equal(error.message, "App Server request failed.");
     assert.equal(error.rpcCode, -32000);
-    assert.equal(Object.hasOwn(error, "rpcMessage"), false);
-    assert.equal(Object.hasOwn(error, "rpcData"), false);
+    assert.equal(error.rpcMessage, "remote failure secret");
+    assert.deepEqual(error.rpcData, { secret: "test data secret" });
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, "rpcMessage"), false);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, "rpcData"), false);
     const serialized = `${error.message} ${JSON.stringify(error)}`;
     assert.equal(serialized.includes("remote failure secret"), false);
     assert.equal(serialized.includes("test data secret"), false);
@@ -390,8 +392,13 @@ test("preserves lossless int64 semantics for remote errors and callback params",
     assert.equal(error.code, "APP_SERVER_RPC_REMOTE_ERROR");
     assert.equal(error.rpcCode, 9223372036854775807n);
     assert.equal(typeof error.rpcCode, "bigint");
-    assert.equal(Object.hasOwn(error, "rpcMessage"), false);
-    assert.equal(Object.hasOwn(error, "rpcData"), false);
+    assert.equal(error.rpcMessage, "remote secret");
+    assert.deepEqual(error.rpcData, { secret: true });
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, "rpcMessage"), false);
+    assert.equal(Object.prototype.propertyIsEnumerable.call(error, "rpcData"), false);
+    const serialized = JSON.stringify(error);
+    assert.equal(serialized.includes("remote secret"), false);
+    assert.equal(serialized.includes("secret"), false);
     return true;
   });
 

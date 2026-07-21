@@ -188,12 +188,14 @@ BRIDGE_READINESS_TIMEOUT_SECONDS = 8.0
 APP_SERVER_READINESS_TIMEOUT_SECONDS = 40.0
 PROCESS_EXIT_TIMEOUT_SECONDS = 8.0
 RESTRICTED_TOOLSETS: list[str] = ["zulip-history"]
+BRIDGE_TOOLSETS: list[str] = [*RESTRICTED_TOOLSETS, "hco_bridge"]
 HERMES_CHECKOUT = Path("/Users/hula/Projects/hermesAgent")
 HERMES_PROJECT_ENV = Path("/Users/hula/Projects/hermesAgent/.env")
 GENERAL_TOOLSETS = ["hermes-zulip"]
 RESTRICTED_DISABLED_TOOLSETS = ["context_engine", "kanban", "zulip-history"]
 OWNED_PROFILE_NAMES = frozenset({"zulip-ingress", "codex-bridge", "hermes-general"})
 INGRESS_REMINDER = b"""# Zulip Ingress\n\nThis profile is project-neutral. It only receives Zulip events and lets the Codex routing hook choose an explicit project profile. A numeric Zulip stream ID plus a fresh, integrity-checked HCO route snapshot are the only project-routing authority. A channel name, topic, message text, cwd, memory, or model inference must never choose or change a project. Never infer a project, workspace, memory, credential, or task context from the default Hermes profile.\n"""
+BRIDGE_SOUL = b"""# Jarvis PM\n\nYou are Jarvis PM, a project-neutral coordination assistant. Help people clarify requests, coordinate executable work, and report progress honestly from available evidence. Never invent project status, completed work, or evidence.\n\nFor executable project work, call `hco_dispatch` exactly once with only a `semantic` object. Never supply or request a capability or `topicModeAction`; trusted routing and authorization stay internal to the bridge. Project identity, workspace, permissions, memory, and credentials come only from trusted routing context; never infer or change them from names, topics, message text, or prior conversations.\n"""
 
 
 class InstallError(RuntimeError):
@@ -849,9 +851,9 @@ def managed_known_plugin_toolsets(
         {
             str(item)
             for item in configured
-            if str(item) != "hco_bridge"
         }
-        | (installed_plugin_toolsets - {"hco_bridge"})
+        | installed_plugin_toolsets
+        | {"hco_bridge"}
     )
 
 
@@ -1015,24 +1017,187 @@ def ingress_config(
     return result
 
 
-def restricted_config(
-    existing: dict[str, Any], installed_plugin_toolsets: set[str]
-) -> dict[str, Any]:
-    result = copy.deepcopy(existing)
-    result.setdefault("platforms", {}).setdefault("zulip", {})["enabled"] = False
-    result.setdefault("platform_toolsets", {})["zulip"] = list(RESTRICTED_TOOLSETS)
-    result.setdefault("known_plugin_toolsets", {})["zulip"] = managed_known_plugin_toolsets(
+def normalized_provider_selector(value: str) -> str:
+    normalized = value.strip().lower().replace(" ", "-")
+    return normalized.removeprefix("custom:")
+
+
+def is_canonical_builtin_provider(selected_provider: str) -> bool:
+    requested = selected_provider.strip().lower().replace(" ", "-")
+    if requested == "auto":
+        return True
+    if requested == "custom" or requested.startswith("custom:"):
+        return False
+
+    old_path = list(sys.path)
+    sys.path.insert(0, str(HERMES_CHECKOUT))
+    try:
+        from hermes_cli.auth import AuthError, resolve_provider
+
+        try:
+            canonical = resolve_provider(requested)
+        except AuthError:
+            return False
+    finally:
+        sys.path[:] = old_path
+    return canonical.strip().lower() == requested
+
+
+def selected_provider_declarations(
+    root: dict[str, Any], selected_provider: str
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], str | None]:
+    selector = normalized_provider_selector(selected_provider)
+    if not selector:
+        raise InstallError("default Hermes model.provider must not be empty")
+
+    providers = root.get("providers", {})
+    if not isinstance(providers, dict):
+        raise InstallError("default Hermes providers config must be a mapping")
+    matching_keyed: list[tuple[str, dict[str, Any], bool]] = []
+    for key, entry in providers.items():
+        if not isinstance(entry, dict):
+            raise InstallError("default Hermes Provider entry must be a mapping")
+        identities = {normalized_provider_selector(str(key))}
+        if str(entry.get("name", "")).strip():
+            identities.add(normalized_provider_selector(str(entry["name"])))
+        if selector in identities:
+            endpoint = next(
+                (
+                    value.strip()
+                    for field in ("api", "url", "base_url")
+                    if isinstance((value := entry.get(field)), str) and value.strip()
+                ),
+                "",
+            )
+            matching_keyed.append((str(key), copy.deepcopy(entry), bool(endpoint)))
+
+    canonical_builtin = is_canonical_builtin_provider(selected_provider)
+    if canonical_builtin:
+        return [], {}, None
+
+    for key, entry, is_endpoint in matching_keyed:
+        if is_endpoint:
+            return [], {key: entry}, "keyed"
+
+    custom = root.get("custom_providers", [])
+    if not isinstance(custom, list):
+        raise InstallError("default Hermes custom_providers config must be a list")
+    for entry in custom:
+        if not isinstance(entry, dict):
+            raise InstallError("default Hermes custom provider entry must be a mapping")
+        identities = {
+            normalized_provider_selector(str(entry.get(field, "")))
+            for field in ("name", "provider_key")
+            if str(entry.get(field, "")).strip()
+        }
+        base_url = entry.get("base_url")
+        if selector in identities and isinstance(base_url, str) and base_url.strip():
+            return [copy.deepcopy(entry)], {}, "custom"
+
+    return [], {}, None
+
+
+def inference_provider_layout(
+    root: dict[str, Any], root_env_data: bytes | None
+) -> tuple[dict[str, Any], bytes]:
+    model = root.get("model")
+    if not isinstance(model, dict):
+        raise InstallError("default Hermes model config must be a mapping")
+    selected_provider = model.get("provider")
+    if not isinstance(selected_provider, str) or not selected_provider.strip():
+        raise InstallError("default Hermes model.provider is required")
+
+    selected_custom, selected_keyed, credential_source = selected_provider_declarations(
+        root, selected_provider
+    )
+    credential_names: set[str] = set()
+    sanitized_custom: list[dict[str, Any]] = []
+    for entry in selected_custom:
+        inline_key = bool(str(entry.get("api_key", "")).strip())
+        entry.pop("api_key", None)
+        key_env = str(entry.get("key_env", "")).strip()
+        if credential_source != "custom":
+            entry.pop("key_env", None)
+            key_env = ""
+        elif inline_key and not key_env:
+            raise InstallError(
+                "selected custom Provider uses inline api_key without key_env"
+            )
+        if key_env:
+            credential_names.add(key_env)
+        sanitized_custom.append(entry)
+
+    sanitized_keyed: dict[str, dict[str, Any]] = {}
+    for key, entry in selected_keyed.items():
+        inline_key = bool(str(entry.get("api_key", "")).strip())
+        entry.pop("api_key", None)
+        key_env = str(entry.get("key_env", "")).strip()
+        if credential_source != "keyed":
+            entry.pop("key_env", None)
+            key_env = ""
+        elif inline_key and not key_env:
+            raise InstallError(
+                "selected keyed Provider uses inline api_key without key_env"
+            )
+        if key_env:
+            credential_names.add(key_env)
+        sanitized_keyed[key] = entry
+
+    if len(credential_names) > 1:
+        raise InstallError("selected Hermes Provider references multiple credentials")
+    root_env_values = dotenv_values(root_env_data)
+    provider_env_values: dict[str, str] = {}
+    for name in credential_names:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise InstallError("selected Hermes Provider key_env is invalid")
+        value = root_env_values.get(name, "")
+        if not value:
+            raise InstallError("selected Hermes Provider credential is unavailable")
+        provider_env_values[name] = value
+
+    result: dict[str, Any] = {"model": copy.deepcopy(model)}
+    if sanitized_custom:
+        result["custom_providers"] = sanitized_custom
+    if sanitized_keyed:
+        result["providers"] = sanitized_keyed
+    return result, update_env(None, provider_env_values)
+
+
+def bridge_profile_layout(
+    root: dict[str, Any],
+    existing: dict[str, Any],
+    installed_plugin_toolsets: set[str],
+    root_env_data: bytes | None,
+) -> tuple[dict[str, Any], bytes]:
+    provider_config, provider_env = inference_provider_layout(root, root_env_data)
+
+    configured_known = existing.get("known_plugin_toolsets", {})
+    if not isinstance(configured_known, dict):
+        raise InstallError("restricted known_plugin_toolsets config must be a mapping")
+    configured_zulip_known = configured_known.get("zulip", [])
+    if not isinstance(configured_zulip_known, list):
+        raise InstallError("restricted known_plugin_toolsets.zulip must be a list")
+    result: dict[str, Any] = {
+        **provider_config,
+        "platforms": {"zulip": {"enabled": False}},
+        "platform_toolsets": {"zulip": list(BRIDGE_TOOLSETS)},
+        "known_plugin_toolsets": {
+            "zulip": [str(item) for item in configured_zulip_known]
+        },
+        "agent": {"disabled_toolsets": list(RESTRICTED_DISABLED_TOOLSETS)},
+        "mcp_servers": {},
+    }
+    result["known_plugin_toolsets"]["zulip"] = managed_known_plugin_toolsets(
         result, installed_plugin_toolsets
     )
-    disabled = result.setdefault("agent", {}).setdefault("disabled_toolsets", [])
-    if not isinstance(disabled, list):
-        raise InstallError("restricted agent.disabled_toolsets must be a list")
-    disabled.extend(item for item in RESTRICTED_DISABLED_TOOLSETS if item not in disabled)
-    disable_mcp_servers(result)
-    return result
+    return result, provider_env
 
 
-def general_config(existing: dict[str, Any]) -> dict[str, Any]:
+def general_config(
+    existing: dict[str, Any],
+    root: dict[str, Any],
+    root_env_data: bytes | None,
+) -> tuple[dict[str, Any], bytes]:
     result = copy.deepcopy(existing)
     result.setdefault("platforms", {}).setdefault("zulip", {})["enabled"] = False
     platform = result.setdefault("platform_toolsets", {})
@@ -1050,9 +1215,13 @@ def general_config(existing: dict[str, Any]) -> dict[str, Any]:
     configured = known.get("zulip", [])
     if not isinstance(configured, list):
         raise InstallError("general known_plugin_toolsets.zulip must be a list")
-    known["zulip"] = [item for item in configured if item != "hco_bridge"]
+    known["zulip"] = sorted({str(item) for item in configured} | {"hco_bridge"})
     disable_mcp_servers(result)
-    return result
+    provider_config, provider_env = inference_provider_layout(root, root_env_data)
+    for key in ("model", "custom_providers", "providers"):
+        result.pop(key, None)
+    result.update(provider_config)
+    return result, provider_env
 
 
 def snapshot(path: Path) -> Snapshot:
@@ -1971,9 +2140,9 @@ def promote_stable_symlink(staged: Path, stable: Path, release: Path) -> None:
 
 EFFECTIVE_HERMES_PROBE_PROGRAM = r'''
 import hashlib
-import inspect
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -1995,6 +2164,7 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.profiles import get_profile_dir
 from hermes_cli.tools_config import _get_platform_tools
 import hermes_cli.plugins as plugin_module
+from tools.registry import registry
 
 loaded_env = load_hermes_dotenv(
     hermes_home=root,
@@ -2029,6 +2199,7 @@ if mode == "general-disabled":
 from gateway.config import Platform, PlatformConfig, load_gateway_config
 from gateway.run import (
     _profile_runtime_scope,
+    _resolve_runtime_agent_kwargs,
     _without_secondary_profile_platform_env,
 )
 import gateway.platforms.zulip as zulip_module
@@ -2039,24 +2210,37 @@ if gateway.multiplex_profiles is not True:
 manager = plugin_module.PluginManager()
 plugin_module._plugin_manager = manager
 root_config = load_config()
+def reject_plugin_llm_access(_self):
+    raise ValueError("bridge plugin accessed ctx.llm during registration")
+plugin_module.PluginContext.llm = property(reject_plugin_llm_access)
 manager.discover_and_load()
 loaded = manager._plugins.get("hermes-codex-bridge")
 if loaded is None or not loaded.enabled or loaded.error:
     raise ValueError("bridge plugin was not discovered and enabled")
-if loaded.tools_registered or "hco_bridge" in manager._plugin_tool_names:
-    raise ValueError("bridge plugin exposed a model-callable tool")
+if loaded.tools_registered != ["hco_dispatch"] or "hco_dispatch" not in manager._plugin_tool_names:
+    raise ValueError("bridge dispatch tool registration is missing")
+dispatch_entry = registry.get_entry("hco_dispatch")
+if dispatch_entry is None or not dispatch_entry.is_async or not dispatch_entry.return_direct:
+    raise ValueError("bridge dispatch tool is not async direct-return")
+dispatch_parameters = dispatch_entry.schema.get("parameters")
+if (
+    type(dispatch_parameters) is not dict
+    or dispatch_parameters.get("type") != "object"
+    or dispatch_parameters.get("additionalProperties") is not False
+    or dispatch_parameters.get("required") != ["semantic"]
+    or set(dispatch_parameters.get("properties", {})) != {"semantic"}
+):
+    raise ValueError("bridge dispatch tool schema is not semantic-only")
 required_commands = {
     "codex",
     "hermes-codex-bridge-internal",
-    "hermes-codex-bridge-natural",
+    "hermes-codex-bridge-registration",
     "hermes-codex-bridge-route-unavailable",
 }
 if not required_commands.issubset(manager._plugin_commands):
     raise ValueError("bridge private commands are missing")
-natural_handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
-plugin_llm = inspect.getclosurevars(natural_handler).nonlocals.get("llm")
-if plugin_llm is None or not callable(plugin_llm.acomplete_structured):
-    raise ValueError("bridge plugin LLM facade is unavailable")
+if "hermes-codex-bridge-natural" in manager._plugin_commands:
+    raise ValueError("legacy bridge natural-language facade is still registered")
 callbacks = manager._hooks.get("pre_gateway_dispatch", [])
 bridge_index = next(
     (
@@ -2102,6 +2286,26 @@ def require_restricted_ingress():
         raise ValueError("zulip-ingress profile is not restricted")
 
 bridge_callback = callbacks[bridge_index]
+fixture_session_key = "codex-bridge:zulip:1:canary:fixture-user"
+fixture_gateway = type(
+    "Gateway",
+    (),
+    {
+        "_session_key_for_source": staticmethod(lambda _source: fixture_session_key),
+        "_is_user_authorized": staticmethod(lambda _source: True),
+    },
+)()
+fixture_session_store = type(
+    "SessionStore",
+    (),
+    {
+        "lookup_by_session_id": staticmethod(
+            lambda _session_id: type(
+                "SessionEntry", (), {"session_key": fixture_session_key}
+            )()
+        )
+    },
+)()
 def invoke_bridge_fixture(event):
     def marked_bridge_callback(**kwargs):
         result = bridge_callback(**kwargs)
@@ -2112,7 +2316,12 @@ def invoke_bridge_fixture(event):
     marked_bridge_callback.__module__ = bridge_callback.__module__
     callbacks[bridge_index] = marked_bridge_callback
     try:
-        results = manager.invoke_hook("pre_gateway_dispatch", event=event)
+        results = manager.invoke_hook(
+            "pre_gateway_dispatch",
+            event=event,
+            gateway=fixture_gateway,
+            session_store=fixture_session_store,
+        )
     finally:
         callbacks[bridge_index] = bridge_callback
     actionable = [
@@ -2195,14 +2404,26 @@ routed_actionable = [
 if (
     not routed_actionable
     or routed_actionable[0].get("_hco_probe_bridge") is not True
-    or routed_actionable[0].get("action") != "rewrite"
-    or not routed_actionable[0].get("text", "").startswith(
-        "/hermes-codex-bridge-natural "
-    )
-    or "natural request" in routed_actionable[0].get("text", "")
+    or routed_actionable[0].get("action") != "allow"
+    or "text" in routed_actionable[0]
+    or routed_event.text != "natural request"
     or routed_event.source.profile != "codex-bridge"
 ):
-    raise ValueError("valid PROJECT route did not produce the bridge rewrite")
+    raise ValueError("valid PROJECT route did not enter the normal bridge agent")
+channel_prompt = getattr(routed_event, "channel_prompt", None)
+if type(channel_prompt) is not str or "natural request" in channel_prompt:
+    raise ValueError("valid PROJECT route did not receive bounded bridge context")
+# Check for the invariant structure (allows dynamic projectId/cwd/containment hints)
+if not re.search(
+    r"Hermes Codex bridge context\.",
+    channel_prompt,
+) or not re.search(
+    r"For executable project work, call hco_dispatch exactly once with the "
+    r"strict semantic object\. For ordinary conversation, answer normally without "
+    r"calling hco_dispatch\.",
+    channel_prompt,
+):
+    raise ValueError("valid PROJECT route supplied malformed bridge context")
 require_restricted_ingress()
 
 def raising_bridge_callback(**_kwargs):
@@ -2219,8 +2440,34 @@ finally:
     callbacks[bridge_index] = bridge_callback
 
 os.environ["HERMES_HOME"] = str(bridge_home)
-if _get_platform_tools(load_config(), "zulip"):
+if _get_platform_tools(load_config(), "zulip") != {"hco_bridge"}:
     raise ValueError("codex-bridge profile is not restricted")
+with _profile_runtime_scope(bridge_home):
+    bridge_runtime = _resolve_runtime_agent_kwargs()
+if not bridge_runtime.get("provider"):
+    raise ValueError("codex-bridge inference Provider did not resolve")
+bridge_soul = (bridge_home / "SOUL.md").read_text(encoding="utf-8")
+if not all(
+    value in bridge_soul
+    for value in (
+        "Jarvis PM",
+        "hco_dispatch",
+        "evidence",
+        "with only a `semantic` object",
+        "Never supply or request a capability or `topicModeAction`",
+    )
+):
+    raise ValueError("codex-bridge Jarvis PM soul is incomplete")
+if any(value in bridge_soul for value in ("/Users/hula/workspace/ASK", "ask-project-memory", "projectId", "alpha")):
+    raise ValueError("codex-bridge Jarvis PM soul contains project-specific context")
+os.environ["HERMES_HOME"] = str(general_home)
+general_config = load_config()
+if "hco_bridge" in _get_platform_tools(general_config, "zulip"):
+    raise ValueError("hermes-general profile exposes the project bridge")
+with _profile_runtime_scope(general_home):
+    general_runtime = _resolve_runtime_agent_kwargs()
+if not general_runtime.get("provider"):
+    raise ValueError("hermes-general inference Provider did not resolve")
 os.environ["HERMES_HOME"] = str(root)
 root_platform = gateway.platforms.get(Platform.ZULIP, PlatformConfig())
 if root_platform.enabled:
@@ -2315,8 +2562,20 @@ def effective_hermes_probe(
             (bridge_home / "config.yaml").read_bytes(),
         )
         atomic_write(
+            probe_bridge_home / ".env",
+            (bridge_home / ".env").read_bytes(),
+        )
+        atomic_write(
+            probe_bridge_home / "SOUL.md",
+            (bridge_home / "SOUL.md").read_bytes(),
+        )
+        atomic_write(
             probe_general_home / "config.yaml",
             (general_home / "config.yaml").read_bytes(),
+        )
+        atomic_write(
+            probe_general_home / ".env",
+            (general_home / ".env").read_bytes(),
         )
         probe_plugins = probe_root / "plugins"
         probe_plugins.mkdir(mode=0o700)
@@ -2356,7 +2615,8 @@ def effective_hermes_probe(
                 raise CompatibilityError(
                     f"{phase} effective Hermes {mode} fixture failed: {result.stderr.strip()}"
                 )
-        diagnostic(f"{phase} valid PROJECT route rewrite fixture: passed")
+        diagnostic(f"{phase} valid PROJECT route allow fixture: passed")
+        diagnostic(f"{phase} bridge inference provider: passed")
     except (OSError, subprocess.SubprocessError) as error:
         fail(f"{phase} effective Hermes probe", error)
     finally:
@@ -2385,7 +2645,10 @@ def stage_effective_hermes_layout(
     ingress_env_data: bytes,
     ingress_reminder_data: bytes,
     bridge_config_data: bytes,
+    bridge_env_data: bytes,
+    bridge_soul_data: bytes,
     general_config_data: bytes,
+    general_env_data: bytes,
     env_data: bytes,
     external_profiles: dict[str, tuple[bytes, bytes | None]],
 ) -> tuple[Path, Path, Path, Path, Path]:
@@ -2405,7 +2668,10 @@ def stage_effective_hermes_layout(
     atomic_write(ingress_home / ".env", ingress_env_data)
     atomic_write(ingress_home / "SOUL.md", ingress_reminder_data)
     atomic_write(bridge_home / "config.yaml", bridge_config_data)
+    atomic_write(bridge_home / ".env", bridge_env_data)
+    atomic_write(bridge_home / "SOUL.md", bridge_soul_data)
     atomic_write(general_home / "config.yaml", general_config_data)
+    atomic_write(general_home / ".env", general_env_data)
     for profile_name, (config_data, profile_env_data) in external_profiles.items():
         profile_home = stage_root / "profiles" / profile_name
         atomic_write(profile_home / "config.yaml", config_data)
@@ -2535,7 +2801,11 @@ def main() -> None:
     gateway_state_path = root / GATEWAY_STATE_FILE
     attestation_path = root / ATTESTATION_FILE
     bridge_config_path = bridge_home / "config.yaml"
+    bridge_env_path = bridge_home / ".env"
+    bridge_soul_path = bridge_home / "SOUL.md"
     general_config_path = general_home / "config.yaml"
+    general_env_path = general_home / ".env"
+    gateway_plist_path = launch_agents_dir / f"{GATEWAY_LABEL}.plist"
     hco_plist_path = launch_agents_dir / f"{HCO_LABEL}.plist"
     delivery_plist_path = launch_agents_dir / f"{DELIVERY_LABEL}.plist"
     database_path = Path(document["databasePath"])
@@ -2599,12 +2869,18 @@ def main() -> None:
         (gateway_state_path, "Hermes Gateway runtime state", False),
         (attestation_path, "Hermes Codex bridge attestation", False),
         (bridge_config_path, "codex-bridge config", False),
+        (bridge_env_path, "codex-bridge dotenv", False),
+        (bridge_soul_path, "codex-bridge soul", False),
         (general_config_path, "hermes-general config", False),
+        (general_env_path, "hermes-general dotenv", False),
         (root_env, "default Hermes dotenv", False),
+        (gateway_plist_path, "Hermes Gateway LaunchAgent plist", False),
         (hco_plist_path, "HCO LaunchAgent plist", False),
         (delivery_plist_path, "delivery LaunchAgent plist", False),
     ):
         validate_mutable_path(path, label, directory=is_directory)
+    if not gateway_plist_path.is_file():
+        raise InstallError("Hermes Gateway LaunchAgent plist is required for rollback")
     if release_store.exists() and stat.S_IMODE(release_store.lstat().st_mode) != 0o700:
         raise InstallError("existing Hermes plugin release store must have mode 0700")
     if stable_link.is_symlink() and stable_link.lstat().st_uid != uid:
@@ -2646,7 +2922,10 @@ def main() -> None:
         ingress_reminder_path,
         attestation_path,
         bridge_config_path,
+        bridge_env_path,
+        bridge_soul_path,
         general_config_path,
+        general_env_path,
         root_env,
         hco_plist_path,
         delivery_plist_path,
@@ -2797,6 +3076,24 @@ def main() -> None:
                     stopped_gateway_pid = current_gateway.pid
             except BaseException as error:
                 record_failure("capture activated Gateway state", error)
+            try:
+                launchctl(
+                    "bootout",
+                    f"{prior_gateway.domain}/{GATEWAY_LABEL}",
+                    check=False,
+                )
+            except BaseException as error:
+                record_failure(f"stop {GATEWAY_LABEL} before restoration", error)
+            try:
+                wait_service_state(
+                    prior_gateway.domain,
+                    GATEWAY_LABEL,
+                    ServiceState(prior_gateway.domain, False, False, None),
+                )
+            except BaseException as error:
+                record_failure(
+                    f"verify stopped {GATEWAY_LABEL} before restoration", error
+                )
         if services_mutated:
             stopping_services: dict[str, ServiceState] = {}
             for label in (DELIVERY_LABEL, HCO_LABEL):
@@ -2868,9 +3165,9 @@ def main() -> None:
                         wait_bridge_gate(document, bearer)
             if gateway_mutated:
                 launchctl(
-                    "kickstart",
-                    "-k",
-                    f"{prior_gateway.domain}/{GATEWAY_LABEL}",
+                    "bootstrap",
+                    prior_gateway.domain,
+                    str(gateway_plist_path),
                 )
                 if prior_plugin_version is not None:
                     restored_gateway = wait_gateway_evidence(
@@ -2991,6 +3288,8 @@ def main() -> None:
         plugin_toolsets = installed_plugin_toolsets(root)
         existing_root_config = load_yaml(root_config_path)
         existing_ingress_config = load_yaml(ingress_config_path)
+        previous_env = root_env.read_bytes() if root_env.exists() else None
+        previous_ingress_env = ingress_env.read_bytes() if ingress_env.exists() else None
         root_config_data = yaml.safe_dump(
             root_config(existing_root_config, plugin_toolsets), sort_keys=False
         ).encode()
@@ -3000,14 +3299,19 @@ def main() -> None:
             ),
             sort_keys=False,
         ).encode()
-        bridge_config_data = yaml.safe_dump(
-            restricted_config(load_yaml(bridge_config_path), plugin_toolsets), sort_keys=False
-        ).encode()
+        bridge_config, bridge_env_data = bridge_profile_layout(
+            existing_root_config,
+            load_yaml(bridge_config_path),
+            plugin_toolsets,
+            previous_env,
+        )
+        bridge_config_data = yaml.safe_dump(bridge_config, sort_keys=False).encode()
+        general_config_value, general_env_data = general_config(
+            load_yaml(general_config_path), existing_root_config, previous_env
+        )
         general_config_data = yaml.safe_dump(
-            general_config(load_yaml(general_config_path)), sort_keys=False
+            general_config_value, sort_keys=False
         ).encode()
-        previous_env = root_env.read_bytes() if root_env.exists() else None
-        previous_ingress_env = ingress_env.read_bytes() if ingress_env.exists() else None
         previous_env_values = dotenv_values(previous_env)
         existing_ingress_values = {
             name: value
@@ -3059,7 +3363,10 @@ def main() -> None:
                     ingress_env_data,
                     INGRESS_REMINDER,
                     bridge_config_data,
+                    bridge_env_data,
+                    BRIDGE_SOUL,
                     general_config_data,
+                    general_env_data,
                     env_data,
                     staged_external_profiles,
                 )
@@ -3102,7 +3409,10 @@ def main() -> None:
         atomic_write(ingress_env, ingress_env_data)
         atomic_write(ingress_reminder_path, INGRESS_REMINDER)
         atomic_write(bridge_config_path, bridge_config_data)
+        atomic_write(bridge_env_path, bridge_env_data)
+        atomic_write(bridge_soul_path, BRIDGE_SOUL)
         atomic_write(general_config_path, general_config_data)
+        atomic_write(general_env_path, general_env_data)
         for path, config_data in external_profile_updates.items():
             atomic_write(path, config_data)
         atomic_write(root_env, env_data)

@@ -1,6 +1,6 @@
 # 0003 - Zulip channel and topic ownership
 
-**Status:** accepted; App Server implementation in progress
+**Status:** accepted; amended 2026-07-19 for proven-missing App Server thread recovery
 **Date:** 2026-07-16
 **Supersedes:** name-based routing and Runner-task continuity in the 2026-07-15 revision
 **Related:** ADR 0001, ADR 0002, `docs/superpowers/specs/2026-07-16-hermes-codex-option-c-design.md`
@@ -78,6 +78,30 @@ older objective.
 Historical Runner/tmux `taskId` values remain audit references only. They are
 never promoted into App Server thread continuity.
 
+An App Server upgrade or state loss may leave HCO with a durable thread binding
+that the server can prove no longer exists. HCO may replace that binding once,
+and must update the objective plus every related `CODEX_BOUND` topic in one
+transaction. Recovery is authorized only by the installed App Server's exact
+missing-thread response for the requested ID; transport errors, timeouts,
+generic protocol errors, and message near-matches remain reconciliation-only.
+The replacement preserves the original turn text and client message ID and
+records both thread IDs. An uncertain replacement `thread/start` requires an
+explicit operator binding and is never attempted again automatically. A
+maintainer or administrator performs that binding from the objective's mapped
+numeric stream with the exact command:
+
+```text
+/codex thread bind <objectiveId> <threadId>
+```
+
+HCO revalidates the stream route, objective ownership, ACL, and trusted source
+Zulip message ID before changing state. The source message ID is the durable
+idempotency key. A repeated command may resume the saved turn only while the
+database still proves `execution_status=submitting`,
+`submission_state=intent`, `turn_id IS NULL`, and no reconciliation fence. HCO
+marks the submission unknown immediately before the external `turn/start` call;
+after that fence, command replay never sends the turn again automatically.
+
 ## Consequences
 
 - Channel renames do not move work to another project.
@@ -92,4 +116,6 @@ never promoted into App Server thread continuity.
 Tests must cover numeric-ID authority, authenticated name migration, generic
 stream routing, all topic transitions, thread-start failure, atomic
 `CODEX_BOUND` persistence, duplicate inbound events, natural-language control,
-and restart recovery of objective/thread bindings.
+restart recovery of objective/thread bindings, maintainer-only operator binding,
+cross-project rejection, source-message conflicts, known-never-sent crash
+resumption, and post-fence no-resend behavior.

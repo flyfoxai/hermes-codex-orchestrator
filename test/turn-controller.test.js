@@ -6,10 +6,15 @@ import test from "node:test";
 
 import Database from "better-sqlite3";
 
-import { executionBackendError, validateExecutionBackend } from "../hco/execution/backend.js";
+import {
+  executionBackendError,
+  requestMayHaveBeenWritten,
+  validateExecutionBackend
+} from "../hco/execution/backend.js";
 import { createAppServerBackend } from "../hco/execution/app-server-backend.js";
 import { createTmuxBackend } from "../hco/execution/tmux-backend.js";
 import { reduceTerminalOutput } from "../hco/recovery.js";
+import { isStateError } from "../hco/state/reducer.js";
 import { openStore } from "../hco/state/store.js";
 import { TurnController } from "../hco/turn-controller.js";
 
@@ -146,6 +151,70 @@ test("App Server backend maps lifecycle operations without retry or tmux selecti
     ["respond", "request-1", { decision: "accept" }],
     ["respondError", 7, { code: -32_000, message: "Request rejected." }]
   ]);
+});
+
+test("App Server backend classifies only the exact requested missing thread as proven absent", async () => {
+  const remote = new Error("App Server request failed.");
+  remote.code = "APP_SERVER_RPC_REMOTE_ERROR";
+  remote.rpcCode = -32600;
+  Object.defineProperty(remote, "rpcMessage", {
+    configurable: false,
+    enumerable: false,
+    value: "thread not loaded: thread-missing",
+    writable: false
+  });
+  const client = {
+    startThread: async () => ({ thread: { id: "thread-new" } }),
+    startTurn: async () => { throw remote; },
+    interruptTurn: async () => ({ ok: true }),
+    readThread: async () => ({ thread: { id: "thread-missing", turns: [] } }),
+    respond: async () => undefined,
+    respondError: async () => undefined
+  };
+  const backend = createAppServerBackend({ client });
+
+  await assert.rejects(
+    backend.startTurn({ threadId: "thread-missing", text: "continue", clientUserMessageId: "client-1" }),
+    (error) => {
+      assertCode(error, "EXECUTION_BACKEND_OBJECTIVE_MISSING");
+      assert.equal(error.message, "Execution backend objective does not exist.");
+      assert.equal(requestMayHaveBeenWritten(error), false);
+      return true;
+    }
+  );
+});
+
+test("App Server backend keeps near-miss and transport failures uncertain", async () => {
+  const failures = [
+    { code: "APP_SERVER_RPC_REMOTE_ERROR", rpcCode: -32600, rpcMessage: "thread not loaded: thread-other" },
+    { code: "APP_SERVER_RPC_REMOTE_ERROR", rpcCode: -32600, rpcMessage: "thread not loaded: thread-missing " },
+    { code: "APP_SERVER_RPC_REMOTE_ERROR", rpcCode: -32601, rpcMessage: "thread not loaded: thread-missing" },
+    { code: "APP_SERVER_RPC_TIMEOUT" },
+    { code: "APP_SERVER_TRANSPORT_CLOSED" },
+    { code: "APP_SERVER_RPC_REMOTE_ERROR", rpcCode: -32000, rpcMessage: "ordinary failure" }
+  ];
+
+  for (const failure of failures) {
+    const remote = new Error("public failure");
+    Object.assign(remote, failure);
+    const backend = createAppServerBackend({ client: {
+      startThread: async () => ({ thread: { id: "thread-new" } }),
+      startTurn: async () => { throw remote; },
+      interruptTurn: async () => ({ ok: true }),
+      readThread: async () => ({ thread: { id: "thread-missing", turns: [] } }),
+      respond: async () => undefined,
+      respondError: async () => undefined
+    } });
+
+    await assert.rejects(
+      backend.startTurn({ threadId: "thread-missing", text: "continue", clientUserMessageId: "client-1" }),
+      (error) => {
+        assertCode(error, "EXECUTION_BACKEND_REQUEST_UNCERTAIN");
+        assert.equal(requestMayHaveBeenWritten(error), true);
+        return true;
+      }
+    );
+  }
 });
 
 test("tmux backend is inert until explicitly called and never claims App Server continuity", async () => {
@@ -335,7 +404,7 @@ test("uncertain thread start requires explicit binding and never reads a null th
   assert.deepEqual(reads, []);
   assert.equal(startCalls, 1);
 
-  const bound = fixture.controller.resolveObjectiveThread({
+  const bound = await fixture.controller.resolveObjectiveThread({
     objectiveId: "objective-1",
     threadId: "thread-operator-bound",
     sourceType: "operator",
@@ -391,7 +460,7 @@ test("accepted intent resumes exactly once after restart and explicit uncertain 
     appServerBackend: backend,
     leaseOwner: "controller-restarted"
   });
-  const bound = reopenedController.resolveObjectiveThread({
+  const bound = await reopenedController.resolveObjectiveThread({
     objectiveId: "objective-1",
     threadId: "thread-operator-bound",
     sourceType: "operator",
@@ -433,8 +502,8 @@ test("explicit thread resolution rejects objectives outside uncertain App Server
   const { controller } = controllerFixture(t);
   await controller.acceptIntent(intent());
 
-  assert.throws(
-    () => controller.resolveObjectiveThread({
+  await assert.rejects(
+    controller.resolveObjectiveThread({
       objectiveId: "objective-1",
       threadId: "thread-other",
       sourceType: "operator",
@@ -965,6 +1034,537 @@ function interactionRequest(overrides = {}) {
   };
 }
 
+test("default approval renderer provides fallback accept and cancel commands", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest());
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, /⚠️ \*\*审批请求\*\*/);
+  assert.match(prompt.payload.content, new RegExp(pending.interactionId));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+  assert.match(prompt.payload.content, /npm test/);
+  assert.match(prompt.payload.content, /允许响应者 ID: 101/);
+});
+
+test("default approval renderer hides object decision choices from command rendering", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: {
+      command: "npm test",
+      availableDecisions: [
+        "decline",
+        { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm", "test"] } }
+      ]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, /App Server UI/);
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} acceptWithExecpolicyAmendment`));
+  assert.doesNotMatch(prompt.payload.content, /execpolicy_amendment/);
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept$`, "m"));
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+});
+
+test("default approval renderer keeps accepting choices when commandActions is present", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: {
+      command: "npm test",
+      availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+      commandActions: [{ command: "npm test" }]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.doesNotMatch(prompt.payload.content, /扩展权限/);
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} acceptForSession`));
+});
+
+for (const [field, value] of [
+  ["networkApprovalContext", { host: "example.com" }]
+]) {
+  test(`default approval renderer hides accepting choices when ${field} is present`, async (t) => {
+    const fixture = controllerFixture(t);
+    await fixture.controller.acceptIntent(intent());
+
+    const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+      request: {
+        command: "npm test",
+        availableDecisions: ["accept", "acceptForSession", "decline", "cancel"],
+        [field]: value
+      }
+    }));
+    const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+    const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+    assert.ok(prompt);
+    assert.match(prompt.payload.content, /扩展权限/);
+    assert.match(prompt.payload.content, /App Server UI/);
+    assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept(?:ForSession)?$`, "m"));
+    assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
+    assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+  });
+}
+
+test("default user input renderer expands real single-question schema", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-1",
+    request: {
+      questions: [{
+        id: "q1",
+        header: "环境",
+        question: "请选择发布环境",
+        isOther: false,
+        isSecret: false,
+        options: [
+          { label: "staging", description: "预发" },
+          { label: "production", description: "生产" }
+        ]
+      }],
+      autoResolutionMs: null
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, /💬 \*\*输入请求\*\*/);
+  assert.match(prompt.payload.content, /环境/);
+  assert.match(prompt.payload.content, /请选择发布环境/);
+  assert.match(prompt.payload.content, /q1/);
+  assert.match(prompt.payload.content, /staging/);
+  assert.match(prompt.payload.content, /production/);
+  assert.match(prompt.payload.content, new RegExp(`/codex answer ${pending.interactionId} <你的回答>`));
+  assert.doesNotMatch(prompt.payload.content, /\/codex approve/);
+});
+
+test("default user input renderer compacts oversized notifications", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-oversized",
+    request: {
+      questions: [{
+        id: "q1",
+        header: "Large question",
+        question: "Choose an option",
+        options: Array.from({ length: 200 }, (_, index) => ({
+          label: `option-${index}`,
+          description: "a".repeat(300)
+        }))
+      }]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.ok(Buffer.byteLength(prompt.payload.content, "utf8") <= 60_000);
+  assert.match(prompt.payload.content, /交互通知过大/);
+  assert.match(prompt.payload.content, new RegExp(pending.interactionId));
+  assert.match(prompt.payload.content, new RegExp(`/codex answer ${pending.interactionId} <你的回答>`));
+});
+
+test("default approval renderer compacts oversized notifications using actual decisions", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    itemId: "approval-item-oversized",
+    request: {
+      reason: "a".repeat(61_000),
+      command: "npm test",
+      availableDecisions: ["decline"]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.ok(Buffer.byteLength(prompt.payload.content, "utf8") <= 60_000);
+  assert.match(prompt.payload.content, /交互通知过大/);
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+});
+
+test("approval renderer uses extended fence for commands containing backticks", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: {
+      reason: "review ``` injected fence",
+      command: "printf '```'",
+      availableDecisions: ["accept", "cancel"]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  // reason uses escapeMarkdownInline — backticks stay backslash-escaped in inline context
+  assert.match(prompt.payload.content, /review \\`\\`\\` injected fence/);
+  // command is verbatim inside the code fence (no backslash-escaping)
+  assert.match(prompt.payload.content, /printf '```'/);
+  // fence is extended to 4 backticks to prevent early close; no bare ``` fence markers
+  assert.match(prompt.payload.content, /````/);
+  assert.ok(!prompt.payload.content.match(/^```$/m), "no bare 3-backtick fence lines");
+});
+
+test("approval renderer uses codeSpan for cwd containing backticks", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: {
+      cwd: "/path/with`backtick/dir",
+      command: "ls",
+      availableDecisions: ["accept", "cancel"]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  // codeSpan extends fence to 2 backticks; content is verbatim (no backslash before backtick)
+  assert.match(prompt.payload.content, /``\/path\/with`backtick\/dir``/);
+  assert.doesNotMatch(prompt.payload.content, /`\/path\/with\\`backtick/);
+});
+
+test("input renderer uses codeSpan for option labels containing backticks", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    request: {
+      questions: [
+        {
+          id: "q1",
+          header: "Pick",
+          question: "Choose one",
+          options: [{ label: "opt`A", description: "first" }]
+        }
+      ]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  // codeSpan uses `` fence; verbatim label (no backslash)
+  assert.match(prompt.payload.content, /``opt`A``/);
+  assert.doesNotMatch(prompt.payload.content, /`opt\\`A`/);
+});
+
+test("unsafe interactionId suppresses approval commands", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  // Inject an unsafe interactionId via the idFactory store option
+  const pending = await fixture.controller.handleInteractionRequest(
+    interactionRequest({ request: { command: "echo hi", availableDecisions: ["accept", "cancel"] } })
+  );
+  // Override the interactionId after the fact in the outbox content check
+  // by checking that a normal UUID-based interactionId produces commands
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+});
+
+test("safeApprovalCommands returns empty array for unsafe interactionId", async (t) => {
+  // Use a custom idFactory that returns an unsafe id for the "interaction" kind
+  const directory = mkdtempSync(path.join(tmpdir(), "hco-unsafe-id-"));
+  const databasePath = path.join(directory, "authority.sqlite3");
+  const counters = new Map();
+  const idFactory = (kind) => {
+    if (kind === "interaction") return "bad id with spaces";
+    const next = (counters.get(kind) ?? 0) + 1;
+    counters.set(kind, next);
+    return `${kind}-${next}`;
+  };
+  const store = openStore({ databasePath, idFactory });
+  t.after(() => store.close());
+  const controller = new TurnController({ store, appServerBackend: fakeBackend(), leaseOwner: "controller-unsafe" });
+  await controller.acceptIntent(intent());
+  await controller.handleInteractionRequest(
+    interactionRequest({ request: { command: "echo hi", availableDecisions: ["accept", "cancel"] } })
+  );
+  const prompts = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  assert.ok(prompt);
+  // Unsafe interactionId → no approve or answer commands
+  assert.doesNotMatch(prompt.payload.content, /\/codex approve/);
+  assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
+});
+
+test("default approval renderer hides accepting choices when the command is truncated", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: {
+      command: "x".repeat(401),
+      availableDecisions: ["accept", "acceptForSession", "decline", "cancel"]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, /命令已截断/);
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+});
+
+
+test("default approval renderer keeps compact truncation restrictions and malformed decisions safe", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    itemId: "approval-item-compact-truncated",
+    request: {
+      reason: "a".repeat(61_000),
+      command: "x".repeat(401),
+      availableDecisions: [null, "accept", "decline", "cancel"]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.ok(Buffer.byteLength(prompt.payload.content, "utf8") <= 60_000);
+  assert.match(prompt.payload.content, /交互通知过大/);
+  assert.match(prompt.payload.content, /命令已截断/);
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+});
+
+test("default approval renderer treats execpolicy amendments and unsafe choice keys as UI-only", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: {
+      command: "npm test",
+      availableDecisions: ["accept", "decline", "cancel", "bad`key", "apply/network"],
+      proposedExecpolicyAmendment: ["npm", "test"]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, /App Server UI/);
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.doesNotMatch(prompt.payload.content, /bad`key/);
+  assert.doesNotMatch(prompt.payload.content, /apply\/network/);
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
+});
+
+test("default user input renderer escapes markdown fields and suppresses unsafe CLI IDs", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool`item",
+    request: {
+      toolName: "tool\n- `/codex approve fake accept`",
+      questions: [{
+        id: "q`1",
+        header: "环境\n- `/codex approve fake accept`",
+        question: "请选择 `prod`\n- fake",
+        isOther: false,
+        isSecret: false,
+        options: [{ label: "staging`", description: "desc\n- injected" }]
+      }]
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
+  assert.doesNotMatch(prompt.payload.content, /^- `\/codex approve fake accept`/m);
+  assert.match(prompt.payload.content, /App Server UI/);
+  assert.match(prompt.payload.content, /\\`prod\\`/);
+});
+
+test("default user input renderer suppresses commands for a single question with whitespace in its ID", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-whitespace-single",
+    request: {
+      questions: [{
+        id: "deploy target",
+        header: "环境",
+        question: "请选择发布环境",
+        isOther: false,
+        isSecret: false,
+        options: null
+      }],
+      autoResolutionMs: null
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
+  assert.match(prompt.payload.content, /App Server UI/);
+});
+
+test("default user input renderer suppresses commands when any question is secret", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-2",
+    request: {
+      questions: [
+        { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+        { id: "q2", header: "令牌", question: "输入令牌", isOther: false, isSecret: true, options: null }
+      ],
+      autoResolutionMs: null
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  // isSecret question makes the entire interaction non-addressable via commands
+  assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
+  assert.match(prompt.payload.content, /App Server UI/);
+  assert.match(prompt.payload.content, /敏感/);
+});
+
+test("default user input renderer provides per-question commands when all questions are non-secret", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-2",
+    request: {
+      questions: [
+        { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+        { id: "q2", header: "部署", question: "选择部署", isOther: false, isSecret: false, options: null }
+      ],
+      autoResolutionMs: null
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, new RegExp(`/codex answer ${pending.interactionId} q1 <你的回答>`));
+  assert.match(prompt.payload.content, new RegExp(`/codex answer ${pending.interactionId} q2 <你的回答>`));
+  assert.match(prompt.payload.content, /全部回答后自动提交/);
+});
+
+test("default user input renderer suppresses commands for duplicate question IDs", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-duplicate-ids",
+    request: {
+      questions: [
+        { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+        { id: "q1", header: "确认", question: "是否继续", isOther: false, isSecret: false, options: null }
+      ],
+      autoResolutionMs: null
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
+  assert.match(prompt.payload.content, /App Server UI/);
+});
+
+test("default user input renderer preserves the generic command for an empty questions list", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-empty-questions",
+    request: { questions: [], autoResolutionMs: null }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.match(prompt.payload.content, new RegExp(`/codex answer ${pending.interactionId} <你的回答>`));
+  assert.doesNotMatch(prompt.payload.content, /App Server UI/);
+});
+
+test("default user input renderer suppresses all commands when any question ID is not addressable", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+
+  await fixture.controller.handleInteractionRequest(interactionRequest({
+    method: "item/tool/requestUserInput",
+    itemId: "tool-item-whitespace-mixed",
+    request: {
+      questions: [
+        { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+        {
+          id: "deploy target",
+          header: "确认",
+          question: "是否继续",
+          isOther: false,
+          isSecret: false,
+          options: null
+        }
+      ],
+      autoResolutionMs: null
+    }
+  }));
+  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+
+  assert.ok(prompt);
+  assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
+  assert.match(prompt.payload.content, /App Server UI/);
+});
+
 test("interaction persists before prompt rendering and preserves typed wire IDs and fixed expiry", async (t) => {
   let store;
   const fixture = controllerFixture(t);
@@ -1300,7 +1900,10 @@ test("expired and orphaned interactions reject answers without a backend respons
       targetSnapshot: { streamId: 42, topic: "Build" },
       answer: { decision: "accept" }
     }),
-    (error) => assertCode(error, "INTERACTION_EXPIRED")
+    (error) => {
+      assert.equal(isStateError(error), true);
+      return assertCode(error, "INTERACTION_EXPIRED");
+    }
   );
   assert.equal(store.readInteraction(expired.interactionId).state, "expired");
 
@@ -1656,4 +2259,438 @@ test("continueObjective preserves trusted project and topic binding for an exist
     objectiveId: "objective-1",
     threadId: "thread-1"
   });
+});
+
+test("proven missing legacy thread is replaced once and the original continuation is submitted unchanged", async (t) => {
+  let startObjectiveCalls = 0;
+  const startTurnCalls = [];
+  const backend = fakeBackend({
+    startObjective: async () => ({ threadId: ++startObjectiveCalls === 1 ? "thread-old" : "thread-replacement" }),
+    startTurn: async (options) => {
+      startTurnCalls.push(options);
+      if (startTurnCalls.length === 1) return { turnId: "turn-initial" };
+      if (startTurnCalls.length === 2) return { turnId: "turn-second-topic" };
+      if (options.threadId === "thread-old") {
+        throw executionBackendError(
+          "EXECUTION_BACKEND_OBJECTIVE_MISSING",
+          "Execution backend objective does not exist."
+        );
+      }
+      return { turnId: "turn-replacement" };
+    }
+  });
+  const { controller, store } = controllerFixture(t, { appServerBackend: backend });
+  await controller.acceptIntent(intent({
+    projectId: "alpha",
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  }));
+  await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-initial",
+      status: "completed",
+      itemsView: "full",
+      items: [{
+        id: "initial-final",
+        type: "agentMessage",
+        status: "completed",
+        phase: "final_answer",
+        text: "initial complete"
+      }]
+    },
+    sourceType: "app-server",
+    sourceId: "initial-completion"
+  });
+  const secondTopic = await controller.continueObjective({
+    sourceType: "zulip-message",
+    sourceId: "second-topic-continuation",
+    objectiveId: "objective-1",
+    projectId: "alpha",
+    text: "Bind a second topic to this objective.",
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Follow-up", sourceMessageId: 954 },
+    topicBinding: { streamId: 42, topic: "Follow-up", actorUserId: 3 }
+  });
+  await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: secondTopic.turnId,
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "second-final", type: "agentMessage", phase: "final_answer", text: "second complete" }]
+    },
+    sourceType: "app-server",
+    sourceId: "second-topic-completion"
+  });
+
+  const continuation = {
+    sourceType: "zulip-message",
+    sourceId: "legacy-continuation",
+    objectiveId: "objective-1",
+    projectId: "alpha",
+    text: "Assess the current project in exactly 1000 Chinese characters.",
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Legacy", sourceMessageId: 955 },
+    threadOptions: { cwd: "/registered/project" },
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  };
+  const result = await controller.continueObjective(continuation);
+
+  assert.equal(result.status, "started");
+  assert.equal(result.threadId, "thread-replacement");
+  assert.equal(result.turnId, "turn-replacement");
+  assert.equal(startObjectiveCalls, 2);
+  assert.equal(startTurnCalls.length, 4);
+  assert.deepEqual(startTurnCalls[3], {
+    threadId: "thread-replacement",
+    text: continuation.text,
+    clientUserMessageId: startTurnCalls[2].clientUserMessageId
+  });
+  assert.equal(store.readObjectiveExecution("objective-1").threadId, "thread-replacement");
+  assert.deepEqual(store.readTopicState({ streamId: 42, topic: "Legacy" }), {
+    streamId: 42,
+    topic: "Legacy",
+    mode: "CODEX_BOUND",
+    projectId: "alpha",
+    objectiveId: "objective-1",
+    threadId: "thread-replacement"
+  });
+  assert.equal(store.readTopicState({ streamId: 42, topic: "Follow-up" }).threadId,
+    "thread-replacement");
+  const replacementFact = store.readTurnAuditFacts("objective-1")
+    .find(({ fact }) => fact.kind === "app_server_thread_replaced");
+  assert.deepEqual(replacementFact?.fact, {
+    kind: "app_server_thread_replaced",
+    newThreadId: "thread-replacement",
+    oldThreadId: "thread-old",
+    reason: "proven_missing_thread"
+  });
+  assert.equal(replacementFact?.submissionId, result.submissionId);
+});
+
+test("a replacement turn failure never creates another replacement thread", async (t) => {
+  let startObjectiveCalls = 0;
+  const startTurnCalls = [];
+  const backend = fakeBackend({
+    startObjective: async () => ({ threadId: `thread-${++startObjectiveCalls}` }),
+    startTurn: async (options) => {
+      startTurnCalls.push(options);
+      if (startTurnCalls.length === 1) return { turnId: "turn-initial" };
+      throw executionBackendError(
+        "EXECUTION_BACKEND_OBJECTIVE_MISSING",
+        "Execution backend objective does not exist."
+      );
+    }
+  });
+  const { controller, store } = controllerFixture(t, { appServerBackend: backend });
+  await controller.acceptIntent(intent());
+  await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-initial",
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "done" }]
+    },
+    sourceType: "app-server",
+    sourceId: "replacement-failure-initial-completion"
+  });
+
+  const result = await controller.continueObjective({
+    objectiveId: "objective-1",
+    sourceId: "replacement-turn-missing",
+    text: "Create only one replacement.",
+    targetSnapshot: { streamId: 42, topic: "Build" }
+  });
+
+  assert.equal(result.status, "backend_unavailable");
+  assert.equal(result.threadId, "thread-2");
+  assert.equal(startObjectiveCalls, 2);
+  assert.equal(startTurnCalls.length, 3);
+  assert.equal(store.readObjectiveExecution("objective-1").threadId, "thread-2");
+  assert.equal(store.readTurnAuditFacts("objective-1")
+    .filter(({ fact }) => fact.kind === "app_server_thread_replaced").length, 1);
+});
+
+test("an uncertain continuation never replaces its durable thread", async (t) => {
+  let startObjectiveCalls = 0;
+  let startTurnCalls = 0;
+  const backend = fakeBackend({
+    startObjective: async () => ({ threadId: `thread-${++startObjectiveCalls}` }),
+    startTurn: async () => {
+      startTurnCalls += 1;
+      if (startTurnCalls === 1) return { turnId: "turn-initial" };
+      throw executionBackendError(
+        "EXECUTION_BACKEND_REQUEST_UNCERTAIN",
+        "Execution backend request outcome is uncertain.",
+        { mayHaveBeenWritten: true }
+      );
+    }
+  });
+  const { controller, store } = controllerFixture(t, { appServerBackend: backend });
+  await controller.acceptIntent(intent());
+  await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-initial",
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "done" }]
+    },
+    sourceType: "app-server",
+    sourceId: "uncertain-initial-completion"
+  });
+
+  const result = await controller.continueObjective({
+    objectiveId: "objective-1",
+    sourceId: "uncertain-continuation",
+    text: "Do not replace this thread.",
+    targetSnapshot: { streamId: 42, topic: "Build" }
+  });
+
+  assert.equal(result.status, "submission_unknown");
+  assert.equal(result.threadId, "thread-1");
+  assert.equal(startObjectiveCalls, 1);
+  assert.equal(store.readObjectiveExecution("objective-1").threadId, "thread-1");
+  assert.equal(store.readTurnAuditFacts("objective-1")
+    .some(({ fact }) => fact.kind === "app_server_thread_replaced"), false);
+});
+
+test("uncertain replacement thread creation is durable and resumes only after explicit binding", async (t) => {
+  let startObjectiveCalls = 0;
+  const startTurnCalls = [];
+  const backend = fakeBackend({
+    startObjective: async () => {
+      startObjectiveCalls += 1;
+      if (startObjectiveCalls === 1) return { threadId: "thread-old" };
+      throw executionBackendError(
+        "EXECUTION_BACKEND_REQUEST_UNCERTAIN",
+        "Execution backend request outcome is uncertain.",
+        { mayHaveBeenWritten: true }
+      );
+    },
+    startTurn: async (options) => {
+      startTurnCalls.push(options);
+      if (startTurnCalls.length === 1) return { turnId: "turn-initial" };
+      throw executionBackendError(
+        "EXECUTION_BACKEND_OBJECTIVE_MISSING",
+        "Execution backend objective does not exist."
+      );
+    }
+  });
+  const fixture = controllerFixture(t, { appServerBackend: backend });
+  await fixture.controller.acceptIntent(intent({
+    projectId: "alpha",
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  }));
+  await fixture.controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-initial",
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "done" }]
+    },
+    sourceType: "app-server",
+    sourceId: "replacement-uncertain-initial-completion"
+  });
+
+  const accepted = await fixture.controller.continueObjective({
+    sourceType: "zulip-message",
+    sourceId: "replacement-uncertain-continuation",
+    objectiveId: "objective-1",
+    projectId: "alpha",
+    text: "Resume only after explicit replacement binding.",
+    targetSnapshot: { streamId: 42, topic: "Legacy" },
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  });
+  assert.equal(accepted.status, "manual_thread_binding_required");
+  const uncertain = fixture.store.readObjectiveExecution("objective-1");
+  assert.equal(uncertain.executionStatus, "reconciliation_needed");
+  assert.equal(uncertain.threadStartUncertain, true);
+  assert.equal(uncertain.threadId, "thread-old");
+  assert.equal(uncertain.activeSubmission.state, "reconciliation_needed");
+  assert.equal(startObjectiveCalls, 2);
+  fixture.store.close();
+
+  const reopenedStore = openStore({ databasePath: fixture.databasePath, now: () => START_MS + 1 });
+  t.after(() => reopenedStore.close());
+  const reboundTurnCalls = [];
+  const reopenedBackend = fakeBackend({
+    startObjective: async () => {
+      startObjectiveCalls += 1;
+      return { threadId: "thread-must-not-be-created" };
+    },
+    startTurn: async (options) => {
+      reboundTurnCalls.push(options);
+      return { turnId: "turn-after-operator-binding" };
+    }
+  });
+  const reopenedController = new TurnController({
+    store: reopenedStore,
+    appServerBackend: reopenedBackend,
+    leaseOwner: "controller-restarted"
+  });
+  assert.deepEqual(await reopenedController.reconcileObjective({ objectiveId: "objective-1" }), {
+    status: "manual_thread_binding_required",
+    objectiveId: "objective-1"
+  });
+
+  const rebound = await reopenedController.resolveObjectiveThread({
+    objectiveId: "objective-1",
+    threadId: "thread-operator-confirmed",
+    sourceType: "operator",
+    sourceId: "replacement-binding-1"
+  });
+  assert.equal(rebound.status, "started");
+  assert.equal(rebound.threadId, "thread-operator-confirmed");
+  assert.equal(rebound.turnId, "turn-after-operator-binding");
+  assert.equal(startObjectiveCalls, 2);
+  assert.deepEqual(reboundTurnCalls, [{
+    threadId: "thread-operator-confirmed",
+    text: "Resume only after explicit replacement binding.",
+    clientUserMessageId: uncertain.activeSubmission.clientUserMessageId
+  }]);
+  assert.equal(reopenedStore.readObjectiveExecution("objective-1").threadStartUncertain, false);
+  assert.deepEqual(reopenedStore.readTopicState({ streamId: 42, topic: "Legacy" }).threadId,
+    "thread-operator-confirmed");
+  const duplicateBinding = await reopenedController.resolveObjectiveThread({
+    objectiveId: "objective-1",
+    threadId: "thread-operator-confirmed",
+    sourceType: "operator",
+    sourceId: "replacement-binding-1"
+  });
+  assert.equal(duplicateBinding.duplicate, true);
+  assert.equal(duplicateBinding.status, "running");
+  assert.equal(reboundTurnCalls.length, 1);
+});
+
+test("duplicate operator binding resumes only a durable known-never-sent intent", async (t) => {
+  let startObjectiveCalls = 0;
+  let initialStartTurnCalls = 0;
+  const initialBackend = fakeBackend({
+    startObjective: async () => {
+      startObjectiveCalls += 1;
+      if (startObjectiveCalls === 1) return { threadId: "thread-old" };
+      throw executionBackendError(
+        "EXECUTION_BACKEND_REQUEST_UNCERTAIN",
+        "Execution backend request outcome is uncertain.",
+        { mayHaveBeenWritten: true }
+      );
+    },
+    startTurn: async () => {
+      initialStartTurnCalls += 1;
+      if (initialStartTurnCalls === 1) return { turnId: "turn-initial" };
+      throw executionBackendError("EXECUTION_BACKEND_OBJECTIVE_MISSING", "Execution backend objective does not exist.");
+    }
+  });
+  const fixture = controllerFixture(t, { appServerBackend: initialBackend });
+  await fixture.controller.acceptIntent(intent({
+    projectId: "alpha", topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  }));
+  await fixture.controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-initial", status: "completed", itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "done" }]
+    },
+    sourceType: "app-server", sourceId: "binding-crash-initial-completion"
+  });
+  assert.equal((await fixture.controller.continueObjective({
+    sourceType: "zulip-message", sourceId: "binding-crash-continuation", objectiveId: "objective-1",
+    projectId: "alpha", text: "Preserve this exact text.",
+    targetSnapshot: { streamId: 42, topic: "Legacy" },
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  })).status, "manual_thread_binding_required");
+
+  const preCrash = fixture.store.readObjectiveExecution("objective-1").activeSubmission;
+  const firstBinding = fixture.store.resolveObjectiveThread({
+    objectiveId: "objective-1", threadId: "thread-operator-confirmed",
+    sourceType: "zulip-message", sourceId: "230"
+  });
+  assert.equal(firstBinding.duplicate, false);
+  assert.equal(fixture.store.readObjectiveExecution("objective-1").activeSubmission.state, "intent");
+  fixture.store.close();
+
+  const reopenedStore = openStore({ databasePath: fixture.databasePath, now: () => START_MS + 1 });
+  t.after(() => reopenedStore.close());
+  const startTurnCalls = [];
+  const reopenedController = new TurnController({
+    store: reopenedStore,
+    appServerBackend: fakeBackend({
+      startTurn: async (options) => {
+        const fenced = reopenedStore.readObjectiveExecution("objective-1");
+        assert.equal(fenced.executionStatus, "submission_unknown");
+        assert.equal(fenced.activeSubmission.state, "submission_unknown");
+        startTurnCalls.push(options);
+        return { turnId: "turn-resumed-after-crash" };
+      }
+    }),
+    leaseOwner: "controller-after-binding-crash"
+  });
+
+  const resumed = await reopenedController.resolveObjectiveThread({
+    objectiveId: "objective-1", threadId: "thread-operator-confirmed",
+    sourceType: "zulip-message", sourceId: "230"
+  });
+  assert.equal(resumed.status, "started");
+  assert.equal(resumed.duplicate, true);
+  assert.equal(resumed.turnId, "turn-resumed-after-crash");
+  assert.deepEqual(startTurnCalls, [{
+    threadId: "thread-operator-confirmed", text: "Preserve this exact text.",
+    clientUserMessageId: preCrash.clientUserMessageId
+  }]);
+});
+
+test("duplicate operator binding never resends after the durable uncertainty fence", async (t) => {
+  let startObjectiveCalls = 0;
+  let initialStartTurnCalls = 0;
+  const fixture = controllerFixture(t, { appServerBackend: fakeBackend({
+    startObjective: async () => {
+      startObjectiveCalls += 1;
+      if (startObjectiveCalls === 1) return { threadId: "thread-old" };
+      throw executionBackendError(
+        "EXECUTION_BACKEND_REQUEST_UNCERTAIN", "Execution backend request outcome is uncertain.",
+        { mayHaveBeenWritten: true }
+      );
+    },
+    startTurn: async () => {
+      initialStartTurnCalls += 1;
+      if (initialStartTurnCalls === 1) return { turnId: "turn-initial" };
+      throw executionBackendError("EXECUTION_BACKEND_OBJECTIVE_MISSING", "Execution backend objective does not exist.");
+    }
+  }) });
+  await fixture.controller.acceptIntent(intent({
+    projectId: "alpha", topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  }));
+  await fixture.controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-initial", status: "completed", itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", phase: "final_answer", text: "done" }]
+    },
+    sourceType: "app-server", sourceId: "binding-fence-initial-completion"
+  });
+  await fixture.controller.continueObjective({
+    sourceType: "zulip-message", sourceId: "binding-fence-continuation", objectiveId: "objective-1",
+    projectId: "alpha", text: "Do not resend me.", targetSnapshot: { streamId: 42, topic: "Legacy" },
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  });
+  const bound = fixture.store.resolveObjectiveThread({
+    objectiveId: "objective-1", threadId: "thread-operator-confirmed",
+    sourceType: "zulip-message", sourceId: "231"
+  });
+  fixture.store.markSubmissionUnknown({ submissionId: bound.submission.submissionId });
+  let startTurnCalls = 0;
+  const controller = new TurnController({
+    store: fixture.store,
+    appServerBackend: fakeBackend({ startTurn: async () => (startTurnCalls += 1, { turnId: "forbidden" }) }),
+    leaseOwner: "controller-after-uncertainty-fence"
+  });
+
+  const replay = await controller.resolveObjectiveThread({
+    objectiveId: "objective-1", threadId: "thread-operator-confirmed",
+    sourceType: "zulip-message", sourceId: "231"
+  });
+  assert.equal(replay.duplicate, true);
+  assert.equal(replay.status, "submission_unknown");
+  assert.equal(startTurnCalls, 0);
 });

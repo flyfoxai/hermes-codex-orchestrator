@@ -202,6 +202,7 @@ function mapInteractionRow(row) {
     expiresAt: row.expires_at_ms,
     state: row.state,
     answer: answerJson === null ? null : JSON.parse(answerJson),
+    partialAnswers: row.partial_answers_json === null ? null : JSON.parse(row.partial_answers_json),
     answeredById: answeredById === null ? null : Number(answeredById),
     answeredAt,
     responseDeliveryState: row.response_delivery_state,
@@ -406,6 +407,30 @@ function createTransactions(db, nowProvider, idFactory) {
       incrementGeneration(now);
     }
     return changed;
+  }
+
+  function pendingMissingThreadReplacement({ objectiveId, submissionId, expectedOldThreadId }) {
+    const execution = db.prepare("SELECT * FROM objective_execution WHERE objective_id = ?").get(objectiveId);
+    const submission = db.prepare("SELECT * FROM turn_submissions WHERE submission_id = ?").get(submissionId);
+    if (!execution || execution.backend !== "app-server" || execution.execution_status !== "submitting" ||
+        execution.backend_objective_started !== 1 || execution.thread_start_uncertain !== 0 ||
+        execution.app_server_thread_id !== expectedOldThreadId || !submission ||
+        submission.objective_id !== objectiveId || submission.submission_state !== "intent" ||
+        submission.turn_id !== null || submission.reconciliation_required !== 0) {
+      throw stateError("OBJECTIVE_THREAD_REPLACEMENT_INVALID", "Objective thread replacement is invalid.");
+    }
+    const active = db.prepare(`
+      SELECT submission_id FROM turn_submissions
+      WHERE objective_id = ? AND submission_state IN ('intent', 'running', 'submission_unknown', 'reconciliation_needed')
+    `).all(objectiveId);
+    if (active.length !== 1 || active[0].submission_id !== submissionId) {
+      throw stateError("OBJECTIVE_THREAD_REPLACEMENT_INVALID", "Objective thread replacement is invalid.");
+    }
+    const topics = db.prepare("SELECT mode, thread_id FROM topic_modes WHERE objective_id = ?").all(objectiveId);
+    if (topics.some((topic) => topic.mode !== "CODEX_BOUND" || topic.thread_id !== expectedOldThreadId)) {
+      throw stateError("OBJECTIVE_THREAD_REPLACEMENT_INVALID", "Objective thread replacement is invalid.");
+    }
+    return { execution, submission, topics };
   }
 
   const ingest = db.transaction((validated) => {
@@ -772,21 +797,118 @@ function createTransactions(db, nowProvider, idFactory) {
     return readExecution(db, objectiveId);
   });
 
+  const replaceMissingObjectiveThread = db.transaction(({
+    objectiveId,
+    submissionId,
+    expectedOldThreadId,
+    newThreadId
+  }) => {
+    const pending = pendingMissingThreadReplacement({ objectiveId, submissionId, expectedOldThreadId });
+    if (newThreadId === expectedOldThreadId || db.prepare(`
+      SELECT objective_id FROM objective_execution WHERE app_server_thread_id = ?
+    `).get(newThreadId)) {
+      throw stateError("OBJECTIVE_THREAD_REPLACEMENT_INVALID", "Objective thread replacement is invalid.");
+    }
+
+    const now = assertNow(nowProvider);
+    db.prepare(`
+      UPDATE objective_execution
+      SET app_server_thread_id = ?, updated_at_ms = ?
+      WHERE objective_id = ?
+    `).run(newThreadId, now, objectiveId);
+    const changedTopics = db.prepare(`
+      UPDATE topic_modes SET thread_id = ?, updated_at_ms = ? WHERE objective_id = ?
+    `).run(newThreadId, now, objectiveId).changes;
+    db.prepare(`
+      INSERT INTO turn_audit_facts (
+        fact_id, source_type, source_id, objective_id, submission_id, fact_json, recorded_at_ms
+      ) VALUES (?, 'app-server-recovery', ?, ?, ?, ?, ?)
+    `).run(
+      assertId(idFactory, "turn-audit-fact"),
+      assertId(idFactory, "thread-replacement-audit"),
+      objectiveId,
+      submissionId,
+      canonicalJson({
+        kind: "app_server_thread_replaced",
+        newThreadId,
+        oldThreadId: expectedOldThreadId,
+        reason: "proven_missing_thread"
+      }),
+      now
+    );
+    if (changedTopics > 0) incrementGeneration(now);
+    return {
+      execution: readExecution(db, objectiveId),
+      submission: mapSubmissionRow(pending.submission)
+    };
+  });
+
+  const markReplacementThreadStartUncertain = db.transaction(({
+    objectiveId,
+    submissionId,
+    expectedOldThreadId
+  }) => {
+    const pending = pendingMissingThreadReplacement({ objectiveId, submissionId, expectedOldThreadId });
+    const now = assertNow(nowProvider);
+    assertSubmissionTransition(pending.submission.submission_state, "reconciliation_needed", { mode: "reconciliation" });
+    assertExecutionTransition(pending.execution.execution_status, "reconciliation_needed", { mode: "reconciliation" });
+    db.prepare(`
+      UPDATE turn_submissions
+      SET submission_state = 'reconciliation_needed', reconciliation_required = 1, updated_at_ms = ?
+      WHERE submission_id = ?
+    `).run(now, submissionId);
+    db.prepare(`
+      UPDATE objective_execution
+      SET execution_status = 'reconciliation_needed', thread_start_uncertain = 1, updated_at_ms = ?
+      WHERE objective_id = ?
+    `).run(now, objectiveId);
+    db.prepare(`
+      INSERT INTO turn_audit_facts (
+        fact_id, source_type, source_id, objective_id, submission_id, fact_json, recorded_at_ms
+      ) VALUES (?, 'app-server-recovery', ?, ?, ?, ?, ?)
+    `).run(
+      assertId(idFactory, "turn-audit-fact"),
+      assertId(idFactory, "thread-replacement-uncertain-audit"),
+      objectiveId,
+      submissionId,
+      canonicalJson({
+        kind: "app_server_thread_replacement_uncertain",
+        oldThreadId: expectedOldThreadId,
+        reason: "replacement_thread_start_uncertain"
+      }),
+      now
+    );
+    return readExecution(db, objectiveId);
+  });
+
   const resolveObjectiveThread = db.transaction(({ objectiveId, threadId, sourceType, sourceId }) => {
     const resolutionFact = canonicalJson({ kind: "operator_thread_binding", threadId });
     const existingSource = db.prepare(`
-      SELECT objective_id, fact_json FROM turn_audit_facts WHERE source_type = ? AND source_id = ?
+      SELECT objective_id, submission_id, fact_json
+      FROM turn_audit_facts WHERE source_type = ? AND source_id = ?
     `).get(sourceType, sourceId);
     if (existingSource) {
       if (existingSource.objective_id !== objectiveId || existingSource.fact_json !== resolutionFact) {
         throw stateError("OBJECTIVE_THREAD_RESOLUTION_SOURCE_CONFLICT", "Objective thread resolution source identity conflicts with durable state.");
       }
-      return { duplicate: true, execution: readExecution(db, objectiveId) };
+      const execution = readExecution(db, objectiveId);
+      const submission = existingSource.submission_id === null ? null : db.prepare(`
+        SELECT * FROM turn_submissions WHERE submission_id = ?
+      `).get(existingSource.submission_id);
+      const safeToResume = execution?.executionStatus === "submitting" &&
+        execution.threadId === threadId && execution.threadStartUncertain === false &&
+        submission?.objective_id === objectiveId && submission.submission_state === "intent" &&
+        submission.turn_id === null && submission.reconciliation_required === 0;
+      return {
+        duplicate: true,
+        execution,
+        submission: safeToResume ? mapSubmissionRow(submission) : null
+      };
     }
 
     const row = db.prepare("SELECT * FROM objective_execution WHERE objective_id = ?").get(objectiveId);
     if (!row || row.backend !== "app-server" || row.execution_status !== "reconciliation_needed" ||
-        row.thread_start_uncertain !== 1 || row.app_server_thread_id !== null) {
+        row.thread_start_uncertain !== 1) {
       throw stateError("OBJECTIVE_THREAD_RESOLUTION_INVALID", "Objective thread resolution is invalid.");
     }
     const existingThread = db.prepare(`
@@ -797,20 +919,62 @@ function createTransactions(db, nowProvider, idFactory) {
     }
 
     const now = assertNow(nowProvider);
-    assertExecutionTransition(row.execution_status, "ready", { mode: "reconciliation" });
+    const replacementRecovery = row.app_server_thread_id !== null;
+    let submission = null;
+    if (replacementRecovery) {
+      submission = db.prepare(`
+        SELECT * FROM turn_submissions
+        WHERE objective_id = ? AND submission_state = 'reconciliation_needed' AND turn_id IS NULL
+      `).get(objectiveId);
+      const topics = db.prepare("SELECT mode, thread_id FROM topic_modes WHERE objective_id = ?").all(objectiveId);
+      if (!submission || submission.reconciliation_required !== 1 ||
+          topics.some((topic) => topic.mode !== "CODEX_BOUND" || topic.thread_id !== row.app_server_thread_id)) {
+        throw stateError("OBJECTIVE_THREAD_RESOLUTION_INVALID", "Objective thread resolution is invalid.");
+      }
+      assertSubmissionTransition(submission.submission_state, "intent", { mode: "reconciliation" });
+      assertExecutionTransition(row.execution_status, "submitting", { mode: "reconciliation" });
+    } else {
+      const active = db.prepare(`
+        SELECT 1 FROM turn_submissions
+        WHERE objective_id = ? AND submission_state IN ('intent', 'running', 'submission_unknown', 'reconciliation_needed')
+      `).get(objectiveId);
+      if (active) throw stateError("OBJECTIVE_THREAD_RESOLUTION_INVALID", "Objective thread resolution is invalid.");
+      assertExecutionTransition(row.execution_status, "ready", { mode: "reconciliation" });
+    }
     db.prepare(`
       INSERT INTO turn_audit_facts (
         fact_id, source_type, source_id, objective_id, submission_id, fact_json, recorded_at_ms
-      ) VALUES (?, ?, ?, ?, NULL, ?, ?)
-    `).run(assertId(idFactory, "turn-audit-fact"), sourceType, sourceId, objectiveId, resolutionFact, now);
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      assertId(idFactory, "turn-audit-fact"), sourceType, sourceId, objectiveId,
+      submission?.submission_id ?? null, resolutionFact, now
+    );
     db.prepare(`
       UPDATE objective_execution
-      SET execution_status = 'ready', backend_objective_started = 1,
+      SET execution_status = ?, backend_objective_started = 1,
           app_server_thread_id = ?, thread_start_uncertain = 0, updated_at_ms = ?
       WHERE objective_id = ?
-    `).run(threadId, now, objectiveId);
-    promoteObjectiveTopics(objectiveId, threadId, now);
-    return { duplicate: false, execution: readExecution(db, objectiveId) };
+    `).run(replacementRecovery ? "submitting" : "ready", threadId, now, objectiveId);
+    if (replacementRecovery) {
+      db.prepare(`
+        UPDATE turn_submissions
+        SET submission_state = 'intent', reconciliation_required = 0, updated_at_ms = ?
+        WHERE submission_id = ?
+      `).run(now, submission.submission_id);
+      const changedTopics = db.prepare(`
+        UPDATE topic_modes SET thread_id = ?, updated_at_ms = ? WHERE objective_id = ?
+      `).run(threadId, now, objectiveId).changes;
+      if (changedTopics > 0) incrementGeneration(now);
+    } else {
+      promoteObjectiveTopics(objectiveId, threadId, now);
+    }
+    return {
+      duplicate: false,
+      execution: readExecution(db, objectiveId),
+      submission: submission === null ? null : mapSubmissionRow(
+        db.prepare("SELECT * FROM turn_submissions WHERE submission_id = ?").get(submission.submission_id)
+      )
+    };
   });
 
   const applyRouteCommand = db.transaction((options) => {
@@ -1056,6 +1220,25 @@ function createTransactions(db, nowProvider, idFactory) {
     `).run(now, submissionId);
     db.prepare(`
       UPDATE objective_execution SET execution_status = 'submission_unknown', updated_at_ms = ? WHERE objective_id = ?
+    `).run(now, submission.objective_id);
+    return mapSubmissionRow(db.prepare("SELECT * FROM turn_submissions WHERE submission_id = ?").get(submissionId));
+  });
+
+  const rollbackSubmissionUnknown = db.transaction(({ submissionId }) => {
+    const now = assertNow(nowProvider);
+    const submission = db.prepare("SELECT * FROM turn_submissions WHERE submission_id = ?").get(submissionId);
+    if (!submission) throw stateError("TURN_SUBMISSION_NOT_FOUND", "Turn submission does not exist.");
+    if (submission.submission_state !== "submission_unknown") {
+      throw stateError("TURN_SUBMISSION_ROLLBACK_INVALID", "Cannot rollback: submission is not in unknown state.");
+    }
+    // Roll back to pending state
+    db.prepare(`
+      UPDATE turn_submissions
+      SET submission_state = 'pending', reconciliation_required = 0, updated_at_ms = ?
+      WHERE submission_id = ?
+    `).run(now, submissionId);
+    db.prepare(`
+      UPDATE objective_execution SET execution_status = 'running', updated_at_ms = ? WHERE objective_id = ?
     `).run(now, submission.objective_id);
     return mapSubmissionRow(db.prepare("SELECT * FROM turn_submissions WHERE submission_id = ?").get(submissionId));
   });
@@ -1625,7 +1808,8 @@ function createTransactions(db, nowProvider, idFactory) {
     db.prepare(`
       UPDATE pending_interactions
       SET state = 'answered', answer_json = ?, answered_by_id = ?, answered_at_ms = ?,
-          response_delivery_state = 'pending', response_delivery_updated_at_ms = ?, updated_at_ms = ?
+          partial_answers_json = NULL, response_delivery_state = 'pending',
+          response_delivery_updated_at_ms = ?, updated_at_ms = ?
       WHERE interaction_id = ?
     `).run(answerJson, String(responderId), now, now, now, interactionId);
     db.prepare(`
@@ -1638,6 +1822,25 @@ function createTransactions(db, nowProvider, idFactory) {
       duplicate: false,
       interaction: mapInteractionRow(db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId))
     };
+  });
+
+  const persistInteractionPartialAnswers = db.transaction(({ interactionId, partialAnswers }) => {
+    const row = db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId);
+    if (!row) throw stateError("INTERACTION_NOT_FOUND", "Interaction does not exist.");
+    if (row.state !== "pending") {
+      throw stateError("INTERACTION_ANSWER_CONFLICT", "Interaction is no longer pending.");
+    }
+    const now = assertNow(nowProvider);
+    if (now >= row.expires_at_ms) {
+      db.prepare(`
+        UPDATE pending_interactions SET state = 'expired', updated_at_ms = ? WHERE interaction_id = ?
+      `).run(now, interactionId);
+      throw stateError("INTERACTION_EXPIRED", "Interaction has expired.");
+    }
+    db.prepare(`
+      UPDATE pending_interactions SET partial_answers_json = ?, updated_at_ms = ? WHERE interaction_id = ?
+    `).run(canonicalJson(partialAnswers), now, interactionId);
+    return mapInteractionRow(db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId));
   });
 
   const recordInteractionResponseDelivery = db.transaction(({ interactionId, state }) => {
@@ -1667,7 +1870,7 @@ function createTransactions(db, nowProvider, idFactory) {
     const now = assertNow(nowProvider);
     const result = db.prepare(`
       UPDATE pending_interactions
-      SET state = 'orphaned', answer_json = NULL, answered_by_id = NULL,
+      SET state = 'orphaned', answer_json = NULL, partial_answers_json = NULL, answered_by_id = NULL,
           answered_at_ms = NULL, updated_at_ms = ?
       WHERE connection_id = ?
         AND (
@@ -1718,7 +1921,7 @@ function createTransactions(db, nowProvider, idFactory) {
     `).run(now);
     const orphaned = db.prepare(`
       UPDATE pending_interactions
-      SET state = 'orphaned', answer_json = NULL, answered_by_id = NULL,
+      SET state = 'orphaned', answer_json = NULL, partial_answers_json = NULL, answered_by_id = NULL,
           answered_at_ms = NULL, updated_at_ms = ?
       WHERE connection_id = ?
         AND (
@@ -1744,10 +1947,12 @@ function createTransactions(db, nowProvider, idFactory) {
     ingest,
     markBackendFailure,
     markConnectionLost,
+    markReplacementThreadStartUncertain,
     markSubmissionUnknown,
     markTurnReconciliationNeeded,
     nackOutbox,
     orphanInteractions,
+    persistInteractionPartialAnswers,
     prepareTurnSubmission,
     recordInteractionResponseDelivery,
     recordTurnAuditFact,
@@ -1755,7 +1960,9 @@ function createTransactions(db, nowProvider, idFactory) {
     reconcileTurnSubmission,
     requestCancellation,
     registerExecutionIntent,
+    replaceMissingObjectiveThread,
     resolveObjectiveThread,
+    rollbackSubmissionUnknown,
     setUserTopicMode,
     syncStaticRegistry
   };
@@ -1994,6 +2201,24 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
       }
       return transactions.bindBackendObjective.immediate({ ...options, threadId: options.threadId ?? null });
     },
+    replaceMissingObjectiveThread(options) {
+      if (!isPlainObject(options) ||
+          Object.keys(options).sort().join(",") !== "expectedOldThreadId,newThreadId,objectiveId,submissionId" ||
+          !requireText(options.objectiveId) || !requireText(options.submissionId) ||
+          !requireText(options.expectedOldThreadId) || !requireText(options.newThreadId)) {
+        throw stateError("OBJECTIVE_THREAD_REPLACEMENT_INVALID", "Objective thread replacement is invalid.");
+      }
+      return transactions.replaceMissingObjectiveThread.immediate(options);
+    },
+    markReplacementThreadStartUncertain(options) {
+      if (!isPlainObject(options) ||
+          Object.keys(options).sort().join(",") !== "expectedOldThreadId,objectiveId,submissionId" ||
+          !requireText(options.objectiveId) || !requireText(options.submissionId) ||
+          !requireText(options.expectedOldThreadId)) {
+        throw stateError("OBJECTIVE_THREAD_REPLACEMENT_INVALID", "Objective thread replacement is invalid.");
+      }
+      return transactions.markReplacementThreadStartUncertain.immediate(options);
+    },
     prepareTurnSubmission(options) {
       if (options === null || typeof options !== "object" || !requireText(options.sourceType) ||
           !requireText(options.sourceId) || !requireText(options.objectiveId) ||
@@ -2114,6 +2339,13 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
         throw stateError("INTERACTION_ANSWER_INVALID", "Interaction answer is invalid.");
       }
       return transactions.commitInteractionAnswer.immediate(options);
+    },
+    persistInteractionPartialAnswers(options) {
+      if (options === null || typeof options !== "object" || !requireText(options.interactionId) ||
+          !isPlainObject(options.partialAnswers)) {
+        throw stateError("INTERACTION_ANSWER_INVALID", "Partial interaction answer is invalid.");
+      }
+      return transactions.persistInteractionPartialAnswers.immediate(options);
     },
     recordInteractionResponseDelivery(options) {
       if (options === null || typeof options !== "object" || !requireText(options.interactionId) ||

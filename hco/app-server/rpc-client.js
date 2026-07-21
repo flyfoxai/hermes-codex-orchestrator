@@ -30,7 +30,26 @@ function ownedError(code) {
 
 function remoteError(payload) {
   const error = ownedError("APP_SERVER_RPC_REMOTE_ERROR");
-  error.rpcCode = payload.code;
+  Object.defineProperties(error, {
+    rpcCode: {
+      configurable: false,
+      enumerable: false,
+      value: payload.code,
+      writable: false
+    },
+    rpcMessage: {
+      configurable: false,
+      enumerable: false,
+      value: payload.message,
+      writable: false
+    },
+    rpcData: {
+      configurable: false,
+      enumerable: false,
+      value: payload.data,
+      writable: false
+    }
+  });
   return error;
 }
 

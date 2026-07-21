@@ -13,6 +13,7 @@ import { signContext } from "../hco/contracts/envelope.js";
 import { createRouteResolver, publishRouteSnapshot, validateRouteSnapshot } from "../hco/routes.js";
 import { createHcoService } from "../hco/service.js";
 import { MIGRATIONS } from "../hco/state/migrations.js";
+import { isStateError } from "../hco/state/reducer.js";
 import { openStore } from "../hco/state/store.js";
 import { TurnController } from "../hco/turn-controller.js";
 
@@ -38,7 +39,7 @@ test("Task 6 exports its control-plane surface and registers the next contiguous
   assert.equal(typeof publishRouteSnapshot, "function");
   assert.equal(typeof validateRouteSnapshot, "function");
   assert.equal(typeof createHcoService, "function");
-  assert.equal(MIGRATIONS.at(-1).name, "route_acl_control_plane");
+  assert.equal(MIGRATIONS.at(-1).name, "interaction_partial_answers");
   assert.equal(MIGRATIONS.at(-1).version, MIGRATIONS.at(-2).version + 1);
 });
 
@@ -325,9 +326,9 @@ test("v5 control-plane migration is contiguous and preserves v4 migration histor
   const { databasePath } = storeFixture(t);
   const db = new Database(databasePath, { readonly: true });
   t.after(() => db.close());
-  assert.equal(db.pragma("user_version", { simple: true }), 5);
+  assert.equal(db.pragma("user_version", { simple: true }), MIGRATIONS.at(-1).version);
   assert.equal(MIGRATIONS.at(-1).version, MIGRATIONS.at(-2).version + 1);
-  assert.deepEqual(db.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all().at(-1), {
+  assert.deepEqual(db.prepare("SELECT version, name FROM schema_migrations WHERE version = 5").get(), {
     version: 5,
     name: "route_acl_control_plane"
   });
@@ -338,6 +339,7 @@ test("v5 control-plane migration is contiguous and preserves v4 migration histor
     assert.equal(db.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?").get(table).count, 1);
   }
   assert.equal(db.prepare("SELECT count(*) AS count FROM interaction_answer_settlements").get().count, 0);
+  assert.ok(db.prepare("PRAGMA table_info(pending_interactions)").all().some((column) => column.name === "partial_answers_json"));
 });
 
 test("route commands are transactional, idempotent, generation-counted, and clear topic selections", (t) => {
@@ -408,7 +410,7 @@ test("trusted execution registration immutably binds project and atomically prom
 
 function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotTtlMs = 60_000 } = {}) {
   const fixture = storeFixture(t);
-  const calls = { accept: [], continue: [], cancel: [], answer: [], interaction: [], completion: [] };
+  const calls = { accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: [] };
   const config = Object.freeze({
     version: 1,
     databasePath: fixture.databasePath,
@@ -448,6 +450,13 @@ function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotT
       return Object.freeze({
         status: "started", objectiveId: options.objectiveId, submissionId: `continuation-${calls.continue.length}`,
         threadId: "thread-existing", turnId: `continued-turn-${calls.continue.length}`
+      });
+    },
+    async resolveObjectiveThread(options) {
+      calls.bind.push(options);
+      return Object.freeze({
+        status: "started", objectiveId: options.objectiveId, submissionId: "submission-bound",
+        clientUserMessageId: "client-bound", threadId: options.threadId, turnId: "turn-bound", duplicate: false
       });
     },
     async cancelObjective(options) {
@@ -524,6 +533,7 @@ function registryConfig(databasePath, assignments) {
 const registryTurnController = Object.freeze({
   async acceptIntent() { throw new Error("unexpected execution"); },
   async continueObjective() { throw new Error("unexpected continuation"); },
+  async resolveObjectiveThread() { throw new Error("unexpected binding"); },
   async cancelObjective() { throw new Error("unexpected cancellation"); },
   async answerInteraction() { throw new Error("unexpected answer"); },
   async handleInteractionRequest() { throw new Error("unexpected interaction"); },
@@ -823,7 +833,7 @@ test("bridge events validate exact fields, verify signed numeric bindings, and r
   mismatch.binding = { ...mismatch.binding, streamId: 43 };
   await assert.rejects(() => fixture.service.handleBridgeEvent(mismatch), { code: "CONTEXT_BINDING_MISMATCH" });
   assert.deepEqual(fixture.calls, {
-    accept: [], continue: [], cancel: [], answer: [], interaction: [], completion: []
+    accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: []
   });
 });
 
@@ -1109,10 +1119,10 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
     leaseOwner: "service-test"
   });
   fixture.store.acknowledgeTurnSubmission({ submissionId: prepared.submission.submissionId, turnId: "turn-commands" });
-  const createInteraction = (wireRequestId, method) => fixture.store.createInteraction({
+  const createInteraction = (wireRequestId, method, request) => fixture.store.createInteraction({
     connectionId: "connection-commands", wireRequestId, method,
     objectiveId: "objective-commands", threadId: "thread-commands", turnId: "turn-commands",
-    itemId: `item-${wireRequestId}`, approvalId: null, request: { prompt: "Respond." },
+    itemId: `item-${wireRequestId}`, approvalId: null, request,
     allowedResponderIds: [3],
     targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 1 },
     renderer: ({ interaction }) => ({
@@ -1120,8 +1130,107 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
       payload: { content: "Respond.", kind: "interaction_request" }
     })
   }).interaction;
-  const approval = createInteraction(1, "item/commandExecution/requestApproval");
-  const question = createInteraction(2, "item/tool/requestUserInput");
+  const approval = createInteraction(1, "item/commandExecution/requestApproval", {
+    command: "npm test",
+    availableDecisions: [
+      "accept",
+      { acceptWithExecpolicyAmendment: { execpolicy_amendment: ["npm", "test"] } },
+      "cancel"
+    ]
+  });
+  const fallbackApproval = createInteraction(2, "item/commandExecution/requestApproval", { command: "npm test" });
+  const nullApproval = createInteraction(5, "item/commandExecution/requestApproval", {
+    command: "npm test", availableDecisions: null
+  });
+  const question = createInteraction(3, "item/tool/requestUserInput", {
+    questions: [{
+      id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false,
+      options: [{ label: "staging", description: "预发" }, { label: "production", description: "生产" }]
+    }],
+    autoResolutionMs: null
+  });
+  const multipleQuestions = createInteraction(4, "item/tool/requestUserInput", {
+    questions: [
+      { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+      { id: "q2", header: "确认", question: "是否继续", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const whitespaceQuestions = createInteraction(6, "item/tool/requestUserInput", {
+    questions: [
+      { id: "deploy target", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const mixedQuestionIds = createInteraction(7, "item/tool/requestUserInput", {
+    questions: [
+      { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+      { id: "deploy target", header: "确认", question: "是否继续", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const emptyQuestionId = createInteraction(8, "item/tool/requestUserInput", {
+    questions: [
+      { id: "", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const mixedEmptyQuestionId = createInteraction(9, "item/tool/requestUserInput", {
+    questions: [
+      { id: "", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+      { id: "q1", header: "确认", question: "是否继续", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const duplicateQuestionIds = createInteraction(10, "item/tool/requestUserInput", {
+    questions: [
+      { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null },
+      { id: "q1", header: "确认", question: "是否继续", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const controlCharacterQuestionId = createInteraction(11, "item/tool/requestUserInput", {
+    questions: [
+      { id: "\x01q", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const oversizedQuestionId = createInteraction(12, "item/tool/requestUserInput", {
+    questions: [
+      { id: "a".repeat(300), header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null }
+    ],
+    autoResolutionMs: null
+  });
+  const nullQuestion = createInteraction(13, "item/tool/requestUserInput", {
+    questions: [null],
+    autoResolutionMs: null
+  });
+  const mixedNullQuestion = createInteraction(14, "item/tool/requestUserInput", {
+    questions: [null, { id: "q1", header: "环境", question: "选择环境", isOther: false, isSecret: false, options: null }],
+    autoResolutionMs: null
+  });
+  const numericQuestion = createInteraction(15, "item/tool/requestUserInput", {
+    questions: [42],
+    autoResolutionMs: null
+  });
+  const highRiskApproval = createInteraction(16, "item/commandExecution/requestApproval", {
+    command: "curl https://example.com",
+    availableDecisions: ["accept", "decline", "cancel"],
+    networkApprovalContext: { host: "example.com" }
+  });
+  const execpolicyApproval = createInteraction(17, "item/commandExecution/requestApproval", {
+    command: "npm test",
+    availableDecisions: ["accept", "decline", "cancel"],
+    proposedExecpolicyAmendment: ["npm", "test"]
+  });
+  const objectNetworkApproval = createInteraction(18, "item/commandExecution/requestApproval", {
+    command: "npm test",
+    availableDecisions: [
+      { applyNetworkPolicyAmendment: { host: "example.com" } },
+      "decline",
+      "cancel"
+    ]
+  });
 
   await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 180, senderId: 4, body: { type: "TOPIC", action: "HERMES" }
@@ -1156,19 +1265,247 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
     body: { type: "APPROVE", replyToken: approval.interactionId, choice: "accept" }
   })), { code: "ACL_FORBIDDEN" });
   assert.equal(fixture.calls.answer.length, 0);
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 192, senderId: 3,
+    body: { type: "APPROVE", replyToken: approval.interactionId, choice: "acceppt" }
+  })), { code: "INTERACTION_DECISION_INVALID" });
+  assert.equal(fixture.calls.answer.length, 0);
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 196, senderId: 3,
+    body: { type: "APPROVE", replyToken: fallbackApproval.interactionId, choice: "acceppt" }
+  })), (error) => error.code === "INTERACTION_DECISION_INVALID" && error.message.includes("acceptForSession"));
+  assert.equal(fixture.calls.answer.length, 0);
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 301, senderId: 3,
+    body: { type: "APPROVE", replyToken: highRiskApproval.interactionId, choice: "accept" }
+  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
+  assert.equal(fixture.calls.answer.length, 0);
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 303, senderId: 3,
+    body: { type: "APPROVE", replyToken: execpolicyApproval.interactionId, choice: "accept" }
+  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
+  assert.equal(fixture.calls.answer.length, 0);
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 304, senderId: 3,
+    body: { type: "APPROVE", replyToken: objectNetworkApproval.interactionId, choice: "applyNetworkPolicyAmendment" }
+  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
+  assert.equal(fixture.calls.answer.length, 0);
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 193, senderId: 3,
+    body: { type: "ANSWER", replyToken: approval.interactionId, text: "accept" }
+  })), { code: "INTERACTION_COMMAND_MISMATCH" });
+  assert.equal(fixture.calls.answer.length, 0);
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 194, senderId: 3,
+    body: { type: "APPROVE", replyToken: question.interactionId, choice: "accept" }
+  })), { code: "INTERACTION_COMMAND_MISMATCH" });
+  assert.equal(fixture.calls.answer.length, 0);
+
   const approved = await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 185, senderId: 3,
     body: { type: "APPROVE", replyToken: approval.interactionId, choice: "accept" }
   }));
   assert.equal(approved.status, "answered");
-  assert.deepEqual(fixture.calls.answer.at(-1).answer, { choice: "accept" });
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 186,
+    senderId: 3,
+    body: {
+      type: "APPROVE",
+      replyToken: approval.interactionId,
+      choice: "acceptWithExecpolicyAmendment"
+    }
+  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
+
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 187, senderId: 3,
+    body: { type: "APPROVE", replyToken: fallbackApproval.interactionId, choice: "accept" }
+  }));
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
 
   const answered = await fixture.service.handleBridgeEvent(fixture.event({
-    sourceMessageId: 186, senderId: 3,
-    body: { type: "ANSWER", replyToken: question.interactionId, text: "Use the safe default." }
+    sourceMessageId: 188, senderId: 3,
+    body: { type: "ANSWER", replyToken: question.interactionId, text: "staging" }
   }));
   assert.equal(answered.status, "answered");
-  assert.deepEqual(fixture.calls.answer.at(-1).answer, { text: "Use the safe default." });
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { answers: { q1: { answers: ["staging"] } } });
+
+  const callsBeforeInvalidQuestionIds = fixture.calls.answer.length;
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 198, senderId: 3,
+    body: { type: "ANSWER", replyToken: whitespaceQuestions.interactionId, text: "staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 199, senderId: 3,
+    body: { type: "ANSWER", replyToken: mixedQuestionIds.interactionId, text: "q1 staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 200, senderId: 3,
+    body: { type: "ANSWER", replyToken: emptyQuestionId.interactionId, text: "staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 201, senderId: 3,
+    body: { type: "ANSWER", replyToken: mixedEmptyQuestionId.interactionId, text: "q1 staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 202, senderId: 3,
+    body: { type: "ANSWER", replyToken: duplicateQuestionIds.interactionId, text: "q1 staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 203, senderId: 3,
+    body: { type: "ANSWER", replyToken: controlCharacterQuestionId.interactionId, text: "staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 204, senderId: 3,
+    body: { type: "ANSWER", replyToken: oversizedQuestionId.interactionId, text: "staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 205, senderId: 3,
+    body: { type: "ANSWER", replyToken: nullQuestion.interactionId, text: "staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 206, senderId: 3,
+    body: { type: "ANSWER", replyToken: mixedNullQuestion.interactionId, text: "q1 staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 207, senderId: 3,
+    body: { type: "ANSWER", replyToken: numericQuestion.interactionId, text: "staging" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+  assert.equal(fixture.calls.answer.length, callsBeforeInvalidQuestionIds);
+  assert.equal(fixture.store.readInteraction(whitespaceQuestions.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(mixedQuestionIds.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(emptyQuestionId.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(mixedEmptyQuestionId.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(duplicateQuestionIds.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(controlCharacterQuestionId.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(oversizedQuestionId.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(nullQuestion.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(mixedNullQuestion.interactionId).partialAnswers, null);
+  assert.equal(fixture.store.readInteraction(numericQuestion.interactionId).partialAnswers, null);
+
+  const partial = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 189, senderId: 3,
+    body: { type: "ANSWER", replyToken: multipleQuestions.interactionId, text: "q1 staging" }
+  }));
+  assert.equal(partial.status, "partial");
+  assert.deepEqual(partial.missingQuestionIds, ["q2"]);
+  assert.equal(fixture.calls.answer.length, 3);
+  assert.deepEqual(fixture.store.readInteraction(multipleQuestions.interactionId).partialAnswers, {
+    q1: { answers: ["staging"] }
+  });
+
+  const completed = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 190, senderId: 3,
+    body: { type: "ANSWER", replyToken: multipleQuestions.interactionId, text: "q2 yes" }
+  }));
+  assert.equal(completed.status, "answered");
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, {
+    answers: { q1: { answers: ["staging"] }, q2: { answers: ["yes"] } }
+  });
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 191, senderId: 3,
+    body: { type: "ANSWER", replyToken: multipleQuestions.interactionId, text: "missing nope" }
+  })), { code: "INTERACTION_QUESTION_ID_INVALID" });
+
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 197, senderId: 3,
+    body: { type: "APPROVE", replyToken: nullApproval.interactionId, choice: "decline" }
+  }));
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "decline" });
+
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 302, senderId: 3,
+    body: { type: "APPROVE", replyToken: highRiskApproval.interactionId, choice: "decline" }
+  }));
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "decline" });
+});
+
+test("APPROVE exposes a missing interaction as a user-facing state error", async (t) => {
+  const fixture = serviceFixture(t);
+
+  await assert.rejects(
+    () => fixture.service.handleBridgeEvent(fixture.event({
+      sourceMessageId: 300,
+      senderId: 3,
+      body: { type: "APPROVE", replyToken: "missing-interaction", choice: "accept" }
+    })),
+    (error) => {
+      assert.equal(isStateError(error), true);
+      assert.equal(error.code, "INTERACTION_NOT_FOUND");
+      assert.match(error.message, /does not exist/);
+      return true;
+    }
+  );
+});
+
+test("THREAD_BIND requires the numeric route objective project and maintainer authority in HERMES_ONLY", async (t) => {
+  const fixture = serviceFixture(t);
+  fixture.store.registerExecutionIntent({
+    sourceType: "seed", sourceId: "thread-bind-objective", objectiveId: "objective-thread-bind",
+    projectId: "alpha", backend: "app-server", text: "seed",
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Legacy", sourceMessageId: 1 },
+    topicBinding: { streamId: 42, topic: "Legacy", actorUserId: 3 }
+  });
+  fixture.store.setUserTopicMode({
+    sourceType: "seed", sourceId: "thread-bind-hermes-only", streamId: 42, topic: "Legacy",
+    projectId: "alpha", mode: "HERMES_ONLY", actorUserId: 4
+  });
+
+  for (const [sourceMessageId, senderId] of [[210, 2], [211, 3]]) {
+    await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+      sourceMessageId, senderId, topic: "Legacy",
+      body: { type: "THREAD_BIND", objectiveId: "objective-thread-bind", threadId: "thread-recovered" }
+    })), { code: "ACL_FORBIDDEN" });
+  }
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 212, senderId: 5, streamId: 43, topic: "Legacy",
+    body: { type: "THREAD_BIND", objectiveId: "objective-thread-bind", threadId: "thread-recovered" }
+  })), { code: "OBJECTIVE_PROJECT_MISMATCH" });
+  assert.deepEqual(fixture.calls.bind, []);
+
+  const maintained = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 213, senderId: 4, topic: "Legacy",
+    body: { type: "THREAD_BIND", objectiveId: "objective-thread-bind", threadId: "thread-recovered" }
+  }));
+  assert.deepEqual(maintained, {
+    schemaVersion: 1, status: "started", action: "objective.thread.bind", projectId: "alpha",
+    objectiveId: "objective-thread-bind", submissionId: "submission-bound",
+    clientUserMessageId: "client-bound", threadId: "thread-recovered", turnId: "turn-bound", duplicate: false
+  });
+  assert.deepEqual(fixture.calls.bind, [{
+    objectiveId: "objective-thread-bind", threadId: "thread-recovered",
+    sourceType: "zulip-message", sourceId: "213"
+  }]);
+
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 214, senderId: 1, topic: "Legacy",
+    body: { type: "THREAD_BIND", objectiveId: "objective-thread-bind", threadId: "thread-recovered" }
+  }));
+  assert.equal(fixture.calls.bind.length, 2);
+});
+
+test("THREAD_BIND rejects malformed command objects before controller execution", async (t) => {
+  const fixture = serviceFixture(t);
+  for (const [index, body] of [
+    { type: "THREAD_BIND", objectiveId: "objective-1" },
+    { type: "THREAD_BIND", objectiveId: "objective-1", threadId: "thread-1", extra: true },
+    { type: "THREAD_BIND", objectiveId: "objective 1", threadId: "thread-1" },
+    { type: "THREAD_BIND", objectiveId: "objective-1", threadId: "thread 1" }
+  ].entries()) {
+    await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+      sourceMessageId: 220 + index, senderId: 4, body
+    })), { code: "BRIDGE_EVENT_INVALID" });
+  }
+  assert.deepEqual(fixture.calls.bind, []);
 });
 
 test("semantic tagged unions and byte/count limits fail closed without changing topic or execution state", async (t) => {
@@ -1248,6 +1585,54 @@ test("authorized semantic AUTO crosses the real controller/store boundary atomic
     objectiveId: result.objectiveId, threadId: "thread-semantic-auto"
   });
   assert.equal(fixture.store.readObjectiveProject(result.objectiveId), "alpha");
+});
+
+test("mapped legacy topic lazily creates a thread and promotes only after durable binding", async (t) => {
+  let releaseThread;
+  let markThreadStarted;
+  const threadStarted = new Promise((resolve) => { markThreadStarted = resolve; });
+  const fixture = serviceFixture(t, {
+    turnControllerFactory(store) {
+      const appServerBackend = {
+        async startObjective() {
+          assert.deepEqual(fixture.store.readTopicState({ streamId: 42, topic: "general chat" }), {
+            streamId: 42, topic: "general chat", mode: "AUTO", projectId: null,
+            objectiveId: null, threadId: null
+          });
+          markThreadStarted();
+          await new Promise((resolve) => { releaseThread = resolve; });
+          return { threadId: "thread-legacy-topic" };
+        },
+        async startTurn() { return { turnId: "turn-legacy-topic" }; },
+        async interruptTurn() { return { ok: true }; },
+        async readObjective() { return { thread: { id: "thread-legacy-topic", turns: [] } }; },
+        async reconcileObjective() { return { thread: { id: "thread-legacy-topic", turns: [] } }; },
+        async respondToInteraction() {},
+        getCapabilities() {
+          return { backend: "app-server", durableThreadContinuity: true, reverseInteractions: true };
+        }
+      };
+      return new TurnController({ store, appServerBackend, leaseOwner: "legacy-topic-controller" });
+    }
+  });
+  const dispatch = fixture.service.handleBridgeEvent(fixture.event({
+    kind: "SEMANTIC", topic: "general chat", sourceMessageId: 445, senderId: 3,
+    body: {
+      type: "DISPATCH", instruction: "Evaluate project progress.", constraints: [],
+      acceptanceCriteria: [], reminders: [], objective: null, topicModeAction: null
+    }
+  }));
+
+  await threadStarted;
+  assert.equal(fixture.store.readTopicState({ streamId: 42, topic: "general chat" }).mode, "AUTO");
+  releaseThread();
+  const result = await dispatch;
+
+  assert.equal(result.status, "accepted");
+  assert.deepEqual(fixture.store.readTopicState({ streamId: 42, topic: "general chat" }), {
+    streamId: 42, topic: "general chat", mode: "CODEX_BOUND", projectId: "alpha",
+    objectiveId: result.objectiveId, threadId: "thread-legacy-topic"
+  });
 });
 
 test("accepted route and topic mutations serialize before later dispatch admission", async (t) => {
@@ -1373,6 +1758,7 @@ test("concurrent execution and route mutations cannot publish an older generatio
           });
         },
         async continueObjective() { throw new Error("unexpected continuation"); },
+        async resolveObjectiveThread() { throw new Error("unexpected thread binding"); },
         async cancelObjective() { throw new Error("unexpected cancellation"); },
         async answerInteraction() { throw new Error("unexpected answer"); },
         async handleInteractionRequest() { throw new Error("unexpected interaction"); },
@@ -1421,6 +1807,7 @@ test("close rejects new work and drains admitted execution through its queued pu
           });
         },
         async continueObjective() { throw new Error("unexpected continuation"); },
+        async resolveObjectiveThread() { throw new Error("unexpected thread binding"); },
         async cancelObjective() { throw new Error("unexpected cancellation"); },
         async answerInteraction() { throw new Error("unexpected answer"); },
         async handleInteractionRequest() { throw new Error("unexpected interaction"); },
@@ -1479,6 +1866,6 @@ test("legacy stream-name routes and Runner task IDs have no HCO authority", (t) 
   assert.equal(fixture.store.readObjectiveProject("runner-task-legacy"), null);
   assert.equal(fixture.store.readObjectiveExecution("runner-task-legacy"), null);
   assert.deepEqual(fixture.calls, {
-    accept: [], continue: [], cancel: [], answer: [], interaction: [], completion: []
+    accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: []
   });
 });

@@ -6,8 +6,10 @@ import json
 import hashlib
 import inspect
 import os
+import re
 import shutil
 import stat
+import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +22,7 @@ from hermes_cli.plugins import PluginContext, PluginManager
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 from gateway.session import SessionSource, build_session_key
+from gateway.session_context import clear_session_vars, set_session_vars
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +30,14 @@ PLUGIN_SOURCE = REPO_ROOT / "plugin" / "hermes-codex-bridge"
 ROUTE_UNAVAILABLE_COMMAND = "/hermes-codex-bridge-route-unavailable"
 ROUTE_UNAVAILABLE_TEXT = "项目路由暂不可用，请稍后重试。"
 ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
+
+
+def test_contract_process_isolates_hermes_state_before_plugin_discovery() -> None:
+    process_home = Path(os.environ["HOME"]).resolve()
+    hermes_home = Path(os.environ["HERMES_HOME"]).resolve()
+
+    assert Path(os.environ["HCO_PYTEST_ISOLATED_HOME"]).resolve() == hermes_home
+    assert hermes_home.parent == process_home
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -150,6 +161,22 @@ def _load_manager(tmp_path: Path, monkeypatch, snapshot: bytes | None = None):
     if snapshot is not None:
         snapshot_path.write_bytes(snapshot)
     manager.discover_and_load()
+    manager._hco_test_session_keys = {}
+    manager._hco_test_requests = {}
+    manager._hco_test_turn = 0
+    manager._hco_test_session_store = SimpleNamespace(
+        lookup_by_session_id=lambda session_id: (
+            SimpleNamespace(session_key=manager._hco_test_session_keys[session_id])
+            if session_id in manager._hco_test_session_keys
+            else None
+        )
+    )
+    manager._hco_test_gateway = SimpleNamespace(
+        _session_key_for_source=lambda source: (
+            f"{source.profile}:zulip:{source.chat_id}:{source.user_id}"
+        ),
+        _is_user_authorized=lambda _source: True,
+    )
     return manager, snapshot_path
 
 
@@ -171,6 +198,19 @@ class _CountingLlm:
         return SimpleNamespace(parsed=self.parsed)
 
 
+def _natural_tool_handler(manager: PluginManager, semantic_source: _CountingLlm):
+    async def invoke(capability: str):
+        if isinstance(semantic_source.parsed, BaseException):
+            semantic_source.calls.append({"semantic": semantic_source.parsed})
+            return "Hermes model unavailable."
+        result = await _call_hco_tool(manager, capability, semantic_source.parsed)
+        if result != "Codex bridge request rejected.":
+            semantic_source.calls.append({"semantic": semantic_source.parsed})
+        return result
+
+    return invoke
+
+
 def _load_manager_with_llm(
     tmp_path: Path,
     monkeypatch,
@@ -183,13 +223,160 @@ def _load_manager_with_llm(
     llm = _CountingLlm(parsed, entered=entered, release=release)
     monkeypatch.setattr(PluginContext, "llm", property(lambda _self: llm))
     manager, snapshot_path = _load_manager(tmp_path, monkeypatch, snapshot)
+    manager._hco_test_semantic_source = llm
     return manager, snapshot_path, llm
 
 
 def _invoke(manager: PluginManager, event) -> dict:
-    results = manager.invoke_hook("pre_gateway_dispatch", event=event)
+    results = manager.invoke_hook(
+        "pre_gateway_dispatch",
+        event=event,
+        gateway=manager._hco_test_gateway,
+        session_store=manager._hco_test_session_store,
+    )
     assert len(results) == 1
-    return results[0]
+    result = results[0]
+    if (
+        result == {"action": "allow"}
+        and getattr(event, "channel_prompt", "").startswith(
+            "Hermes Codex bridge context."
+        )
+    ):
+        _assert_semantic_channel_prompt(event)
+        capability = _pending_capability(manager, event)
+        payload = _token_payload(capability)
+        manager._hco_test_requests[payload["messageSha256"]] = event.text
+        result = _HookResult(result, capability)
+    return result
+
+
+def _invoke_with_runtime(manager: PluginManager, event, gateway, session_store) -> dict:
+    results = manager.invoke_hook(
+        "pre_gateway_dispatch",
+        event=event,
+        gateway=gateway,
+        session_store=session_store,
+    )
+    assert len(results) == 1
+    result = results[0]
+    if (
+        result == {"action": "allow"}
+        and getattr(event, "channel_prompt", "").startswith(
+            "Hermes Codex bridge context."
+        )
+    ):
+        _assert_semantic_channel_prompt(event)
+        result = _HookResult(result, _pending_capability(manager, event))
+    return result
+
+
+def _pre_tool_block(
+    manager: PluginManager,
+    capability: str,
+    session_id: str,
+    turn_id: str,
+    semantic: dict | None = None,
+):
+    semantic = _dispatch() if semantic is None else semantic
+    args = {"semantic": semantic}
+    now = _plugin_globals(manager)["_now_seconds"]()
+    bound = _pending_vault(manager).bound_entry(session_id, turn_id, now)
+    if bound is not None and bound[1].context_token != capability:
+        args["capability"] = capability
+    results = manager.invoke_hook(
+        "pre_tool_call",
+        tool_name="hco_dispatch",
+        args=args,
+        session_id=session_id,
+        turn_id=turn_id,
+        tool_call_id=f"tool-{turn_id}",
+        task_id=f"task-{turn_id}",
+        api_request_id=f"api-{turn_id}",
+    )
+    for result in results:
+        if isinstance(result, dict) and result.get("action") == "block":
+            return result.get("message")
+    return None
+
+
+def _bind_turn(
+    manager: PluginManager,
+    *,
+    session_id: str,
+    turn_id: str,
+    user_message: str,
+    message_id: int | str | None,
+) -> None:
+    tokens = set_session_vars(message_id="" if message_id is None else str(message_id))
+    try:
+        manager.invoke_hook(
+            "pre_llm_call",
+            session_id=session_id,
+            turn_id=turn_id,
+            user_message=user_message,
+        )
+    finally:
+        clear_session_vars(tokens)
+
+
+async def _call_hco_tool(manager: PluginManager, capability: str, semantic: dict):
+    try:
+        payload = _token_payload(capability)
+    except (TypeError, ValueError):
+        manager._hco_test_turn += 1
+        turn_id = f"test-turn-{manager._hco_test_turn}"
+        session_id = "invalid-capability-session"
+        block = _pre_tool_block(manager, capability, session_id, turn_id)
+        if block is not None:
+            return block
+        return await _dispatch_tool_entry().handler(
+            {"semantic": semantic},
+            session_id=session_id,
+        )
+    binding = payload["binding"]
+    session_key = (
+        f"codex-bridge:zulip:{binding['streamId']}:{binding['topic']}:"
+        "person@example.com"
+    )
+    session_id = f"session-{binding['streamId']}-{binding['topic']}"
+    manager._hco_test_session_keys[session_id] = session_key
+    manager._hco_test_turn += 1
+    turn_id = f"test-turn-{manager._hco_test_turn}"
+    request = manager._hco_test_requests.get(payload.get("messageSha256"), "")
+    _bind_turn(
+        manager,
+        session_id=session_id,
+        turn_id=turn_id,
+        user_message=request,
+        message_id=binding["sourceMessageId"],
+    )
+    vault = _pending_vault(manager)
+    bound = vault.bound_entry(
+        session_id, turn_id, _plugin_globals(manager)["_now_seconds"]()
+    )
+    if bound is not None and bound[1].context_token != capability:
+        vault._entries[bound[0]] = replace(bound[1], context_token=capability)
+    block = _pre_tool_block(manager, capability, session_id, turn_id, semantic)
+    if block is not None:
+        manager.invoke_hook(
+            "post_llm_call", session_id=session_id, turn_id=turn_id
+        )
+        return block
+    try:
+        return await _dispatch_tool_entry().handler(
+            {"semantic": semantic},
+            session_id=session_id,
+        )
+    finally:
+        manager.invoke_hook(
+            "post_llm_call", session_id=session_id, turn_id=turn_id
+        )
+
+
+class _HookResult(dict):
+    def __init__(self, value: dict, capability: str):
+        super().__init__(value)
+        self.capability = capability
 
 
 def _token_from_rewrite(result: dict) -> str:
@@ -200,10 +387,46 @@ def _token_from_rewrite(result: dict) -> str:
 
 
 def _nlp_token_from_rewrite(result: dict) -> str:
+    if isinstance(result, _HookResult):
+        assert result == {"action": "allow"}
+        return result.capability
     prefix = "/hermes-codex-bridge-natural "
     assert result["action"] == "rewrite"
     assert result["text"].startswith(prefix)
     return result["text"][len(prefix) :]
+
+
+def _assert_semantic_channel_prompt(event) -> None:
+    prompt = getattr(event, "channel_prompt", None)
+    # BUG-2 L2: channel_prompt now includes project context; check key phrases
+    assert isinstance(prompt, str)
+    assert prompt.startswith("Hermes Codex bridge context.")
+    assert "call hco_dispatch exactly once" in prompt
+    assert "For ordinary conversation, answer normally without" in prompt
+
+
+def _pending_vault(manager: PluginManager):
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    return inspect.getclosurevars(hook).nonlocals["pending_vault"]
+
+
+def _pending_capability(manager: PluginManager, event) -> str:
+    message_id = int(event.message_id)
+    matches = [
+        entry.context_token
+        for entry in _pending_vault(manager)._entries.values()
+        if entry.context.provenance.message_id == message_id
+    ]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _dispatch_tool_entry():
+    from tools.registry import registry
+
+    entry = registry.get_entry("hco_dispatch")
+    assert entry is not None
+    return entry
 
 
 def _token_payload(token: str) -> dict:
@@ -228,14 +451,89 @@ def test_real_directory_plugin_is_discovered_and_registers_synchronously(
     assert (installed / "__init__.py").is_file()
     assert loaded.enabled is True
     assert loaded.error is None
-    assert loaded.hooks_registered == ["pre_gateway_dispatch"]
+    assert loaded.hooks_registered == [
+        "pre_gateway_dispatch",
+        "pre_llm_call",
+        "pre_tool_call",
+        "post_llm_call",
+    ]
     assert set(loaded.commands_registered) == {
         "codex",
         "hermes-codex-bridge-internal",
-        "hermes-codex-bridge-natural",
+        "hermes-codex-bridge-registration",
         "hermes-codex-bridge-route-unavailable",
     }
-    assert loaded.tools_registered == []
+    assert loaded.tools_registered == ["hco_dispatch"]
+    entry = _dispatch_tool_entry()
+    assert entry.is_async is True
+    assert entry.return_direct is True
+    assert entry.schema["name"] == "hco_dispatch"
+    assert entry.schema["parameters"] == {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["semantic"],
+        "properties": {
+            "semantic": _plugin_globals(manager)["SEMANTIC_SCHEMA"],
+        },
+    }
+
+
+def test_project_prompt_never_exposes_internal_capability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event("ship the requested change")
+
+    assert _invoke(manager, event) == {"action": "allow"}
+    assert event.source.profile == "codex-bridge"
+    assert "hco_capability" not in event.channel_prompt
+    assert "capability" not in event.channel_prompt.lower()
+    assert "ship the requested change" not in event.channel_prompt
+
+
+def test_model_supplied_capability_is_rejected_as_an_extra_tool_field(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event("ship it")
+    assert _invoke(manager, event) == {"action": "allow"}
+    manager._hco_test_session_keys["session-a"] = (
+        "codex-bridge:zulip:42:Build:person@example.com"
+    )
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-a",
+        user_message="ship it",
+        message_id=99,
+    )
+
+    results = manager.invoke_hook(
+        "pre_tool_call",
+        tool_name="hco_dispatch",
+        args={"capability": "model-controlled", "semantic": _dispatch()},
+        session_id="session-a",
+        turn_id="turn-a",
+        tool_call_id="tool-a",
+        task_id="task-a",
+        api_request_id="api-a",
+    )
+
+    assert any(
+        result == {
+            "action": "block",
+            "message": "Codex bridge request rejected.",
+        }
+        for result in results
+    )
 
 
 def test_successful_registration_writes_owner_only_process_attestation(
@@ -296,12 +594,118 @@ def test_valid_numeric_routes_select_only_explicit_hermes_profile(
     hermes = _event(stream_id=43)
     unknown = _event(stream_id=44)
 
-    assert _invoke(manager, project)["action"] == "rewrite"
+    original_text = project.text
+    assert _invoke(manager, project) == {"action": "allow"}
+    assert project.text == original_text
+    _assert_semantic_channel_prompt(project)
     assert project.source.profile == "codex-bridge"
     assert _invoke(manager, hermes) == {"action": "allow"}
     assert hermes.source.profile == "hermes-general"
     assert _invoke(manager, unknown) == {"action": "allow"}
     assert unknown.source.profile == "hermes-general"
+    assert "不要根据话题名称或消息内容猜测 projectId" in unknown.channel_prompt
+    assert "canonical 绝对工作目录" in unknown.channel_prompt
+    assert "当前数字 stream" in unknown.channel_prompt
+    assert "objectiveId" in unknown.channel_prompt
+    assert "alpha" not in unknown.channel_prompt
+
+
+@pytest.mark.asyncio
+async def test_unmapped_stream_explicit_project_command_returns_registration_template_without_hco(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event("/codex run inspect this project", stream_id=44)
+
+    result = _invoke(manager, event)
+
+    assert result == {
+        "action": "rewrite",
+        "text": "/hermes-codex-bridge-registration",
+    }
+    assert event.source.profile == "hermes-general"
+    handler = manager._plugin_commands["hermes-codex-bridge-registration"]["handler"]
+    visible = await handler("")
+    assert "当前频道尚未登记 Codex 项目" in visible
+    assert "projectId" in visible
+    assert "canonical 绝对工作目录" in visible
+    assert "当前数字 stream" in visible
+    assert "objectiveId" in visible
+
+
+def test_project_natural_language_does_not_access_plugin_llm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def reject_llm_access(_self):
+        raise AssertionError("project natural-language registration accessed ctx.llm")
+
+    monkeypatch.setattr(PluginContext, "llm", property(reject_llm_access))
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event("introduce yourself")
+
+    assert _invoke(manager, event) == {"action": "allow"}
+    assert event.text == "introduce yourself"
+    assert event.source.profile == "codex-bridge"
+    assert "introduce yourself" not in event.channel_prompt
+    _assert_semantic_channel_prompt(event)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_tool_submits_exact_trusted_event(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    semantic = {
+        "type": "DISPATCH",
+        "instruction": "ship it",
+        "constraints": ["keep compatibility"],
+        "acceptanceCriteria": ["tests pass"],
+        "reminders": [],
+        "objective": {"mode": "CONTINUE", "objectiveId": "obj-1"},
+    }
+    event = _event("please ship it")
+    invoked = _invoke(manager, event)
+    assert invoked == {"action": "allow"}
+    capability = _nlp_token_from_rewrite(invoked)
+    submissions = []
+
+    async def submit(_self, submitted):
+        submissions.append(submitted)
+        return {"accepted": True, "objectiveId": "obj-1"}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    result = await _call_hco_tool(manager, capability, semantic)
+
+    assert result == "Codex 请求已提交。任务：obj-1。"
+    assert len(submissions) == 1
+    submitted = submissions[0]
+    assert submitted == {
+        "schemaVersion": 1,
+        "kind": "SEMANTIC",
+        "contextToken": capability,
+        "binding": {
+            "streamId": 42,
+            "topic": "Build",
+            "sourceMessageId": 99,
+            "senderId": 17,
+        },
+        "semantic": {**semantic, "topicModeAction": None},
+    }
+    payload = _token_payload(submitted["contextToken"])
+    assert payload["projectId"] == "alpha"
+    assert payload["topicMode"] == "AUTO"
 
 
 @pytest.mark.parametrize(
@@ -529,6 +933,14 @@ def test_key_path_swap_disables_all_bridge_registration(
             },
         ),
         (
+            "/codex thread bind objective-1 thread-1",
+            {
+                "type": "THREAD_BIND",
+                "objectiveId": "objective-1",
+                "threadId": "thread-1",
+            },
+        ),
+        (
             "/codex approve reply-1 accept",
             {"type": "APPROVE", "replyToken": "reply-1", "choice": "accept"},
         ),
@@ -581,6 +993,13 @@ def test_exact_public_grammar_rewrites_to_command_bound_signed_envelope(
         "/codex topic AUTO",
         "/codex route set",
         "/codex objective continue obj-only",
+        "/codex thread bind",
+        "/codex thread bind objective-only",
+        "/codex thread bind objective-1 thread-1 extra",
+        "/codex thread  bind objective-1 thread-1",
+        "/codex thread bind objective-1\tthread-1",
+        "/codex thread bind  objective-1 thread-1",
+        "/codex thread bind objective-1 thread-1 ",
         "/codex unknown thing",
         "/codex run ok\nsecond-line",
     ],
@@ -723,6 +1142,22 @@ async def test_backend_unavailable_is_rendered_as_actionable_text_not_json(
             (
                 "任务：objective-1。项目：stockprofits。状态：running。"
                 "后端：app-server。会话：thread-1。"
+            ),
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "started",
+                "action": "objective.thread.bind",
+                "projectId": "stockprofits",
+                "objectiveId": "objective-1",
+                "threadId": "thread-recovered",
+                "turnId": "turn-recovered",
+                "duplicate": False,
+            },
+            (
+                "Codex 会话绑定完成。项目：stockprofits。任务：objective-1。"
+                "会话：thread-recovered。状态：started。轮次：turn-recovered。"
             ),
         ),
         (
@@ -885,6 +1320,230 @@ async def test_natural_route_query_uses_signed_route_show_without_llm(
     assert submitted[0]["command"] == {"type": "ROUTE", "action": "SHOW"}
     assert "stockprofits" in visible
     assert "/Users/hula/Projects/stockprofits" in visible
+    assert "本次仅核验项目路由，未执行项目工作区进度扫描" in visible
+
+
+@pytest.mark.asyncio
+async def test_project_context_progress_query_uses_trusted_route_without_llm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        RuntimeError("model must not run"),
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+    submitted = []
+
+    async def submit(_self, event):
+        submitted.append(event)
+        return {
+            "schemaVersion": 1,
+            "status": "ok",
+            "action": "route.show",
+            "route": {
+                "streamId": 42,
+                "owner": "PROJECT",
+                "projectId": "stockprofits",
+                "source": "static",
+                "cwd": "/Users/hula/Projects/stockprofits",
+            },
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    result = _invoke(
+        manager,
+        _event("请回复当前 projectId、工作目录，并用一句话汇报项目进度。"),
+    )
+    token = _token_from_rewrite(result)
+    handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
+    visible = await handler(token)
+
+    assert llm.calls == []
+    assert submitted[0]["command"] == {"type": "ROUTE", "action": "SHOW"}
+    assert "stockprofits" in visible
+    assert "/Users/hula/Projects/stockprofits" in visible
+    assert "本次仅核验项目路由，未执行项目工作区进度扫描" in visible
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "请告诉我当前项目的 projectid。",
+        "projectid",
+        "current project id?",
+    ],
+)
+def test_project_id_metadata_query_stays_with_hermes_without_llm(
+    tmp_path: Path, monkeypatch, query: str
+) -> None:
+    manager, _, llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        RuntimeError("model must not run"),
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    result = _invoke(manager, _event(query))
+
+    assert _token_from_rewrite(result)
+    assert llm.calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_route_query_echoes_bounded_marker_without_llm(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        RuntimeError("model must not run"),
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    async def submit(_self, _event):
+        return {
+            "schemaVersion": 1,
+            "status": "ok",
+            "action": "route.show",
+            "route": {
+                "streamId": 42,
+                "owner": "PROJECT",
+                "projectId": "stockprofits",
+                "source": "static",
+                "cwd": "/Users/hula/Projects/stockprofits",
+            },
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _token_from_rewrite(
+        _invoke(
+            manager,
+            _event(
+                "请回复当前 projectId、工作目录，并用一句话汇报项目进度。"
+                "回显 LIVE-POSTFIX.S-001。"
+            ),
+        )
+    )
+    handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
+
+    visible = await handler(token)
+
+    assert llm.calls == []
+    assert visible == (
+        "当前项目：stockprofits。工作目录：/Users/hula/Projects/stockprofits。"
+        "项目进度：本次仅核验项目路由，未执行项目工作区进度扫描。"
+        "回显：LIVE-POSTFIX.S-001。"
+    )
+
+
+@pytest.mark.asyncio
+async def test_route_query_without_marker_preserves_existing_reply(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="ASK")]),
+    )
+
+    async def submit(_self, _event):
+        return {
+            "schemaVersion": 1,
+            "status": "ok",
+            "action": "route.show",
+            "route": {
+                "streamId": 42,
+                "owner": "PROJECT",
+                "projectId": "ASK",
+                "source": "static",
+                "cwd": "/Users/hula/workspace/ASK",
+            },
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _token_from_rewrite(
+        _invoke(
+            manager,
+            _event("请回复当前 projectId、工作目录，并用一句话汇报项目进度。"),
+        )
+    )
+    handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
+
+    visible = await handler(token)
+
+    assert visible == (
+        "当前项目：ASK。工作目录：/Users/hula/workspace/ASK。"
+        "项目进度：本次仅核验项目路由，未执行项目工作区进度扫描。"
+    )
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "回显 LIVE-ONLY-001。",
+        "请回复当前 projectId、工作目录，并执行交易。回显 LIVE-WORK-001。",
+        "请回复当前 projectId、工作目录。回显 LIVE-001。回显 LIVE-002。",
+    ],
+)
+def test_marker_cannot_expand_trusted_route_query_whitelist(
+    tmp_path: Path, monkeypatch, query: str
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    result = _invoke(manager, _event(query))
+
+    assert result == {"action": "allow"}
+    assert hasattr(result, "capability")
+
+
+def test_project_progress_only_query_does_not_require_model_capability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        RuntimeError("model must not run"),
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    result = _invoke(
+        manager,
+        _event("请用一句话汇报当前项目进度，并回显测试编号 BURST-003。"),
+    )
+
+    token = _token_from_rewrite(result)
+    assert token
+    assert llm.calls == []
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "请回复当前 projectId、工作目录，并用一句话汇报项目进度。回显 POSTFIX-S-001。",
+        "请回复当前 projectId、工作目录，并回显 POSTFIX-SAME-003。",
+        "请用一句话汇报当前项目进度，并回显 POSTFIX-A-BURST-002。",
+    ],
+)
+def test_live_route_query_variants_do_not_require_model_capability(
+    tmp_path: Path, monkeypatch, query: str
+) -> None:
+    manager, _, llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        RuntimeError("model must not run"),
+        _snapshot([_route(42, "PROJECT", project_id="stockprofits")]),
+    )
+
+    result = _invoke(manager, _event(query))
+
+    token = _token_from_rewrite(result)
+    assert token
+    assert llm.calls == []
 
 
 @pytest.mark.asyncio
@@ -986,6 +1645,142 @@ async def test_private_handler_maps_transport_and_protocol_errors_stably(
     second = _token_from_rewrite(_invoke(manager, _event("/codex status", message_id=101)))
     assert await handler(second) == "Codex bridge protocol error."
 
+    async def user_error(_self, _event):
+        raise globals_["BridgeUserError"](
+            "INTERACTION_DECISION_INVALID",
+            "Invalid decision 'acceppt'. Valid choices: accept, decline.",
+        )
+
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", user_error)
+    third = _token_from_rewrite(
+        _invoke(manager, _event("/codex approve reply-1 acceppt", message_id=102))
+    )
+    result = await handler(third)
+    assert "Valid choices: accept, decline." in result
+    assert "protocol error" not in result
+
+
+def test_bridge_client_preserves_known_user_error_response(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    bridge_client_module = inspect.getmodule(globals_["BridgeClient"])
+    body = json.dumps(
+        {
+            "error": {
+                "code": "INTERACTION_DECISION_INVALID",
+                "message": "Invalid decision 'acceppt'. Valid choices: accept, decline.",
+            }
+        }
+    ).encode()
+    response = (
+        b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+
+    with pytest.raises(Exception) as raised:
+        bridge_client_module._parse_response(response)
+
+    assert type(raised.value).__name__ == "BridgeUserError"
+    assert str(raised.value) == "Invalid decision 'acceppt'. Valid choices: accept, decline."
+
+
+def test_bridge_client_rejects_known_user_error_code_from_server_error(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    bridge_client_module = inspect.getmodule(globals_["BridgeClient"])
+    body = json.dumps(
+        {
+            "error": {
+                "code": "INTERACTION_DECISION_INVALID",
+                "message": "internal decision failure",
+            }
+        }
+    ).encode()
+    response = (
+        b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+
+    with pytest.raises(Exception) as raised:
+        bridge_client_module._parse_response(response)
+
+    assert type(raised.value).__name__ == "BridgeProtocolError"
+    assert str(raised.value) == "bridge rejected request"
+
+
+@pytest.mark.asyncio
+async def test_private_handler_surfaces_user_errors_through_real_bridge(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    handler = manager._plugin_commands["hermes-codex-bridge-internal"]["handler"]
+    client = inspect.getclosurevars(handler).nonlocals["client"]
+    socket_path = Path("/tmp") / f"hco-fifth-pass-{time.time_ns()}.sock"
+    client.socket_path = str(socket_path)
+    token_path = Path(os.environ["HCO_CONFIG_PATH"])
+    token_path = Path(json.loads(token_path.read_text())["bridge"]["tokenPath"])
+    script = """
+import { createBridge } from './hco/bridge/server.js';
+import { stateError } from './hco/state/reducer.js';
+const [socketPath, tokenPath] = process.argv.slice(1);
+const store = { claimOutbox() {}, ackOutbox() {}, nackOutbox() {} };
+const bridge = createBridge({
+  store,
+  tokenPath,
+  async eventHandler(event) {
+    if (event.command.type === 'APPROVE') {
+      throw stateError('INTERACTION_DECISION_INVALID', "Invalid decision 'acceppt'. Valid choices: accept, decline.");
+    }
+    throw stateError('INTERACTION_COMMAND_MISMATCH', "Cannot use /codex answer on an approval interaction.");
+  }
+});
+const running = await bridge.start({ socketPath });
+console.log('READY');
+const close = async () => { await running.close(); process.exit(0); };
+process.on('SIGTERM', close);
+process.on('SIGINT', close);
+await new Promise(() => {});
+"""
+    process = subprocess.Popen(
+        ["node", "--input-type=module", "-e", script, str(socket_path), str(token_path)],
+        cwd=REPO_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "READY"
+        approve = _token_from_rewrite(
+            _invoke(manager, _event("/codex approve reply-1 acceppt", message_id=103))
+        )
+        answer = _token_from_rewrite(
+            _invoke(manager, _event("/codex answer reply-1 no", message_id=104))
+        )
+
+        approve_result = await handler(approve)
+        answer_result = await handler(answer)
+
+        assert "Valid choices: accept, decline." in approve_result
+        assert "protocol error" not in approve_result
+        assert answer_result == "Cannot use /codex answer on an approval interaction."
+    finally:
+        process.terminate()
+        process.wait(timeout=5)
+        socket_path.unlink(missing_ok=True)
+
 
 @pytest.mark.asyncio
 async def test_async_unix_client_posts_exact_authenticated_json(tmp_path: Path, monkeypatch) -> None:
@@ -1053,7 +1848,6 @@ async def test_natural_handler_submits_exact_event_and_rejects_authority_fields(
         "acceptanceCriteria": ["tests pass"],
         "reminders": [],
         "objective": {"mode": "CONTINUE", "objectiveId": "obj-1"},
-        "topicModeAction": None,
     }
     manager, _, llm = _load_manager_with_llm(
         tmp_path,
@@ -1068,7 +1862,7 @@ async def test_natural_handler_submits_exact_event_and_rejects_authority_fields(
         return {"accepted": True, "objectiveId": "obj-1"}
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
     result = await handler(token)
 
@@ -1084,7 +1878,7 @@ async def test_natural_handler_submits_exact_event_and_rejects_authority_fields(
         "sourceMessageId": 99,
         "senderId": 17,
     }
-    assert submitted["semantic"] == semantic
+    assert submitted["semantic"] == {**semantic, "topicModeAction": None}
     payload = _token_payload(submitted["contextToken"])
     assert payload["binding"] == submitted["binding"]
     assert payload["projectId"] == "alpha"
@@ -1162,7 +1956,7 @@ async def test_natural_handler_rejects_invalid_semantic_union_without_hco(
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
 
     assert await handler(token) == "Hermes model protocol error."
     assert len(llm.calls) == 1
@@ -1180,7 +1974,6 @@ async def test_natural_handler_returns_hco_denial_without_replay(
         "acceptanceCriteria": [],
         "reminders": [],
         "objective": None,
-        "topicModeAction": "AUTO",
     }
     manager, _, llm = _load_manager_with_llm(
         tmp_path,
@@ -1188,12 +1981,7 @@ async def test_natural_handler_returns_hco_denial_without_replay(
         semantic,
         _snapshot(
             [
-                _route(
-                    42,
-                    "PROJECT",
-                    project_id="alpha",
-                    topics=[{"topic": "Build", "mode": "HERMES_ONLY"}],
-                )
+                _route(42, "PROJECT", project_id="alpha")
             ]
         ),
     )
@@ -1206,13 +1994,13 @@ async def test_natural_handler_returns_hco_denial_without_replay(
 
     monkeypatch.setattr(globals_["BridgeClient"], "submit", deny)
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
 
     assert await handler(token) == "Codex bridge protocol error."
     assert await handler(token) == "Codex bridge request rejected."
     assert len(llm.calls) == 1
     assert len(calls) == 1
-    assert calls[0]["semantic"] == semantic
+    assert calls[0]["semantic"] == {**semantic, "topicModeAction": None}
 
 
 @pytest.mark.asyncio
@@ -1245,7 +2033,7 @@ async def test_natural_vault_isolates_concurrent_project_topics(
         return {"accepted": True}
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
 
     async def run(topic: str, message_id: int):
         token = _nlp_token_from_rewrite(
@@ -1309,9 +2097,16 @@ def test_plugin_hook_result_precedes_later_hooks_for_supported_install_order(
         lambda **_kwargs: {"action": "rewrite", "text": "later-plugin"}
     )
 
-    results = manager.invoke_hook("pre_gateway_dispatch", event=_event())
+    event = _event()
+    results = manager.invoke_hook(
+        "pre_gateway_dispatch",
+        event=event,
+        gateway=manager._hco_test_gateway,
+        session_store=manager._hco_test_session_store,
+    )
 
-    assert results[0]["text"].startswith("/hermes-codex-bridge-natural ")
+    assert results[0] == {"action": "allow"}
+    _assert_semantic_channel_prompt(event)
     assert results[1] == {"action": "rewrite", "text": "later-plugin"}
 
 
@@ -1336,7 +2131,6 @@ def _adapter_event(text: str, message_id: int) -> MessageEvent:
         chat_type="stream",
         chat_topic="Build",
         user_id="person@example.com",
-        message_id=str(message_id),
     )
     return MessageEvent(
         text=text,
@@ -1354,6 +2148,75 @@ def _adapter_event(text: str, message_id: int) -> MessageEvent:
     )
 
 
+def test_project_hook_promotes_verified_event_message_id_to_empty_source(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _adapter_event("natural work request", 600)
+
+    assert event.source.message_id is None
+    assert _invoke(manager, event) == {"action": "allow"}
+    assert event.source.message_id == "600"
+
+
+def test_general_hook_leaves_empty_source_message_id_unchanged(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "HERMES")]),
+    )
+    event = _adapter_event("ordinary conversation", 600)
+
+    assert event.source.message_id is None
+    assert manager.invoke_hook(
+        "pre_gateway_dispatch",
+        event=event,
+        gateway=manager._hco_test_gateway,
+        session_store=manager._hco_test_session_store,
+    ) == [{"action": "allow"}]
+    assert event.source.profile == "hermes-general"
+    assert event.source.message_id is None
+
+
+def test_project_hook_fails_closed_when_empty_source_message_id_is_read_only(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _adapter_event("natural work request", 601)
+
+    class ReadOnlySource:
+        platform = Platform.ZULIP
+        chat_id = "42:Build"
+        chat_type = "stream"
+        chat_topic = "Build"
+        user_id = "person@example.com"
+
+        @property
+        def message_id(self):
+            return None
+
+        @message_id.setter
+        def message_id(self, _value):
+            raise AttributeError("message_id is read-only")
+
+    event.source = ReadOnlySource()
+
+    assert _invoke(manager, event) == {
+        "action": "rewrite",
+        "text": "/hermes-codex-bridge-route-unavailable",
+    }
+
+
 async def _dispatch_through_real_gateway(manager, monkeypatch, event):
     import hermes_cli.plugins as plugin_module
     from gateway.run import GatewayRunner
@@ -1361,7 +2224,7 @@ async def _dispatch_through_real_gateway(manager, monkeypatch, event):
     monkeypatch.setattr(plugin_module, "_plugin_manager", manager)
     runner = object.__new__(GatewayRunner)
     runner.config = {}
-    runner.session_store = SimpleNamespace()
+    runner.session_store = manager._hco_test_session_store
     runner.adapters = {}
     runner.hooks = SimpleNamespace(emit_collect=_empty_hook_results)
     runner._running_agents = {}
@@ -1374,7 +2237,7 @@ async def _dispatch_through_real_gateway(manager, monkeypatch, event):
     runner._busy_input_mode = "interrupt"
     runner._scale_to_zero_note_real_inbound = lambda: None
     runner._is_user_authorized = lambda _source: True
-    runner._session_key_for_source = lambda _source: "zulip:42:Build"
+    runner._session_key_for_source = manager._hco_test_gateway._session_key_for_source
     runner._check_slash_access = lambda _source, _command: None
     runner._is_telegram_topic_root_lobby = lambda _source: False
     runner._claim_active_session_slot = lambda _key, _source: (None, None)
@@ -1384,11 +2247,16 @@ async def _dispatch_through_real_gateway(manager, monkeypatch, event):
     runner._release_running_agent_state = lambda _key: None
     agent_entries = []
 
-    async def fail_if_agent_entered(*_args, **_kwargs):
+    async def run_through_agent(agent_event, *_args, **_kwargs):
         agent_entries.append("ordinary-agent")
-        raise AssertionError("ordinary Hermes agent path was entered")
+        semantic_source = manager._hco_test_semantic_source
+        _assert_semantic_channel_prompt(agent_event)
+        capability = _pending_capability(manager, agent_event)
+        payload = _token_payload(capability)
+        manager._hco_test_requests[payload["messageSha256"]] = agent_event.text
+        return await _natural_tool_handler(manager, semantic_source)(capability)
 
-    runner._handle_message_with_agent = fail_if_agent_entered
+    runner._handle_message_with_agent = run_through_agent
     result = await GatewayRunner._handle_message(runner, event)
     return result, agent_entries
 
@@ -1422,7 +2290,7 @@ async def test_gateway_dispatch_contains_malformed_reject_reason_code_without_ag
     assert result == "Hermes model protocol error."
     assert len(llm.calls) == 1
     assert submissions == []
-    assert agent_entries == []
+    assert agent_entries == ["ordinary-agent"]
 
 
 @pytest.mark.asyncio
@@ -1479,7 +2347,12 @@ async def test_idle_and_busy_exact_commands_use_zero_model_calls_and_busy_is_del
             active_started.set()
             await release_active.wait()
             return None
-        results = manager.invoke_hook("pre_gateway_dispatch", event=event)
+        results = manager.invoke_hook(
+            "pre_gateway_dispatch",
+            event=event,
+            gateway=manager._hco_test_gateway,
+            session_store=manager._hco_test_session_store,
+        )
         for result in results:
             if result.get("action") == "rewrite":
                 rewritten = replace(event, text=result["text"])
@@ -1514,7 +2387,7 @@ async def test_idle_and_busy_exact_commands_use_zero_model_calls_and_busy_is_del
     await adapter.cancel_background_tasks()
 
 
-def _dispatch(*, objective=None, topic_mode_action=None) -> dict:
+def _dispatch(*, objective=None) -> dict:
     return {
         "type": "DISPATCH",
         "instruction": "ship it",
@@ -1522,7 +2395,6 @@ def _dispatch(*, objective=None, topic_mode_action=None) -> dict:
         "acceptanceCriteria": ["tests pass"],
         "reminders": [],
         "objective": objective,
-        "topicModeAction": topic_mode_action,
     }
 
 
@@ -1600,7 +2472,8 @@ def test_project_natural_language_uses_short_one_shot_capability_without_user_te
         (
             _dispatch(objective=None),
             "unavailable",
-            "Codex bridge unavailable.",
+            # BUG-3: improved message for BridgeUnavailableError in hco_dispatch_handler
+            "Codex bridge 响应异常，任务可能已提交但响应丢失。请稍后用 `/codex status` 查询状态，如任务未出现请重新发起。",
             1,
         ),
         (
@@ -1622,7 +2495,7 @@ def test_project_natural_language_uses_short_one_shot_capability_without_user_te
         "hco-protocol-failure",
     ],
 )
-async def test_real_gateway_contains_every_natural_result_without_agent_fallthrough(
+async def test_real_gateway_enters_agent_then_contains_every_natural_result(
     tmp_path: Path,
     monkeypatch,
     semantic,
@@ -1650,23 +2523,28 @@ async def test_real_gateway_contains_every_natural_result_without_agent_fallthro
     globals_ = _plugin_globals(manager)
     monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
 
+    gateway_event = _adapter_event(request, 600)
     result, agent_entries = await _dispatch_through_real_gateway(
-        manager, monkeypatch, _adapter_event(request, 600)
+        manager, monkeypatch, gateway_event
     )
 
     assert result == visible
     assert len(llm.calls) == 1
-    assert llm.calls[0]["input"] == [{"type": "text", "text": request}]
-    assert request not in llm.calls[0]["instructions"]
+    assert llm.calls[0]["semantic"] is semantic
+    assert gateway_event.text == request
+    assert request not in gateway_event.channel_prompt
     assert len(submissions) == hco_calls
-    assert agent_entries == []
+    assert agent_entries == ["ordinary-agent"]
     if submissions:
         assert submissions[0]["kind"] == "SEMANTIC"
         assert submissions[0]["binding"]["senderId"] == 17
-        assert submissions[0]["semantic"] == semantic
-        assert semantic.get("objective", "absent") is submissions[0][
-            "semantic"
-        ].get("objective", "absent")
+        expected_semantic = (
+            {**semantic, "topicModeAction": None}
+            if semantic["type"] == "DISPATCH"
+            else semantic
+        )
+        assert submissions[0]["semantic"] == expected_semantic
+        assert "topicModeAction" not in semantic
 
 
 @pytest.mark.asyncio
@@ -1678,29 +2556,341 @@ async def test_natural_capability_is_consumed_before_first_await_and_never_resto
     manager, _, llm = _load_manager_with_llm(
         tmp_path,
         monkeypatch,
-        RuntimeError("provider token secret"),
+        _dispatch(),
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-        entered=entered,
-        release=release,
     )
     submissions = []
 
     async def submit(_self, event):
         submissions.append(event)
+        entered.set()
+        await release.wait()
         return {"accepted": True}
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
     pending = asyncio.create_task(handler(token))
     await asyncio.wait_for(entered.wait(), timeout=2)
 
     assert await handler(token) == "Codex bridge request rejected."
-    assert len(llm.calls) == 1
+    assert llm.calls == []
     release.set()
-    assert await pending == "Hermes model unavailable."
+    assert await pending == "Codex 请求已提交。"
     assert await handler(token) == "Codex bridge request rejected."
-    assert submissions == []
+    assert len(llm.calls) == 1
+    assert len(submissions) == 1
+
+
+def _lifecycle_runtime(session_keys: dict[str, str]):
+    entries = {
+        session_id: SimpleNamespace(session_key=session_key)
+        for session_id, session_key in session_keys.items()
+    }
+    session_store = SimpleNamespace(
+        lookup_by_session_id=lambda session_id: entries.get(session_id)
+    )
+    gateway = SimpleNamespace(
+        _session_key_for_source=lambda source: (
+            f"{source.profile}:zulip:{source.chat_id}:{source.user_id}"
+        )
+    )
+    return gateway, session_store
+
+
+def test_natural_capability_rejects_runtime_session_store_replacement(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    session_key = "codex-bridge:zulip:42:Build:person@example.com"
+    gateway_a, session_store_a = _lifecycle_runtime({"session-a": session_key})
+    gateway_b, session_store_b = _lifecycle_runtime({"session-b": session_key})
+
+    first = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager,
+            _event(message_id=991),
+            gateway_a,
+            session_store_a,
+        )
+    )
+    assert _invoke_with_runtime(
+        manager,
+        _event(message_id=992),
+        gateway_b,
+        session_store_b,
+    ) == {
+        "action": "rewrite",
+        "text": "/hermes-codex-bridge-route-unavailable",
+    }
+
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-a",
+        user_message="natural work request",
+        message_id=991,
+    )
+    assert _pre_tool_block(manager, first, "session-a", "turn-a") is None
+
+
+@pytest.mark.asyncio
+async def test_natural_capability_succeeds_only_in_its_bound_turn(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    session_key = "codex-bridge:zulip:42:Build:person@example.com"
+    gateway, session_store = _lifecycle_runtime({"session-a": session_key})
+    token = _nlp_token_from_rewrite(
+        _invoke_with_runtime(manager, _event(), gateway, session_store)
+    )
+
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-a",
+        user_message="natural work request",
+        message_id=99,
+    )
+
+    assert _pre_tool_block(manager, token, "session-a", "turn-b") == (
+        "Codex bridge request rejected."
+    )
+    assert _pre_tool_block(manager, token, "session-a", "turn-a") is None
+    result = await _dispatch_tool_entry().handler(
+        {"semantic": _dispatch()}, session_id="session-a"
+    )
+    assert "任务可能已提交但响应丢失" in result  # BUG-3: improved unavailable message
+
+
+@pytest.mark.asyncio
+async def test_post_llm_revokes_only_the_exact_unused_turn_capability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot(
+            [
+                _route(42, "PROJECT", project_id="alpha"),
+                _route(43, "PROJECT", project_id="beta"),
+            ]
+        ),
+    )
+    key_a = "codex-bridge:zulip:42:Build:person@example.com"
+    key_b = "codex-bridge:zulip:43:Build:person@example.com"
+    gateway, session_store = _lifecycle_runtime(
+        {"session-a": key_a, "session-b": key_b}
+    )
+    token_a = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(stream_id=42, message_id=501), gateway, session_store
+        )
+    )
+    token_b = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(stream_id=43, message_id=502), gateway, session_store
+        )
+    )
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-a",
+        user_message="natural work request",
+        message_id=501,
+    )
+    _bind_turn(
+        manager,
+        session_id="session-b",
+        turn_id="turn-b",
+        user_message="natural work request",
+        message_id=502,
+    )
+
+    manager.invoke_hook(
+        "post_llm_call", session_id="session-a", turn_id="turn-a"
+    )
+
+    assert _pre_tool_block(manager, token_a, "session-a", "turn-a") == (
+        "Codex bridge request rejected."
+    )
+    assert _pre_tool_block(manager, token_b, "session-b", "turn-b") is None
+    assert _pre_tool_block(manager, token_b, "session-a", "turn-a") == (
+        "Codex bridge request rejected."
+    )
+
+
+def test_concurrent_session_capabilities_remain_isolated(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot(
+            [
+                _route(42, "PROJECT", project_id="alpha"),
+                _route(43, "PROJECT", project_id="beta"),
+            ]
+        ),
+    )
+    key_a = "codex-bridge:zulip:42:Build:person@example.com"
+    key_b = "codex-bridge:zulip:43:Build:person@example.com"
+    gateway, session_store = _lifecycle_runtime(
+        {"session-a": key_a, "session-b": key_b}
+    )
+    token_a = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(stream_id=42, message_id=601), gateway, session_store
+        )
+    )
+    token_b = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(stream_id=43, message_id=602), gateway, session_store
+        )
+    )
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-a",
+        user_message="natural work request",
+        message_id=601,
+    )
+    _bind_turn(
+        manager,
+        session_id="session-b",
+        turn_id="turn-b",
+        user_message="natural work request",
+        message_id=602,
+    )
+
+    assert _pre_tool_block(manager, token_a, "session-a", "turn-a") is None
+    assert _pre_tool_block(manager, token_b, "session-b", "turn-b") is None
+    assert _pre_tool_block(manager, token_a, "session-b", "turn-b") == (
+        "Codex bridge request rejected."
+    )
+    assert _pre_tool_block(manager, token_b, "session-a", "turn-a") == (
+        "Codex bridge request rejected."
+    )
+
+
+def test_orphan_capability_cannot_bind_a_later_identical_message(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    session_key = "codex-bridge:zulip:42:Build:person@example.com"
+    gateway, session_store = _lifecycle_runtime({"session-a": session_key})
+    orphan = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(message_id=701), gateway, session_store
+        )
+    )
+    current = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(message_id=702), gateway, session_store
+        )
+    )
+
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-current",
+        user_message="natural work request",
+        message_id=702,
+    )
+
+    assert _pre_tool_block(manager, orphan, "session-a", "turn-current") == (
+        "Codex bridge request rejected."
+    )
+    assert _pre_tool_block(manager, current, "session-a", "turn-current") is None
+
+
+@pytest.mark.asyncio
+async def test_identical_fifo_messages_bind_by_their_own_message_ids(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    session_key = "codex-bridge:zulip:42:Build:person@example.com"
+    gateway, session_store = _lifecycle_runtime({"session-a": session_key})
+    first = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(message_id=801), gateway, session_store
+        )
+    )
+    second = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(message_id=802), gateway, session_store
+        )
+    )
+
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-first",
+        user_message="natural work request",
+        message_id=801,
+    )
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-second",
+        user_message="natural work request",
+        message_id=802,
+    )
+
+    semantic = _dispatch()
+    assert _pre_tool_block(
+        manager, first, "session-a", "turn-first", semantic
+    ) is None
+    result = await _dispatch_tool_entry().handler(
+        {"semantic": semantic}, session_id="session-a"
+    )
+    assert "任务可能已提交但响应丢失" in result  # BUG-3: improved unavailable message
+    assert _pre_tool_block(manager, second, "session-a", "turn-second") is None
+
+
+def test_natural_capability_fails_closed_without_gateway_message_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    session_key = "codex-bridge:zulip:42:Build:person@example.com"
+    gateway, session_store = _lifecycle_runtime({"session-a": session_key})
+    token = _nlp_token_from_rewrite(
+        _invoke_with_runtime(
+            manager, _event(message_id=901), gateway, session_store
+        )
+    )
+
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-missing-message-id",
+        user_message="natural work request",
+        message_id=None,
+    )
+
+    assert _pre_tool_block(
+        manager, token, "session-a", "turn-missing-message-id"
+    ) == "Codex bridge request rejected."
 
 
 @pytest.mark.asyncio
@@ -1713,23 +2903,26 @@ async def test_natural_capability_rejects_tamper_binding_digest_length_and_direc
         _dispatch(),
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
     )
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
     globals_ = _plugin_globals(manager)
 
-    direct = _invoke(manager, _event("/hermes-codex-bridge-natural attacker"))
-    assert direct == {
-        "action": "rewrite",
-        "text": "/hermes-codex-bridge-natural invalid",
-    }
+    direct_event = _event("/hermes-codex-bridge-natural attacker")
+    assert _invoke(manager, direct_event) == {"action": "allow"}
+    assert not hasattr(direct_event, "channel_prompt")
+    assert "hermes-codex-bridge-natural" not in manager._plugin_commands
     assert await handler("invalid") == "Codex bridge request rejected."
 
-    for field, value in (
-        ("projectId", "other"),
-        ("topicMode", "HERMES_ONLY"),
-        ("messageSha256", "0" * 64),
-        ("messageBytes", 999),
+    for offset, (field, value) in enumerate(
+        (
+            ("projectId", "other"),
+            ("topicMode", "HERMES_ONLY"),
+            ("messageSha256", "0" * 64),
+            ("messageBytes", 999),
+        )
     ):
-        token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=100 + len(llm.calls))))
+        token = _nlp_token_from_rewrite(
+            _invoke(manager, _event(message_id=100 + offset))
+        )
         payload = _token_payload(token)
         payload[field] = value
         altered = globals_["_sign_context"](payload, b"k" * 32)
@@ -1760,7 +2953,7 @@ async def test_invalid_model_output_is_local_and_makes_no_repair_or_hco_call(
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
 
     assert await handler(token) == "Hermes model protocol error."
     assert len(llm.calls) == 1
@@ -1768,7 +2961,7 @@ async def test_invalid_model_output_is_local_and_makes_no_repair_or_hco_call(
 
 
 @pytest.mark.asyncio
-async def test_hermes_only_natural_dispatch_requires_auto_but_control_reaches_hco(
+async def test_hermes_only_dispatch_stays_blocked_but_explicit_control_reaches_hco(
     tmp_path: Path, monkeypatch
 ) -> None:
     snapshot = _snapshot(
@@ -1789,22 +2982,657 @@ async def test_hermes_only_natural_dispatch_requires_auto_but_control_reaches_hc
         return {"accepted": True}
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
 
     plain = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=301)))
     assert await handler(plain) == "Codex bridge request rejected."
     assert submissions == []
 
-    llm.parsed = _dispatch(topic_mode_action="AUTO")
-    auto = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=302)))
-    assert await handler(auto) == "Codex 请求已提交。"
-    assert len(submissions) == 1
-
     llm.parsed = {"type": "CONTROL", "action": "SET_TOPIC_MODE", "mode": "AUTO"}
-    control = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=303)))
+    control = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=302)))
     assert await handler(control) == "Codex 请求已提交。"
-    assert len(submissions) == 2
-    assert len(llm.calls) == 3
+    assert len(submissions) == 1
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_dispatch_instruction_referencing_foreign_project_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """BUG-2 L1: DISPATCH semantic whose instruction text names a different project
+    must be rejected before reaching HCO, with a clear conflict warning."""
+    snapshot = _snapshot([_route(42, "PROJECT", project_id="alpha")])
+    contaminated_dispatch = {
+        "type": "DISPATCH",
+        "instruction": "请在当前 beta 仓库中执行任务。",
+        "constraints": [],
+        "acceptanceCriteria": [],
+        "reminders": [],
+        "objective": None,
+    }
+    manager, _, llm = _load_manager_with_llm(tmp_path, monkeypatch, contaminated_dispatch, snapshot)
+
+    # Inject project_cwd_map into the live closure via dict mutation (captured by reference)
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    cwd_map = inspect.getclosurevars(hook).nonlocals["project_cwd_map"]
+    cwd_map.update({"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)})
+
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    globals_ = _plugin_globals(manager)
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=501)))
+    result = await _call_hco_tool(manager, token, contaminated_dispatch)
+
+    # Must reject without calling HCO
+    assert submissions == [], "contaminated instruction must not reach HCO"
+    assert "指令上下文冲突" in result, f"expected conflict warning, got: {result!r}"
+    assert "alpha" in result
+    assert "beta" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "foreign_reference"),
+    [
+        ("instruction", "Fix beta's failing tests."),
+        ("instruction", "Work on beta and update its CI."),
+        ("instruction", "修复 beta 的测试。"),
+        ("instruction", "debug beta"),
+        ("instruction", "请在 beta 仓库中执行"),
+        ("instruction", "请切换到 beta 执行"),
+        ("instruction", "请在 beta 中执行"),
+        ("instruction", "检查 beta 的仓库"),
+        ("instruction", "use beta for this task"),
+        ("instruction", "switch to beta"),
+        ("constraints", "必须在 beta 仓库中操作"),
+        ("acceptanceCriteria", "结果必须来自 beta project"),
+        ("reminders", "不要离开 beta repo"),
+        ("instruction", "使用 /workspace/beta"),
+        ("constraints", "禁止修改 /workspace/beta"),
+        ("acceptanceCriteria", "检查 /workspace/beta 的输出"),
+        ("reminders", "工作目录是 /workspace/beta"),
+    ],
+)
+async def test_dispatch_foreign_project_reference_in_any_text_field_is_rejected(
+    tmp_path: Path, monkeypatch, field: str, foreign_reference: str
+) -> None:
+    semantic = {
+        "type": "DISPATCH",
+        "instruction": "执行当前项目任务",
+        "constraints": [],
+        "acceptanceCriteria": [],
+        "reminders": [],
+        "objective": None,
+    }
+    if field == "instruction":
+        semantic[field] = foreign_reference
+    else:
+        semantic[field] = [foreign_reference]
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    cwd_map = inspect.getclosurevars(hook).nonlocals["project_cwd_map"]
+    cwd_map.update({"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)})
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=503)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+    assert field in result
+    assert "beta" in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_ask_common_english_does_not_false_positive(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {**_dispatch(), "instruction": "Ask the user before changing the API."}
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
+        {"alpha": ("/workspace/alpha", None), "ASK": ("/workspace/ASK", None)}
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=504)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert len(submissions) == 1
+    assert "指令上下文冲突" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "instruction",
+    [
+        "repositoryASK is a local identifier.",
+        "Do not ask for approval.",
+        "Use /workspace/alpha for this task.",
+        "Fix alpha's tests.",
+        "Inspect /workspace/beta-staging only.",
+        "Inspect /workspace/beta_prod only.",
+        "Inspect /workspace/beta.backup only.",
+    ],
+)
+async def test_dispatch_project_and_cwd_boundaries_do_not_false_positive(
+    tmp_path: Path, monkeypatch, instruction: str
+) -> None:
+    semantic = {**_dispatch(), "instruction": instruction}
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
+        {
+            "a": ("/workspace/a", None),
+            "alpha": ("/workspace/alpha", None),
+            "beta": ("/workspace/beta", None),
+            "ASK": ("/workspace/ASK", None),
+        }
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=506)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert len(submissions) == 1
+    assert "指令上下文冲突" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_exact_foreign_cwd_boundary_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {**_dispatch(), "instruction": "在 /workspace/beta 中执行"}
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
+        {"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)}
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=507)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_foreign_cwd_subpath_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {
+        **_dispatch(),
+        "instruction": "Edit /workspace/beta/src/main.py to fix the bug.",
+    }
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
+        {"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)}
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=801)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_normalizes_configured_cwd_and_ignores_root(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {
+        **_dispatch(),
+        "instruction": "Edit /workspace/beta/src/main.py to fix the bug.",
+    }
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    config_path = tmp_path / "cwd-map.json"
+    _write_private(
+        config_path,
+        json.dumps(
+            {
+                "projects": [
+                    {"projectId": "alpha", "cwd": "/workspace/alpha"},
+                    {"projectId": "beta", "cwd": "/workspace/beta/"},
+                    {"projectId": "root", "cwd": "/"},
+                ]
+            }
+        ).encode(),
+    )
+    loaded = globals_["_load_project_cwd_map"](str(config_path))
+    assert loaded == {
+        "alpha": ("/workspace/alpha", None),
+        "beta": ("/workspace/beta", None),
+        "root": (None, None),
+    }
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(loaded)
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=802)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_resolves_symlinked_project_cwd_before_conflict_check(
+    tmp_path: Path, monkeypatch
+) -> None:
+    canonical_beta = tmp_path / "canonical" / "beta"
+    canonical_beta.mkdir(parents=True)
+    symlink_beta = tmp_path / "symlink_beta"
+    symlink_beta.symlink_to(canonical_beta, target_is_directory=True)
+    semantic = {
+        **_dispatch(),
+        "instruction": f"Edit {canonical_beta / 'src' / 'main.py'} to fix the bug.",
+    }
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    config_path = tmp_path / "cwd-map-symlink.json"
+    _write_private(
+        config_path,
+        json.dumps(
+            {
+                "projects": [
+                    {"projectId": "alpha", "cwd": str(tmp_path / "alpha")},
+                    {"projectId": "beta", "cwd": str(symlink_beta)},
+                ]
+            }
+        ).encode(),
+    )
+    loaded = globals_["_load_project_cwd_map"](str(config_path))
+    assert loaded["beta"] == (str(symlink_beta), str(canonical_beta))
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(loaded)
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=803)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_rejects_configured_symlink_alias_subpath(
+    tmp_path: Path, monkeypatch
+) -> None:
+    canonical_beta = tmp_path / "canonical-alias" / "beta"
+    canonical_beta.mkdir(parents=True)
+    symlink_beta = tmp_path / "beta-alias"
+    symlink_beta.symlink_to(canonical_beta, target_is_directory=True)
+    semantic = {
+        **_dispatch(),
+        "instruction": f"Edit {symlink_beta / 'src' / 'main.py'} to fix the bug.",
+    }
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    config_path = tmp_path / "cwd-map-alias.json"
+    _write_private(
+        config_path,
+        json.dumps(
+            {
+                "projects": [
+                    {"projectId": "alpha", "cwd": str(tmp_path / "alpha")},
+                    {"projectId": "beta", "cwd": str(symlink_beta)},
+                ]
+            }
+        ).encode(),
+    )
+    loaded = globals_["_load_project_cwd_map"](str(config_path))
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(loaded)
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=804)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("instruction", "blocked"),
+    [
+        ("Fix root's failing tests.", True),
+        ("Inspect /anywhere/path without naming another project.", False),
+    ],
+)
+async def test_root_project_keeps_identity_without_matching_all_paths(
+    tmp_path: Path, monkeypatch, instruction: str, blocked: bool
+) -> None:
+    semantic = {**_dispatch(), "instruction": instruction}
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
+        {"alpha": ("/workspace/alpha", None), "root": (None, None)}
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=805 if blocked else 806)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert (submissions == []) is blocked
+    assert ("指令上下文冲突" in result) is blocked
+
+
+@pytest.mark.asyncio
+async def test_dispatch_explicit_ask_project_reference_is_rejected(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {**_dispatch(), "instruction": "请在 ASK 仓库中执行"}
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
+        {"alpha": ("/workspace/alpha", None), "ASK": ("/workspace/ASK", None)}
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=505)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert submissions == []
+    assert "指令上下文冲突" in result
+    assert "ASK" in result
+
+
+def test_safe_question_id_rejects_whitespace_and_accepts_simple_ids(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    is_safe = _plugin_globals(manager)["_is_safe_question_id"]
+
+    assert is_safe(" q1") is False
+    assert is_safe("\u00a0q1") is False
+    assert is_safe("\ufeffq1") is False
+    assert is_safe("\u0085q1") is False
+    assert is_safe("  ") is False
+    assert is_safe("q1") is True
+
+
+def test_safe_question_id_rejects_node_special_chars(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """_is_safe_question_id must reject the same chars as Node isSafeCliToken."""
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    is_safe = _plugin_globals(manager)["_is_safe_question_id"]
+
+    # Each character Node rejects that is not whitespace/control
+    for ch in '`"\'<>[]{}()|;\\/':
+        assert is_safe(f"q{ch}1") is False, f"expected rejection for char {ch!r}"
+
+    # Normal alphanumeric IDs and hyphens/underscores/dots are allowed
+    assert is_safe("q1") is True
+    assert is_safe("question-id_1.2") is True
+
+
+def test_project_reference_detection_handles_boundaries_verbs_and_short_names(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    mentions = _plugin_globals(manager)["_mentions_project_id"]
+
+    assert mentions("Please handle beta failures", "beta") is True
+    assert mentions("Please investigate beta failures", "beta") is True
+    assert mentions("请处理 beta 中的失败", "beta") is True
+    assert mentions("fix api", "api") is True
+    assert mentions("run test", "test") is True
+    assert mentions("debug test", "test") is True
+    assert mentions("work in foo.bar", "foo") is False
+
+
+@pytest.mark.asyncio
+async def test_partial_answer_renders_missing_question_ids(
+    tmp_path: Path, monkeypatch
+) -> None:
+    snapshot = _snapshot([_route(42, "PROJECT", project_id="alpha")])
+    dispatch = _dispatch()
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path, monkeypatch, dispatch, snapshot
+    )
+
+    async def submit(_self, event):
+        return {
+            "schemaVersion": 1,
+            "status": "partial",
+            "action": "interaction.answer",
+            "projectId": "alpha",
+            "objectiveId": "objective-1",
+            "interactionId": "interaction-1",
+            "missingQuestionIds": ["q2", "q3"],
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=901)))
+    result = await _call_hco_tool(manager, token, dispatch)
+
+    assert "已记录部分回答" in result
+    assert "q2" in result
+    assert "q3" in result
+    assert "/codex answer" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing, expected",
+    [
+        (["q2", "bad\nvalue"], None),
+        (["q2", 7], None),
+        (["q1\ninjected"], None),
+        ([7], None),
+    ],
+)
+async def test_partial_answer_filters_unsafe_missing_question_ids(
+    tmp_path: Path, monkeypatch, missing, expected
+) -> None:
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path, monkeypatch, _dispatch(), _snapshot([_route(42, "PROJECT", project_id="alpha")])
+    )
+
+    async def submit(_self, event):
+        return {
+            "schemaVersion": 1,
+            "status": "partial",
+            "action": "interaction.answer",
+            "projectId": "alpha",
+            "objectiveId": "objective-1",
+            "interactionId": "interaction-1",
+            "missingQuestionIds": missing,
+        }
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=902)))
+    result = await _call_hco_tool(manager, token, _dispatch())
+
+    if expected is None:
+        assert result == "Codex bridge protocol error."
+    else:
+        assert expected in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_continue_bridge_unavailable_includes_objective_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {
+        **_dispatch(objective={"mode": "CONTINUE", "objectiveId": "objective-123"}),
+        "instruction": "继续任务",
+    }
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+
+    async def submit(_self, _event):
+        raise _plugin_globals(manager)["BridgeUnavailableError"]("offline")
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=506)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert "任务可能已提交但响应丢失" in result
+    assert "objective-123" in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_instruction_with_own_project_name_is_accepted(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """BUG-2 L1: DISPATCH semantic whose instruction mentions the trusted project
+    must not be rejected (no false positive)."""
+    snapshot = _snapshot([_route(42, "PROJECT", project_id="alpha")])
+    clean_dispatch = {
+        "type": "DISPATCH",
+        "instruction": "请在当前 alpha 项目中执行任务。",
+        "constraints": [],
+        "acceptanceCriteria": [],
+        "reminders": [],
+        "objective": None,
+    }
+    manager, _, llm = _load_manager_with_llm(tmp_path, monkeypatch, clean_dispatch, snapshot)
+
+    # Inject project_cwd_map: alpha→beta conflict only triggered for foreign names
+    hook = manager._hooks["pre_gateway_dispatch"][0]
+    cwd_map = inspect.getclosurevars(hook).nonlocals["project_cwd_map"]
+    cwd_map.update({"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)})
+
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True}
+
+    globals_ = _plugin_globals(manager)
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=502)))
+    result = await _call_hco_tool(manager, token, clean_dispatch)
+
+    # Must reach HCO normally — no false positive on own project name
+    assert len(submissions) == 1, "clean instruction must reach HCO"
+    assert "指令上下文冲突" not in result
 
 
 def test_natural_vault_fails_closed_at_sender_and_global_capacity_then_cleans_expiry(
@@ -1822,25 +3650,19 @@ def test_natural_vault_fails_closed_at_sender_and_global_capacity_then_cleans_ex
     now = int(time.time())
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now)
 
-    assert _invoke(manager, _event(sender_id=17, message_id=401))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
+    _nlp_token_from_rewrite(_invoke(manager, _event(sender_id=17, message_id=401)))
     assert _invoke(manager, _event(sender_id=17, message_id=402)) == {
         "action": "rewrite",
-        "text": "/hermes-codex-bridge-natural invalid",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
     }
-    assert _invoke(manager, _event(sender_id=18, message_id=403))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
+    _nlp_token_from_rewrite(_invoke(manager, _event(sender_id=18, message_id=403)))
     assert _invoke(manager, _event(sender_id=19, message_id=404)) == {
         "action": "rewrite",
-        "text": "/hermes-codex-bridge-natural invalid",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
     }
 
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now + 91)
-    assert _invoke(manager, _event(sender_id=19, message_id=405))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
+    _nlp_token_from_rewrite(_invoke(manager, _event(sender_id=19, message_id=405)))
 
 
 @pytest.mark.asyncio
@@ -1913,7 +3735,7 @@ async def test_nlp_capability_boundary_matrix_has_stable_counts(
         return {"accepted": True}
 
     monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
-    handler = manager._plugin_commands["hermes-codex-bridge-natural"]["handler"]
+    handler = _natural_tool_handler(manager, llm)
 
     expected = "Codex 请求已提交。" if accepted else "Codex bridge request rejected."
     assert await handler(altered) == expected
@@ -1939,15 +3761,11 @@ def test_natural_vault_exact_capacity_byte_and_cleanup_boundaries(
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now)
 
     monkeypatch.setitem(globals_, "MAX_PENDING_PER_SENDER", 2)
-    assert _invoke(manager, _event("a", sender_id=17, message_id=800))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
-    assert _invoke(manager, _event("b", sender_id=17, message_id=801))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
+    _nlp_token_from_rewrite(_invoke(manager, _event("a", sender_id=17, message_id=800)))
+    _nlp_token_from_rewrite(_invoke(manager, _event("b", sender_id=17, message_id=801)))
     assert _invoke(manager, _event("c", sender_id=17, message_id=802)) == {
         "action": "rewrite",
-        "text": "/hermes-codex-bridge-natural invalid",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
     }
 
     manager, _, llm = _load_manager_with_llm(
@@ -1960,12 +3778,13 @@ def test_natural_vault_exact_capacity_byte_and_cleanup_boundaries(
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now)
     monkeypatch.setitem(globals_, "MAX_PENDING_ENTRIES", 2)
     for sender_id, message_id in ((17, 810), (18, 811)):
-        assert _invoke(manager, _event("a", sender_id=sender_id, message_id=message_id))[
-            "text"
-        ].startswith("/hermes-codex-bridge-natural ")
-    assert _invoke(manager, _event("a", sender_id=19, message_id=812))["text"].endswith(
-        " invalid"
-    )
+        _nlp_token_from_rewrite(
+            _invoke(manager, _event("a", sender_id=sender_id, message_id=message_id))
+        )
+    assert _invoke(manager, _event("a", sender_id=19, message_id=812)) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
 
     manager, _, llm = _load_manager_with_llm(
         tmp_path / "bytes",
@@ -1977,12 +3796,13 @@ def test_natural_vault_exact_capacity_byte_and_cleanup_boundaries(
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now)
     monkeypatch.setitem(globals_, "MAX_PENDING_BYTES", 6)
     for sender_id, message_id in ((17, 820), (18, 821)):
-        assert _invoke(manager, _event("界", sender_id=sender_id, message_id=message_id))[
-            "text"
-        ].startswith("/hermes-codex-bridge-natural ")
-    assert _invoke(manager, _event("a", sender_id=19, message_id=822))["text"].endswith(
-        " invalid"
-    )
+        _nlp_token_from_rewrite(
+            _invoke(manager, _event("界", sender_id=sender_id, message_id=message_id))
+        )
+    assert _invoke(manager, _event("a", sender_id=19, message_id=822)) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
 
     manager, _, llm = _load_manager_with_llm(
         tmp_path / "cleanup",
@@ -1993,15 +3813,14 @@ def test_natural_vault_exact_capacity_byte_and_cleanup_boundaries(
     globals_ = _plugin_globals(manager)
     monkeypatch.setitem(globals_, "MAX_PENDING_ENTRIES", 1)
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now)
-    assert _invoke(manager, _event("a", message_id=830))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
+    _nlp_token_from_rewrite(_invoke(manager, _event("a", message_id=830)))
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now + 90)
-    assert _invoke(manager, _event("b", message_id=831))["text"].endswith(" invalid")
+    assert _invoke(manager, _event("b", message_id=831)) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
     monkeypatch.setitem(globals_, "_now_seconds", lambda: now + 91)
-    assert _invoke(manager, _event("c", message_id=832))["text"].startswith(
-        "/hermes-codex-bridge-natural "
-    )
+    _nlp_token_from_rewrite(_invoke(manager, _event("c", message_id=832)))
     assert llm.calls == []
 
 
@@ -2129,8 +3948,8 @@ async def test_semantic_utf8_count_and_total_json_exact_plus_one_boundaries(
     assert len(submissions) == exact_submits
     assert plus_result == "Hermes model protocol error."
     assert globals_["_valid_semantic"](plus) is False
-    assert exact_agent_entries == []
-    assert plus_agent_entries == []
+    assert exact_agent_entries == ["ordinary-agent"]
+    assert plus_agent_entries == ["ordinary-agent"]
     if exact_submits:
         assert exact_result == "Codex 请求已提交。"
     elif exact["type"] == "CLARIFY":
@@ -2218,7 +4037,7 @@ async def test_semantic_scalar_type_matrix_is_total_and_gateway_local(
     assert result == "Hermes model protocol error."
     assert len(llm.calls) == 1
     assert submissions == []
-    assert agent_entries == []
+    assert agent_entries == ["ordinary-agent"]
 
 
 @pytest.mark.asyncio
@@ -2258,7 +4077,7 @@ async def test_semantic_container_type_matrix_is_total_and_gateway_local(
     assert result == "Hermes model protocol error."
     assert len(llm.calls) == 1
     assert submissions == []
-    assert agent_entries == []
+    assert agent_entries == ["ordinary-agent"]
 
 
 def test_semantic_validation_never_raises_for_recursive_and_malformed_objects(
@@ -2310,4 +4129,4 @@ async def test_gateway_contains_unexpected_validator_failure(
 
     assert result == "Hermes model protocol error."
     assert len(llm.calls) == 1
-    assert agent_entries == []
+    assert agent_entries == ["ordinary-agent"]

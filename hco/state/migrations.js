@@ -415,6 +415,11 @@ const ROUTE_ACL_CONTROL_PLANE_SCHEMA = `
   ) STRICT;
 `;
 
+const INTERACTION_PARTIAL_ANSWERS_SCHEMA = `
+  ALTER TABLE pending_interactions
+  ADD COLUMN partial_answers_json TEXT;
+`;
+
 const migrations = [
   Object.freeze({
     version: 1,
@@ -451,6 +456,14 @@ migrations.push(Object.freeze({
   name: "route_acl_control_plane",
   up(db) {
     db.exec(ROUTE_ACL_CONTROL_PLANE_SCHEMA);
+  }
+}));
+
+migrations.push(Object.freeze({
+  version: migrations.at(-1).version + 1,
+  name: "interaction_partial_answers",
+  up(db) {
+    db.exec(INTERACTION_PARTIAL_ANSWERS_SCHEMA);
   }
 }));
 
