@@ -1,0 +1,129 @@
+{
+  "run_id": "hco-api-20260722T215446Z-eecbc8ab",
+  "stream_id": 2,
+  "topic": "hco-api-20260722T215446Z-eecbc8ab",
+  "credentials": "read from local config; not recorded",
+  "records": [
+    {
+      "case_id": "B-01",
+      "message_id": 490,
+      "raw_sha256": "c56ec7df3ac7e9102b923f57c83550dc5c81756243bc01ab51fe2771e52eccbd",
+      "rendered_sha256": "1d0305b28b6e48fa543a83ee424aed965ead545fc1d11dda2d6a43859c373e79",
+      "raw_bytes": 91,
+      "rendered_bytes": 98,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-1",
+      "message_id": 491,
+      "raw_sha256": "ef7158a5b08f8c8de139e52e373fd4fef62f98d6b8b764eaaffb6126e6198d01",
+      "rendered_sha256": "c7a09f018047f7cd1ff94de8d1e8bfb206106f9a321151068b02cdd2ae29cc83",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-2",
+      "message_id": 492,
+      "raw_sha256": "d0a3730379c8b8bc1db36f91180cf0ec88185b95cc94f631cad03c5ef98f5d68",
+      "rendered_sha256": "418ed1cbbcc1a690c7d3527fef6b37301ca553567780b5404b0ad66647637c09",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-3",
+      "message_id": 493,
+      "raw_sha256": "adce0cecf4c4cc77b0261a67f8c5f9242958f4f44fa6c6c6e19462b1264fa683",
+      "rendered_sha256": "144566070146e4b1beea5142b505da9754e55e7dfe8d694030382fa886e14e40",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-4",
+      "message_id": 494,
+      "raw_sha256": "9bd6e3362f8071863c4a0913b5c029aa1a14ca37793cf9c4ddc24a172d3de90c",
+      "rendered_sha256": "7c90a3ceddef1bf332af5d0bd04960ee05a10615f66ba29f6d1f0ab6a9f470ef",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-5",
+      "message_id": 495,
+      "raw_sha256": "c40e48904cea2226594276535ef533e64a5ad14570aecc70b0ab1224399a2f22",
+      "rendered_sha256": "c08f22dec7f67e08315053aaae34e18b20d0657f7324c170b29260bd09bd3dbb",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-6",
+      "message_id": 496,
+      "raw_sha256": "ada1e2e8116a6698bc1db3e8030077976b32ffa5246ae1c2fdd59504a28ef8d1",
+      "rendered_sha256": "b0a3faf70437e188b7c547fabbd6130f4f6ea7b3bc2ea25cd9d56d0d789b3014",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-7",
+      "message_id": 497,
+      "raw_sha256": "be7e325e1bec2d2ef23988c9997081233d93537b88b2d6d3d933371d61964180",
+      "rendered_sha256": "53220428ed5d777f331390c586cc337497a2ac9146e18d95076ac2cf7b8b6757",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-02-8",
+      "message_id": 498,
+      "raw_sha256": "8de3465a065e30ebc166d86ca744d328840bce31f6ad5405a2eb60cf7e5d1808",
+      "rendered_sha256": "195033f2e5bb55ef3359e529c7f56f5afb42f58e016331342da687a23fab5732",
+      "raw_bytes": 52,
+      "rendered_bytes": 59,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-03",
+      "message_id": 499,
+      "raw_sha256": "65170bcd0e8c78fca0832d901fea10c575eab9f368d8707be431fdc310cd9496",
+      "rendered_sha256": "14b3e656ccdfe78cd166cb64f7c7bedc86ff1ccc41b07aa0e72db8812fff2802",
+      "raw_bytes": 167,
+      "rendered_bytes": 174,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-04",
+      "message_id": 500,
+      "raw_sha256": "e44029ec07057933b352840541b186286b984728fa8e6a802e102608e26345d4",
+      "rendered_sha256": "7e75592ef9707851feba769c80dc76e9a21dd19ec750aee5e8027413fce4f275",
+      "raw_bytes": 98,
+      "rendered_bytes": 105,
+      "status": "PASS",
+      "failures": []
+    },
+    {
+      "case_id": "B-05",
+      "message_id": 501,
+      "raw_sha256": "6148545a4e1d7788046276e2cb3ceebd88a3eed3d9ecd10aaf7df8145c712678",
+      "rendered_sha256": "fbf810e64494afabd569c2783dcd125028c98635822ec0115374cd55bd818272",
+      "raw_bytes": 7498,
+      "rendered_bytes": 7505,
+      "status": "PASS",
+      "failures": []
+    }
+  ],
+  "status": "PASS"
+}

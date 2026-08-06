@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { mkdtempSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -42,7 +43,7 @@ function fakeBackend(overrides = {}) {
   });
 }
 
-function controllerFixture(t, { appServerBackend = fakeBackend(), tmuxBackend } = {}) {
+function controllerFixture(t, { appServerBackend = fakeBackend(), tmuxBackend, legacyArtifactsEnabled = true } = {}) {
   const directory = mkdtempSync(path.join(tmpdir(), "hco-controller-"));
   const databasePath = path.join(directory, "authority.sqlite3");
   const clock = { value: START_MS };
@@ -53,7 +54,13 @@ function controllerFixture(t, { appServerBackend = fakeBackend(), tmuxBackend } 
     return `${kind}-${next}`;
   };
   const store = openStore({ databasePath, now: () => clock.value, idFactory });
-  const controller = new TurnController({ store, appServerBackend, tmuxBackend, leaseOwner: "controller-1" });
+  const controller = new TurnController({
+    store,
+    appServerBackend,
+    tmuxBackend,
+    legacyArtifactsEnabled,
+    leaseOwner: "controller-1"
+  });
   t.after(() => store.close());
   return { clock, controller, databasePath, store };
 }
@@ -119,7 +126,9 @@ test("App Server backend maps lifecycle operations without retry or tmux selecti
   };
   const backend = createAppServerBackend({ client });
 
-  assert.deepEqual(await backend.startObjective({ threadOptions: { model: "gpt-5" } }), { threadId: "thread-1" });
+  assert.deepEqual(await backend.startObjective({
+    threadOptions: { model: "gpt-5", modelReasoningEffort: "high" }
+  }), { threadId: "thread-1" });
   assert.deepEqual(await backend.startTurn({
     threadId: "thread-1",
     text: "continue",
@@ -140,10 +149,27 @@ test("App Server backend maps lifecycle operations without retry or tmux selecti
   assert.deepEqual(backend.getCapabilities(), {
     backend: "app-server",
     durableThreadContinuity: true,
-    reverseInteractions: true
+    reverseInteractions: true,
+    fileExchange: {
+      profile: "local_single_broker_exchange/v1",
+      supported: false,
+      physicalSeal: false,
+      enforcedUploadLimits: false,
+      anchoredUploadDirectories: false,
+      capabilityRevision: null,
+      limitProfileDigest: null,
+      maxDepth: null,
+      maximumFilesPerAttempt: null,
+      maximumBytesPerAttempt: null,
+      maximumBytesPerWork: null,
+      hcoReserveBytes: null,
+      maximumRetentionMs: null,
+      maxEffectivePathUnits: null,
+      pathUnits: null
+    }
   });
   assert.deepEqual(calls, [
-    ["startThread", { model: "gpt-5" }],
+    ["startThread", { model: "gpt-5", modelReasoningEffort: "high" }],
     ["startTurn", { threadId: "thread-1", text: "continue", clientUserMessageId: "client-1" }],
     ["readThread", { threadId: "thread-1", includeTurns: true }],
     ["readThread", { threadId: "thread-1", includeTurns: true }],
@@ -232,10 +258,77 @@ test("tmux backend is inert until explicitly called and never claims App Server 
   assert.deepEqual(backend.getCapabilities(), {
     backend: "tmux",
     durableThreadContinuity: false,
-    reverseInteractions: false
+    reverseInteractions: false,
+    fileExchange: {
+      profile: "local_single_broker_exchange/v1",
+      supported: false,
+      physicalSeal: false,
+      enforcedUploadLimits: false,
+      anchoredUploadDirectories: false,
+      capabilityRevision: null,
+      limitProfileDigest: null,
+      maxDepth: null,
+      maximumFilesPerAttempt: null,
+      maximumBytesPerAttempt: null,
+      maximumBytesPerWork: null,
+      hcoReserveBytes: null,
+      maximumRetentionMs: null,
+      maxEffectivePathUnits: null,
+      pathUnits: null
+    }
   });
   assert.deepEqual(await backend.startObjective({ objectiveId: "objective-1" }), { objectiveRef: "tmux-1" });
   assert.deepEqual(calls, [["startObjective", { objectiveId: "objective-1" }]]);
+});
+
+test("legacy project artifacts are rejected unless explicitly enabled", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-gate-"));
+  const { controller, store } = controllerFixture(t, { legacyArtifactsEnabled: false });
+  await assert.rejects(
+    controller.acceptIntent(intent({
+      artifactBaseDir: projectDirectory,
+      artifacts: { input: [], output: [] }
+    })),
+    (error) => assertCode(error, "FILE_EXCHANGE_UNSUPPORTED")
+  );
+  assert.equal(store.readObjectiveExecution("objective-1"), null);
+});
+
+test("managed artifact mode fails closed before creating an execution intent", async (t) => {
+  const { controller, store } = controllerFixture(t, { legacyArtifactsEnabled: true });
+  await assert.rejects(
+    controller.acceptIntent(intent({ artifactMode: "managed" })),
+    (error) => assertCode(error, "FILE_EXCHANGE_UNSUPPORTED")
+  );
+  assert.equal(store.readObjectiveExecution("objective-1"), null);
+});
+
+test("project-local artifacts are accepted independently of the legacy artifact compatibility gate", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-project-local-gate-"));
+  const inputDirectory = path.join(projectDirectory, ".hco", "exchanges", "v1", "work-1", "exchange-1", "input");
+  mkdirSync(inputDirectory, { recursive: true });
+  const contextText = "project-local context\n";
+  writeFileSync(path.join(inputDirectory, "context.md"), contextText);
+  const { controller, store } = controllerFixture(t, { legacyArtifactsEnabled: false });
+
+  const result = await controller.acceptIntent(intent({
+    artifactMode: "project_local",
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [{
+        artifactId: "hco-context",
+        path: ".hco/exchanges/v1/work-1/exchange-1/input/context.md",
+        kind: "context",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        sha256: createHash("sha256").update(contextText).digest("hex")
+      }],
+      output: []
+    }
+  }));
+
+  assert.equal(result.status, "started");
+  assert.equal(store.readObjectiveExecution("objective-1").executionStatus, "running");
 });
 
 test("acceptIntent persists submission intent before one backend call and binds objective, thread, and turn", async (t) => {
@@ -764,6 +857,438 @@ test("terminal completion without authoritative output durably requires reconcil
   assert.equal(store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 }).length, 0);
 });
 
+test("required output artifact missing keeps the turn in reconciliation without final outbox", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-project-"));
+  mkdirSync(path.join(projectDirectory, "docs"));
+  const { controller, store } = controllerFixture(t);
+  await controller.acceptIntent(intent({
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [],
+      output: [{
+        artifactId: "result",
+        path: "docs/result.md",
+        kind: "document",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        required: true
+      }]
+    }
+  }));
+
+  const result = await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{
+        id: "final-without-artifact",
+        type: "agentMessage",
+        status: "completed",
+        phase: "final_answer",
+        text: "I wrote the requested artifact."
+      }]
+    },
+    sourceType: "app-server",
+    sourceId: "missing-artifact-completion"
+  });
+
+  assert.equal(result.status, "reconciliation_needed");
+  assert.equal(store.readTurnOutput("objective-1", "turn-1"), null);
+  assert.equal(store.readObjectiveExecution("objective-1").executionStatus, "reconciliation_needed");
+  assert.equal(store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 }).length, 0);
+});
+
+test("project-local completion fails deterministically when Codex changes a staged input", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-project-local-input-change-"));
+  const exchangeRoot = path.join(projectDirectory, ".hco", "exchanges", "v1", "work-1", "exchange-1");
+  mkdirSync(path.join(exchangeRoot, "input"), { recursive: true });
+  mkdirSync(path.join(exchangeRoot, "output"), { recursive: true });
+  const inputPath = path.join(exchangeRoot, "input", "context.md");
+  const outputPath = path.join(exchangeRoot, "output", "result.md");
+  const originalInput = "trusted staged input\n";
+  writeFileSync(inputPath, originalInput);
+  const { controller, store } = controllerFixture(t, { legacyArtifactsEnabled: false });
+  await controller.acceptIntent(intent({
+    artifactMode: "project_local",
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [{
+        artifactId: "hco-context",
+        path: ".hco/exchanges/v1/work-1/exchange-1/input/context.md",
+        kind: "context",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        sha256: createHash("sha256").update(originalInput).digest("hex")
+      }],
+      output: [{
+        artifactId: "result",
+        path: ".hco/exchanges/v1/work-1/exchange-1/output/result.md",
+        kind: "document",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        required: true
+      }]
+    }
+  }));
+  writeFileSync(inputPath, "Codex changed the staged input.\n");
+  writeFileSync(outputPath, "result\n");
+
+  const completed = await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", status: "completed", phase: "final_answer", text: "Done." }]
+    },
+    sourceType: "app-server",
+    sourceId: "project-local-input-changed"
+  });
+
+  assert.equal(completed.status, "reconciliation_needed");
+  assert.equal(completed.errorCode, "PROJECT_LOCAL_INPUT_CHANGED");
+  assert.equal(store.readTurnOutput("objective-1", "turn-1"), null);
+});
+
+test("project-local completion rejects malformed JSON output", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-project-local-json-"));
+  const outputDirectory = path.join(projectDirectory, ".hco", "exchanges", "v1", "work-1", "exchange-1", "output");
+  mkdirSync(outputDirectory, { recursive: true });
+  const { controller, store } = controllerFixture(t, { legacyArtifactsEnabled: false });
+  await controller.acceptIntent(intent({
+    artifactMode: "project_local",
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [],
+      output: [{
+        artifactId: "evidence",
+        path: ".hco/exchanges/v1/work-1/exchange-1/output/evidence.json",
+        kind: "evidence",
+        mimeType: "application/json",
+        maxBytes: 1024,
+        required: true
+      }]
+    }
+  }));
+  writeFileSync(path.join(outputDirectory, "evidence.json"), "{not-json}\n");
+
+  const completed = await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", status: "completed", phase: "final_answer", text: "Done." }]
+    },
+    sourceType: "app-server",
+    sourceId: "project-local-invalid-json"
+  });
+
+  assert.equal(completed.status, "reconciliation_needed");
+  assert.equal(completed.errorCode, "PROJECT_LOCAL_OUTPUT_INVALID");
+  assert.equal(store.readTurnOutput("objective-1", "turn-1"), null);
+});
+
+test("project-local completion publishes verified output and records AVAILABLE status", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-project-local-success-"));
+  const exchangeRoot = path.join(projectDirectory, ".hco", "exchanges", "v1", "work-1", "exchange-1");
+  const outputDirectory = path.join(exchangeRoot, "output");
+  mkdirSync(outputDirectory, { recursive: true });
+  writeFileSync(path.join(exchangeRoot, "status.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    exchangeMode: "project_local/v1",
+    workId: "work-1",
+    exchangeId: "exchange-1",
+    projectId: "alpha",
+    state: "READY",
+    updatedAtMs: START_MS
+  }, null, 2)}\n`);
+  const outputText = "verified project-local result\n";
+  writeFileSync(path.join(outputDirectory, "result.md"), outputText);
+  const { controller, store } = controllerFixture(t, { legacyArtifactsEnabled: false });
+  await controller.acceptIntent(intent({
+    artifactMode: "project_local",
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [],
+      output: [{
+        artifactId: "result",
+        path: ".hco/exchanges/v1/work-1/exchange-1/output/result.md",
+        kind: "document",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        required: true
+      }]
+    }
+  }));
+
+  const completed = await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{ id: "final", type: "agentMessage", status: "completed", phase: "final_answer", text: "Done." }]
+    },
+    sourceType: "app-server",
+    sourceId: "project-local-success"
+  });
+
+  assert.equal(completed.status, "completed");
+  assert.equal(JSON.parse(readFileSync(path.join(exchangeRoot, "status.json"), "utf8")).state, "AVAILABLE");
+  const [delivery] = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(delivery.payload.artifacts.output[0].state, "verified");
+  assert.equal(delivery.payload.artifacts.output[0].sha256, createHash("sha256").update(outputText).digest("hex"));
+});
+
+test("project-local completion rejects oversized, invalid UTF-8, and symlink outputs", async (t) => {
+  const scenarios = [
+    {
+      name: "oversized",
+      write(outputPath) { writeFileSync(outputPath, "too large\n"); },
+      maxBytes: 4
+    },
+    {
+      name: "invalid-utf8",
+      write(outputPath) { writeFileSync(outputPath, Buffer.from([0xc3, 0x28])); },
+      maxBytes: 1024
+    },
+    {
+      name: "symlink",
+      write(outputPath, outputDirectory) {
+        const target = path.join(outputDirectory, "real-result.md");
+        writeFileSync(target, "target\n");
+        symlinkSync(target, outputPath, "file");
+      },
+      maxBytes: 1024
+    }
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async (subtest) => {
+      const projectDirectory = mkdtempSync(path.join(tmpdir(), `hco-project-local-${scenario.name}-`));
+      const exchangeRoot = path.join(projectDirectory, ".hco", "exchanges", "v1", "work-1", "exchange-1");
+      const outputDirectory = path.join(exchangeRoot, "output");
+      mkdirSync(outputDirectory, { recursive: true });
+      writeFileSync(path.join(exchangeRoot, "status.json"), `${JSON.stringify({
+        schemaVersion: 1,
+        exchangeMode: "project_local/v1",
+        workId: "work-1",
+        exchangeId: "exchange-1",
+        projectId: "alpha",
+        state: "READY",
+        updatedAtMs: START_MS
+      }, null, 2)}\n`);
+      const outputPath = path.join(outputDirectory, "result.md");
+      try {
+        scenario.write(outputPath, outputDirectory);
+      } catch (error) {
+        if (scenario.name === "symlink" && ["EPERM", "EACCES"].includes(error?.code)) {
+          subtest.skip("file symlinks are unavailable on this host");
+          return;
+        }
+        throw error;
+      }
+      const { controller, store } = controllerFixture(subtest, { legacyArtifactsEnabled: false });
+      await controller.acceptIntent(intent({
+        artifactMode: "project_local",
+        artifactBaseDir: projectDirectory,
+        artifacts: {
+          input: [],
+          output: [{
+            artifactId: "result",
+            path: ".hco/exchanges/v1/work-1/exchange-1/output/result.md",
+            kind: "document",
+            mimeType: "text/markdown",
+            maxBytes: scenario.maxBytes,
+            required: true
+          }]
+        }
+      }));
+
+      const completed = await controller.handleTurnCompleted({
+        objectiveId: "objective-1",
+        turn: {
+          id: "turn-1",
+          status: "completed",
+          itemsView: "full",
+          items: [{ id: "final", type: "agentMessage", status: "completed", phase: "final_answer", text: "Done." }]
+        },
+        sourceType: "app-server",
+        sourceId: `project-local-${scenario.name}`
+      });
+
+      assert.equal(completed.status, "reconciliation_needed");
+      assert.equal(completed.errorCode, "PROJECT_LOCAL_OUTPUT_INVALID");
+      assert.equal(store.readTurnOutput("objective-1", "turn-1"), null);
+      assert.deepEqual(JSON.parse(readFileSync(path.join(exchangeRoot, "status.json"), "utf8")), {
+        schemaVersion: 1,
+        exchangeMode: "project_local/v1",
+        workId: "work-1",
+        exchangeId: "exchange-1",
+        projectId: "alpha",
+        state: "ERROR",
+        updatedAtMs: START_MS,
+        errorCode: "PROJECT_LOCAL_OUTPUT_INVALID"
+      });
+    });
+  }
+});
+
+test("required output artifact completion can retry with the original source after the file appears", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-project-"));
+  mkdirSync(path.join(projectDirectory, "docs"));
+  const outputPath = path.join(projectDirectory, "docs", "result.md");
+  const { controller, store } = controllerFixture(t);
+  await controller.acceptIntent(intent({
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [],
+      output: [{
+        artifactId: "result",
+        path: "docs/result.md",
+        kind: "document",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        required: true
+      }]
+    }
+  }));
+  const completion = {
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{
+        id: "final-artifact-retry",
+        type: "agentMessage",
+        status: "completed",
+        phase: "final_answer",
+        text: "Done."
+      }]
+    },
+    sourceType: "app-server",
+    sourceId: "artifact-retry-completion"
+  };
+
+  assert.equal((await controller.handleTurnCompleted(completion)).status, "reconciliation_needed");
+  writeFileSync(outputPath, "result after retry\n");
+
+  const retried = await controller.handleTurnCompleted(completion);
+  assert.equal(retried.status, "completed");
+  assert.equal(store.readObjectiveExecution("objective-1").executionStatus, "completed");
+  assert.equal(store.readTurnOutput("objective-1", "turn-1").rawText, "Done.");
+  const claimed = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(claimed.length, 1);
+  assert.equal(claimed[0].payload.artifacts.output[0].state, "verified");
+});
+
+test("missing optional output artifacts do not block completion", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-project-"));
+  mkdirSync(path.join(projectDirectory, "docs"));
+  const { controller, store } = controllerFixture(t);
+  await controller.acceptIntent(intent({
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [],
+      output: [{
+        artifactId: "supplement",
+        path: "docs/supplement.md",
+        kind: "document",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        required: false
+      }]
+    }
+  }));
+
+  const result = await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{
+        id: "final-without-optional-artifact",
+        type: "agentMessage",
+        status: "completed",
+        phase: "final_answer",
+        text: "Done without the optional supplement."
+      }]
+    },
+    sourceType: "app-server",
+    sourceId: "optional-artifact-completion"
+  });
+
+  assert.equal(result.status, "completed");
+  const claimed = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(claimed.length, 1);
+  assert.deepEqual(claimed[0].payload.artifacts.output[0], {
+    artifactId: "supplement",
+    path: "docs/supplement.md",
+    kind: "document",
+    mimeType: "text/markdown",
+    required: false,
+    maxBytes: 1024,
+    state: "missing"
+  });
+});
+
+test("verified output artifacts are attached to final outbox payloads", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-project-"));
+  mkdirSync(path.join(projectDirectory, "docs"));
+  const outputText = "artifact result\n";
+  const outputPath = path.join(projectDirectory, "docs", "result.md");
+  const outputSha256 = createHash("sha256").update(outputText, "utf8").digest("hex");
+  const { controller, store } = controllerFixture(t);
+  await controller.acceptIntent(intent({
+    artifactBaseDir: projectDirectory,
+    artifacts: {
+      input: [],
+      output: [{
+        artifactId: "result",
+        path: "docs/result.md",
+        kind: "document",
+        mimeType: "text/markdown",
+        maxBytes: 1024,
+        required: true
+      }]
+    }
+  }));
+  writeFileSync(outputPath, outputText);
+
+  const result = await controller.handleTurnCompleted({
+    objectiveId: "objective-1",
+    turn: {
+      id: "turn-1",
+      status: "completed",
+      itemsView: "full",
+      items: [{
+        id: "final-with-artifact",
+        type: "agentMessage",
+        status: "completed",
+        phase: "final_answer",
+        text: "Done."
+      }]
+    },
+    sourceType: "app-server",
+    sourceId: "verified-artifact-completion"
+  });
+
+  assert.equal(result.status, "completed");
+  const claimed = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(claimed.length, 1);
+  assert.equal(claimed[0].payload.artifacts.output[0].artifactId, "result");
+  assert.equal(claimed[0].payload.artifacts.output[0].path, "docs/result.md");
+  assert.equal(claimed[0].payload.artifacts.output[0].sha256, outputSha256);
+  assert.equal(claimed[0].payload.artifacts.output[0].bytes, Buffer.byteLength(outputText, "utf8"));
+  assert.match(claimed[0].payload.content, /Artifact manifest:/);
+  assert.match(claimed[0].payload.content, /docs\/result\.md/);
+});
+
 test("known-turn reconciliation reaches terminal state idempotently without replacement", async (t) => {
   let startCalls = 0;
   const terminalTurn = {
@@ -1034,24 +1559,128 @@ function interactionRequest(overrides = {}) {
   };
 }
 
+function claimInteractionPrompt(store) {
+  const detailContents = [];
+  for (let index = 0; index < 20; index += 1) {
+    const [delivery] = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+    assert.ok(delivery, "expected the next ordered interaction delivery");
+    if (delivery.payload.kind === "interaction_request") {
+      return { prompt: delivery, detailContent: detailContents.join("\n") };
+    }
+    assert.equal(delivery.payload.kind, "interaction_detail");
+    detailContents.push(delivery.payload.content);
+    store.ackOutbox({
+      deliveryId: delivery.deliveryId,
+      leaseToken: delivery.leaseToken,
+      zulipMessageId: 10_000 + index
+    });
+  }
+  assert.fail("interaction prompt was not released after its details");
+}
+
 test("default approval renderer provides fallback accept and cancel commands", async (t) => {
   const fixture = controllerFixture(t);
   await fixture.controller.acceptIntent(intent());
 
   const pending = await fixture.controller.handleInteractionRequest(interactionRequest());
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   assert.match(prompt.payload.content, /⚠️ \*\*审批请求\*\*/);
   assert.match(prompt.payload.content, new RegExp(pending.interactionId));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
-  assert.match(prompt.payload.content, /npm test/);
-  assert.match(prompt.payload.content, /允许响应者 ID: 101/);
+  assert.match(detailContent, /npm test/);
+  assert.equal(fixture.store.readInteractionDetail(pending.interactionId).state, "delivered");
+  assert.deepEqual(prompt.payload.ui.actionIds, prompt.payload.interaction.actions.map(({ actionId }) => actionId));
 });
 
-test("default approval renderer hides object decision choices from command rendering", async (t) => {
+test("action prompt remains blocked until every ordered detail chunk is acknowledged", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: { command: "x".repeat(60_000), availableDecisions: ["accept", "cancel"] }
+  }));
+
+  const [firstDetail] = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(firstDetail.payload.kind, "interaction_detail");
+  assert.equal(fixture.store.readInteractionDetail(pending.interactionId).state, "detail_pending");
+  assert.deepEqual(fixture.store.claimOutbox({ workerId: "other", limit: 10, leaseMs: 1_000 }), []);
+  fixture.store.ackOutbox({
+    deliveryId: firstDetail.deliveryId,
+    leaseToken: firstDetail.leaseToken,
+    zulipMessageId: 20_001
+  });
+  const [secondDetail] = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(secondDetail.payload.kind, "interaction_detail");
+  fixture.store.ackOutbox({
+    deliveryId: secondDetail.deliveryId,
+    leaseToken: secondDetail.leaseToken,
+    zulipMessageId: 20_002
+  });
+  const [prompt] = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(prompt.payload.kind, "interaction_request");
+  assert.equal(fixture.store.readInteractionDetail(pending.interactionId).state, "delivered");
+});
+
+test("natural replies cannot settle an interaction before all details are delivered", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: { command: "x".repeat(60_000), availableDecisions: ["accept", "cancel"] },
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build" }
+  }));
+  const naturalReply = {
+    binding: { streamId: 42, topic: "Build", sourceMessageId: 601, senderId: 101 },
+    intent: "allow",
+    normalizedAlias: "ok"
+  };
+
+  assert.deepEqual(fixture.store.resolveNaturalInteraction(naturalReply), {
+    status: "not_applicable",
+    duplicate: false
+  });
+  assert.equal(fixture.store.readInteraction(pending.interactionId).state, "pending");
+
+  claimInteractionPrompt(fixture.store);
+  const settled = fixture.store.resolveNaturalInteraction({
+    ...naturalReply,
+    binding: { ...naturalReply.binding, sourceMessageId: 602 }
+  });
+
+  assert.equal(settled.status, "selected");
+  assert.equal(settled.interactionId, pending.interactionId);
+  assert.equal(fixture.store.readInteraction(pending.interactionId).state, "answered");
+  assert.equal(
+    fixture.store.readInteractionSettlementAudit(pending.interactionId).resolutionSource,
+    "natural_alias"
+  );
+});
+
+test("details beyond the chunk budget use a verified Markdown document before actions", async (t) => {
+  const fixture = controllerFixture(t);
+  await fixture.controller.acceptIntent(intent());
+  const pending = await fixture.controller.handleInteractionRequest(interactionRequest({
+    request: { command: "文档命令".repeat(100_000), availableDecisions: ["accept", "cancel"] }
+  }));
+
+  const [documentDelivery] = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(documentDelivery.payload.kind, "interaction_document");
+  const { document } = documentDelivery.payload;
+  assert.equal(Buffer.byteLength(document.textContent, "utf8"), document.bytes);
+  assert.equal(createHash("sha256").update(document.textContent, "utf8").digest("hex"), document.sha256);
+  assert.equal(fixture.store.readInteractionDetail(pending.interactionId).mode, "document");
+  fixture.store.ackOutbox({
+    deliveryId: documentDelivery.deliveryId,
+    leaseToken: documentDelivery.leaseToken,
+    zulipMessageId: 20_101
+  });
+  const [prompt] = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
+  assert.equal(prompt.payload.kind, "interaction_request");
+  assert.equal(prompt.payload.interaction.detail.mode, "document");
+});
+
+test("default approval renderer exposes policy decisions only through opaque action IDs", async (t) => {
   const fixture = controllerFixture(t);
   await fixture.controller.acceptIntent(intent());
 
@@ -1064,14 +1693,15 @@ test("default approval renderer hides object decision choices from command rende
       ]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
-  assert.match(prompt.payload.content, /App Server UI/);
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
   assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} acceptWithExecpolicyAmendment`));
-  assert.doesNotMatch(prompt.payload.content, /execpolicy_amendment/);
+  assert.match(detailContent, /execpolicy_amendment/);
+  const policyAction = prompt.payload.interaction.actions.find((action) => action.class === "policy_change");
+  assert.ok(policyAction);
+  assert.match(prompt.payload.content, new RegExp(`/codex interact ${pending.interactionId} ${policyAction.actionId}`));
   assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept$`, "m"));
   assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
 });
@@ -1087,19 +1717,19 @@ test("default approval renderer keeps accepting choices when commandActions is p
       commandActions: [{ command: "npm test" }]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   assert.doesNotMatch(prompt.payload.content, /扩展权限/);
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
-  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} acceptForSession`));
+  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} acceptForSession`));
+  assert.ok(prompt.payload.interaction.actions.some((action) => action.class === "policy_change"));
 });
 
 for (const [field, value] of [
   ["networkApprovalContext", { host: "example.com" }]
 ]) {
-  test(`default approval renderer hides accepting choices when ${field} is present`, async (t) => {
+  test(`default approval renderer keeps one-time approval when ${field} is present`, async (t) => {
     const fixture = controllerFixture(t);
     await fixture.controller.acceptIntent(intent());
 
@@ -1110,13 +1740,12 @@ for (const [field, value] of [
         [field]: value
       }
     }));
-    const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-    const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+    const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
     assert.ok(prompt);
-    assert.match(prompt.payload.content, /扩展权限/);
-    assert.match(prompt.payload.content, /App Server UI/);
-    assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept(?:ForSession)?$`, "m"));
+    assert.match(detailContent, /example\.com/);
+    assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+    assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} acceptForSession`));
     assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
     assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
   });
@@ -1144,8 +1773,7 @@ test("default user input renderer expands real single-question schema", async (t
       autoResolutionMs: null
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   assert.match(prompt.payload.content, /💬 \*\*输入请求\*\*/);
@@ -1187,7 +1815,7 @@ test("default user input renderer compacts oversized notifications", async (t) =
   assert.match(prompt.payload.content, new RegExp(`/codex answer ${pending.interactionId} <你的回答>`));
 });
 
-test("default approval renderer compacts oversized notifications using actual decisions", async (t) => {
+test("default approval renderer chunks oversized details without losing decisions", async (t) => {
   const fixture = controllerFixture(t);
   await fixture.controller.acceptIntent(intent());
 
@@ -1199,12 +1827,12 @@ test("default approval renderer compacts oversized notifications using actual de
       availableDecisions: ["decline"]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   assert.ok(Buffer.byteLength(prompt.payload.content, "utf8") <= 60_000);
-  assert.match(prompt.payload.content, /交互通知过大/);
+  assert.ok(detailContent.includes("a".repeat(10_000)));
+  assert.equal(fixture.store.readInteractionDetail(pending.interactionId).chunkCount, 2);
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
   assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
   assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
@@ -1221,17 +1849,16 @@ test("approval renderer uses extended fence for commands containing backticks", 
       availableDecisions: ["accept", "cancel"]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   // reason uses escapeMarkdownInline — backticks stay backslash-escaped in inline context
-  assert.match(prompt.payload.content, /review \\`\\`\\` injected fence/);
+  assert.match(detailContent, /review ``` injected fence/);
   // command is verbatim inside the code fence (no backslash-escaping)
-  assert.match(prompt.payload.content, /printf '```'/);
+  assert.match(detailContent, /printf '```'/);
   // fence is extended to 4 backticks to prevent early close; no bare ``` fence markers
-  assert.match(prompt.payload.content, /````/);
-  assert.ok(!prompt.payload.content.match(/^```$/m), "no bare 3-backtick fence lines");
+  assert.match(detailContent, /````/);
+  assert.ok(!detailContent.match(/^```$/m), "no bare 3-backtick fence lines");
 });
 
 test("approval renderer uses codeSpan for cwd containing backticks", async (t) => {
@@ -1245,13 +1872,12 @@ test("approval renderer uses codeSpan for cwd containing backticks", async (t) =
       availableDecisions: ["accept", "cancel"]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   // codeSpan extends fence to 2 backticks; content is verbatim (no backslash before backtick)
-  assert.match(prompt.payload.content, /``\/path\/with`backtick\/dir``/);
-  assert.doesNotMatch(prompt.payload.content, /`\/path\/with\\`backtick/);
+  assert.match(detailContent, /\/path\/with`backtick\/dir/);
+  assert.doesNotMatch(detailContent, /\/path\/with\\`backtick/);
 });
 
 test("input renderer uses codeSpan for option labels containing backticks", async (t) => {
@@ -1271,8 +1897,7 @@ test("input renderer uses codeSpan for option labels containing backticks", asyn
       ]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   // codeSpan uses `` fence; verbatim label (no backslash)
@@ -1290,13 +1915,12 @@ test("unsafe interactionId suppresses approval commands", async (t) => {
   );
   // Override the interactionId after the fact in the outbox content check
   // by checking that a normal UUID-based interactionId produces commands
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt } = claimInteractionPrompt(fixture.store);
   assert.ok(prompt);
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
 });
 
-test("safeApprovalCommands returns empty array for unsafe interactionId", async (t) => {
+test("approval renderer suppresses all commands for an unsafe interactionId", async (t) => {
   // Use a custom idFactory that returns an unsafe id for the "interaction" kind
   const directory = mkdtempSync(path.join(tmpdir(), "hco-unsafe-id-"));
   const databasePath = path.join(directory, "authority.sqlite3");
@@ -1314,15 +1938,14 @@ test("safeApprovalCommands returns empty array for unsafe interactionId", async 
   await controller.handleInteractionRequest(
     interactionRequest({ request: { command: "echo hi", availableDecisions: ["accept", "cancel"] } })
   );
-  const prompts = store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt } = claimInteractionPrompt(store);
   assert.ok(prompt);
   // Unsafe interactionId → no approve or answer commands
   assert.doesNotMatch(prompt.payload.content, /\/codex approve/);
   assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
 });
 
-test("default approval renderer hides accepting choices when the command is truncated", async (t) => {
+test("default approval renderer keeps a 401-character command complete and approvable", async (t) => {
   const fixture = controllerFixture(t);
   await fixture.controller.acceptIntent(intent());
 
@@ -1332,18 +1955,18 @@ test("default approval renderer hides accepting choices when the command is trun
       availableDecisions: ["accept", "acceptForSession", "decline", "cancel"]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
-  assert.match(prompt.payload.content, /命令已截断/);
-  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.doesNotMatch(prompt.payload.content, /命令已截断/);
+  assert.match(detailContent, new RegExp("x{401}"));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
 });
 
 
-test("default approval renderer keeps compact truncation restrictions and malformed decisions safe", async (t) => {
+test("default approval renderer chunks long UTF-8 details and skips malformed decisions", async (t) => {
   const fixture = controllerFixture(t);
   await fixture.controller.acceptIntent(intent());
 
@@ -1355,19 +1978,18 @@ test("default approval renderer keeps compact truncation restrictions and malfor
       availableDecisions: [null, "accept", "decline", "cancel"]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
   assert.ok(Buffer.byteLength(prompt.payload.content, "utf8") <= 60_000);
-  assert.match(prompt.payload.content, /交互通知过大/);
-  assert.match(prompt.payload.content, /命令已截断/);
-  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.doesNotMatch(prompt.payload.content, /交互通知过大|命令已截断/);
+  assert.match(detailContent, new RegExp("x{401}"));
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
 });
 
-test("default approval renderer treats execpolicy amendments and unsafe choice keys as UI-only", async (t) => {
+test("default approval renderer keeps accept independent from proposed amendments and skips invalid decisions", async (t) => {
   const fixture = controllerFixture(t);
   await fixture.controller.acceptIntent(intent());
 
@@ -1378,12 +2000,11 @@ test("default approval renderer treats execpolicy amendments and unsafe choice k
       proposedExecpolicyAmendment: ["npm", "test"]
     }
   }));
-  const prompts = fixture.store.claimOutbox({ workerId: "worker", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const { prompt, detailContent } = claimInteractionPrompt(fixture.store);
 
   assert.ok(prompt);
-  assert.match(prompt.payload.content, /App Server UI/);
-  assert.doesNotMatch(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
+  assert.match(detailContent, /命令策略变更建议/);
+  assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
   assert.doesNotMatch(prompt.payload.content, /bad`key/);
   assert.doesNotMatch(prompt.payload.content, /apply\/network/);
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} decline`));
@@ -1469,6 +2090,7 @@ test("default user input renderer suppresses commands when any question is secre
   assert.doesNotMatch(prompt.payload.content, /\/codex answer/);
   assert.match(prompt.payload.content, /App Server UI/);
   assert.match(prompt.payload.content, /敏感/);
+  assert.doesNotMatch(prompt.payload.content, /选择环境|输入令牌|令牌/);
 });
 
 test("default user input renderer provides per-question commands when all questions are non-secret", async (t) => {
@@ -1628,11 +2250,21 @@ test("interaction answer authorizes immutable sender and target then commits bef
   store = fixture.store;
   await fixture.controller.acceptIntent(intent());
   const pending = await fixture.controller.handleInteractionRequest(interactionRequest());
+  const acceptAction = store.readInteraction(pending.interactionId).actions.find(
+    (action) => action.sourceKey === "accept"
+  );
   const answer = {
     interactionId: pending.interactionId,
     responderId: 101,
     targetSnapshot: { streamId: 42, topic: "Build" },
-    answer: { decision: "accept" }
+    answer: { decision: "accept" },
+    audit: {
+      actionId: acceptAction.actionId,
+      actionClass: acceptAction.actionClass,
+      resolutionSource: "explicit_action",
+      sourceType: "zulip-message",
+      sourceMessageId: "501"
+    }
   };
   await assert.rejects(
     fixture.controller.answerInteraction({ ...answer, responderId: 999 }),
@@ -1646,8 +2278,20 @@ test("interaction answer authorizes immutable sender and target then commits bef
   const answered = await fixture.controller.answerInteraction(answer);
   assert.equal(answered.status, "answered");
   assert.equal(Object.hasOwn(store.readInteraction(pending.interactionId).answer, "policyAmendment"), false);
+  assert.deepEqual(store.readInteractionSettlementAudit(pending.interactionId), {
+    interactionId: pending.interactionId,
+    actionId: acceptAction.actionId,
+    actionClass: "one_time_allow",
+    resolutionSource: "explicit_action",
+    sourceType: "zulip-message",
+    sourceMessageId: "501",
+    detailSha256: store.readInteractionDetail(pending.interactionId).contentSha256,
+    responderId: 101,
+    settledAt: START_MS
+  });
   const duplicate = await fixture.controller.answerInteraction(answer);
   assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.status, "already_answered");
   assert.equal(backendCalls, 1);
   await assert.rejects(
     fixture.controller.answerInteraction({ ...answer, answer: { decision: "decline" } }),
@@ -1885,6 +2529,170 @@ test("successful interaction response delivery is persisted and repeated answers
   assert.equal(repeated.duplicate, true);
   assert.equal(backendCalls, 1);
 });
+
+test("concurrent identical interaction answers hold one response lease and send only once", async (t) => {
+  let backendCalls = 0;
+  let releaseResponse;
+  let responseStarted;
+  const started = new Promise((resolve) => { responseStarted = resolve; });
+  const blocked = new Promise((resolve) => { releaseResponse = resolve; });
+  const backend = fakeBackend({
+    respondToInteraction: async () => {
+      backendCalls += 1;
+      responseStarted();
+      await blocked;
+    }
+  });
+  const { controller, store } = controllerFixture(t, { appServerBackend: backend });
+  await controller.acceptIntent(intent());
+  const pending = await controller.handleInteractionRequest(interactionRequest());
+  const answer = {
+    interactionId: pending.interactionId,
+    responderId: 101,
+    targetSnapshot: { streamId: 42, topic: "Build" },
+    answer: { decision: "accept" }
+  };
+
+  const firstPromise = controller.answerInteraction(answer);
+  await started;
+  const concurrent = await controller.answerInteraction(answer);
+
+  assert.equal(concurrent.status, "response_uncertain");
+  assert.equal(concurrent.duplicate, true);
+  assert.equal(backendCalls, 1);
+  assert.equal(store.readInteraction(pending.interactionId).responseDeliveryState, "pending");
+
+  releaseResponse();
+  const first = await firstPromise;
+  assert.equal(first.status, "answered");
+  assert.equal(store.readInteraction(pending.interactionId).responseDeliveryState, "delivered");
+  assert.equal(backendCalls, 1);
+});
+
+test("expired interaction response lease becomes uncertain and is never blindly replayed", async (t) => {
+  let backendCalls = 0;
+  const backend = fakeBackend({ respondToInteraction: async () => { backendCalls += 1; } });
+  const { clock, controller, store } = controllerFixture(t, { appServerBackend: backend });
+  await controller.acceptIntent(intent());
+  const pending = await controller.handleInteractionRequest(interactionRequest());
+  const answer = {
+    interactionId: pending.interactionId,
+    responderId: 101,
+    targetSnapshot: { streamId: 42, topic: "Build" },
+    answer: { decision: "accept" }
+  };
+  assert.equal(store.commitInteractionAnswer(answer).accepted, true);
+  assert.equal(store.claimInteractionResponse({
+    interactionId: pending.interactionId,
+    leaseOwner: "crashed-controller"
+  }).acquired, true);
+
+  clock.value += (2 * 60 * 1_000) + 1;
+  const afterExpiry = await controller.answerInteraction(answer);
+  const repeated = await controller.answerInteraction(answer);
+
+  assert.equal(afterExpiry.status, "response_uncertain");
+  assert.equal(afterExpiry.duplicate, true);
+  assert.equal(repeated.status, "response_uncertain");
+  assert.equal(store.readInteraction(pending.interactionId).responseDeliveryState, "uncertain");
+  assert.equal(backendCalls, 0);
+});
+
+test("a live response holder returns response_uncertain when its lease expires mid-flight", async (t) => {
+  let backendCalls = 0;
+  let releaseResponse;
+  let responseStarted;
+  const started = new Promise((resolve) => { responseStarted = resolve; });
+  const blocked = new Promise((resolve) => { releaseResponse = resolve; });
+  const backend = fakeBackend({
+    respondToInteraction: async () => {
+      backendCalls += 1;
+      responseStarted();
+      await blocked;
+    }
+  });
+  const { clock, controller, store } = controllerFixture(t, { appServerBackend: backend });
+  await controller.acceptIntent(intent());
+  const pending = await controller.handleInteractionRequest(interactionRequest());
+  const answer = {
+    interactionId: pending.interactionId,
+    responderId: 101,
+    targetSnapshot: { streamId: 42, topic: "Build" },
+    answer: { decision: "accept" }
+  };
+
+  const holder = controller.answerInteraction(answer);
+  await started;
+  clock.value += (2 * 60 * 1_000) + 1;
+
+  const observer = await controller.answerInteraction(answer);
+  assert.equal(observer.status, "response_uncertain");
+  assert.equal(store.readInteraction(pending.interactionId).responseDeliveryState, "uncertain");
+
+  releaseResponse();
+  const lateHolder = await holder;
+  assert.equal(lateHolder.status, "response_uncertain");
+  assert.equal(store.readInteraction(pending.interactionId).responseDeliveryState, "uncertain");
+  assert.equal(backendCalls, 1);
+});
+
+for (const scenario of [
+  {
+    label: "explicit orphaning",
+    orphan(controller) {
+      const result = controller.orphanInteractions({ connectionId: "connection-1" });
+      assert.equal(result.orphaned, 1);
+    }
+  },
+  {
+    label: "connection loss",
+    orphan(controller) {
+      const result = controller.handleConnectionLost({ connectionId: "connection-1" });
+      assert.equal(result.orphanedInteractions, 1);
+    }
+  }
+]) {
+  test(`${scenario.label} clears a mid-flight response lease and stabilizes the holder`, async (t) => {
+    let releaseResponse;
+    let responseStarted;
+    const started = new Promise((resolve) => { responseStarted = resolve; });
+    const blocked = new Promise((resolve) => { releaseResponse = resolve; });
+    const backend = fakeBackend({
+      respondToInteraction: async () => {
+        responseStarted();
+        await blocked;
+      }
+    });
+    const { controller, databasePath, store } = controllerFixture(t, { appServerBackend: backend });
+    const db = new Database(databasePath, { readonly: true });
+    t.after(() => db.close());
+    await controller.acceptIntent(intent());
+    const pending = await controller.handleInteractionRequest(interactionRequest());
+    const answer = {
+      interactionId: pending.interactionId,
+      responderId: 101,
+      targetSnapshot: { streamId: 42, topic: "Build" },
+      answer: { decision: "accept" }
+    };
+
+    const holder = controller.answerInteraction(answer);
+    await started;
+    const leaseCount = () => db.prepare(`
+      SELECT count(*) AS count FROM resource_leases
+      WHERE resource_type = 'interaction_response' AND resource_id = ?
+    `).get(pending.interactionId).count;
+    assert.equal(leaseCount(), 1);
+
+    scenario.orphan(controller);
+    assert.equal(store.readInteraction(pending.interactionId).state, "orphaned");
+    assert.equal(leaseCount(), 0);
+
+    releaseResponse();
+    const lateHolder = await holder;
+    assert.equal(lateHolder.status, "response_uncertain");
+    assert.equal(store.readInteraction(pending.interactionId).state, "orphaned");
+  });
+}
 
 test("expired and orphaned interactions reject answers without a backend response", async (t) => {
   let backendCalls = 0;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -9,6 +10,7 @@ import socket
 import stat
 import sys
 import threading
+import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -18,7 +20,7 @@ from zulip_sender import ZulipSender
 PROTOCOL_VERSION = 1
 PLUGIN_VERSION = "1.0.0"
 CAPABILITIES: list[str] = []
-MAX_RESPONSE_BYTES = 1_048_576
+MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 IO_TIMEOUT_SECONDS = 10.0
 MAX_IDENTIFIER_BYTES = 512
 MAX_CONTENT_BYTES = 65_536
@@ -30,6 +32,22 @@ MAX_WORKER_ID_BYTES = 4_096
 MAX_CLAIM_LIMIT = 100
 MAX_LEASE_MS = 24 * 60 * 60 * 1_000
 MAX_POLL_SECONDS = 60.0
+MAX_WIDGET_CHOICES = 10
+MAX_WIDGET_HEADING_BYTES = 200
+MAX_WIDGET_LABEL_BYTES = 100
+MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+MAX_DOCUMENT_NAME_BYTES = 200
+SAFE_ACTION_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,255}")
+ACTION_CLASSES = frozenset(
+    {
+        "one_time_allow",
+        "file_change_allow",
+        "deny",
+        "policy_change",
+        "network_policy_change",
+        "choice_input",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -199,6 +217,7 @@ class HcoClient:
         self.worker_id = worker_id
         self.claim_limit = claim_limit
         self.lease_ms = lease_ms
+        self.server_capabilities: frozenset[str] = frozenset()
 
     @staticmethod
     def _metadata() -> dict:
@@ -277,6 +296,12 @@ class HcoClient:
         }
         if type(document) is not dict or document.get("compatibility") != expected:
             raise HcoError(status, "HCO_INCOMPATIBLE", "HCO compatibility failed.")
+        advertised = document.get("serverCapabilities", [])
+        if type(advertised) is not list or any(
+            type(value) is not str or not value for value in advertised
+        ):
+            raise HcoError(status, "HCO_INCOMPATIBLE", "HCO compatibility failed.")
+        self.server_capabilities = frozenset(advertised)
 
     def check_health(self) -> None:
         document = self._request("GET", "/v1/health")
@@ -377,7 +402,127 @@ class DeliverySidecar:
         return delivery_id, lease_token
 
     @classmethod
-    def _validated_claim(cls, claim: object) -> tuple[str, str, int, str, str] | None:
+    def _widget_content(cls, payload: dict) -> str | None:
+        ui = payload.get("ui")
+        if ui is None:
+            return None
+        interaction = payload.get("interaction")
+        if type(ui) is not dict or type(interaction) is not dict:
+            raise ValueError("invalid interaction UI")
+        if set(ui) != {"type", "heading", "actionIds"} or ui.get("type") != "choices":
+            raise ValueError("invalid interaction UI")
+        heading = ui.get("heading")
+        action_ids = ui.get("actionIds")
+        interaction_id = interaction.get("interactionId")
+        actions = interaction.get("actions")
+        if (
+            not cls._bounded_text(heading, MAX_WIDGET_HEADING_BYTES)
+            or type(interaction_id) is not str
+            or SAFE_ACTION_TOKEN.fullmatch(interaction_id) is None
+            or type(action_ids) is not list
+            or not 0 < len(action_ids) <= MAX_WIDGET_CHOICES
+            or type(actions) is not list
+            or not 0 < len(actions) <= MAX_WIDGET_CHOICES
+        ):
+            raise ValueError("invalid interaction UI")
+        indexed = {}
+        for action in actions:
+            if type(action) is not dict or set(action) != {
+                "actionId", "label", "style", "class", "naturalAliasEligible"
+            }:
+                raise ValueError("invalid interaction UI")
+            action_id = action.get("actionId")
+            if (
+                type(action_id) is not str
+                or SAFE_ACTION_TOKEN.fullmatch(action_id) is None
+                or action_id in indexed
+                or not cls._bounded_text(action.get("label"), MAX_WIDGET_LABEL_BYTES)
+                or action.get("style") not in {"primary", "warning", "danger"}
+                or action.get("class") not in ACTION_CLASSES
+                or type(action.get("naturalAliasEligible")) is not bool
+            ):
+                raise ValueError("invalid interaction UI")
+            indexed[action_id] = action
+        if any(type(action_id) is not str for action_id in action_ids) or len(set(action_ids)) != len(action_ids):
+            raise ValueError("invalid interaction UI")
+        try:
+            selected = [indexed[action_id] for action_id in action_ids]
+        except KeyError as exc:
+            raise ValueError("invalid interaction UI") from exc
+        descriptions = {
+            "one_time_allow": "仅执行本次操作，不修改策略",
+            "file_change_allow": "仅应用本次文件变更",
+            "deny": "拒绝或取消本次操作",
+            "policy_change": "执行并更新命令策略",
+            "network_policy_change": "执行并更新网络策略",
+            "choice_input": "提交此选项",
+        }
+        return json.dumps(
+            {
+                "widget_type": "zform",
+                "extra_data": {
+                    "type": "choices",
+                    "heading": heading,
+                    "choices": [
+                        {
+                            "type": "multiple_choice",
+                            "short_name": action["label"],
+                            "long_name": descriptions[action["class"]],
+                            "reply": f"/codex interact {interaction_id} {action['actionId']}",
+                        }
+                        for action in selected
+                    ],
+                },
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def _document(cls, payload: dict) -> tuple[str, bytes, str] | None:
+        document = payload.get("document")
+        if document is None:
+            if payload.get("kind") == "interaction_document":
+                raise ValueError("missing interaction document")
+            return None
+        if payload.get("kind") != "interaction_document" or type(document) is not dict or set(document) != {
+            "schemaVersion", "kind", "displayName", "mimeType", "bytes", "sha256", "textContent"
+        }:
+            raise ValueError("invalid interaction document")
+        display_name = document.get("displayName")
+        text_content = document.get("textContent")
+        expected_bytes = document.get("bytes")
+        expected_sha256 = document.get("sha256")
+        if (
+            document.get("schemaVersion") != 1
+            or document.get("kind") != "interaction_detail"
+            or document.get("mimeType") != "text/markdown"
+            or not cls._bounded_text(display_name, MAX_DOCUMENT_NAME_BYTES)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}", display_name) is None
+            or type(text_content) is not str
+            or type(expected_bytes) is not int
+            or type(expected_bytes) is bool
+            or not 0 <= expected_bytes <= MAX_DOCUMENT_BYTES
+            or type(expected_sha256) is not str
+            or re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None
+        ):
+            raise ValueError("invalid interaction document")
+        try:
+            content_bytes = text_content.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ValueError("invalid interaction document") from exc
+        if (
+            len(content_bytes) != expected_bytes
+            or len(content_bytes) > MAX_DOCUMENT_BYTES
+            or hashlib.sha256(content_bytes).hexdigest() != expected_sha256
+        ):
+            raise ValueError("invalid interaction document")
+        return display_name, content_bytes, expected_sha256
+
+    @classmethod
+    def _validated_claim(
+        cls, claim: object
+    ) -> tuple[str, str, int, str, str, str | None, tuple[str, bytes, str] | None, int | None] | None:
         identity = cls._identity(claim)
         if identity is None or type(claim) is not dict:
             return None
@@ -385,19 +530,40 @@ class DeliverySidecar:
         target = claim.get("targetSnapshot")
         if type(payload) is not dict or type(target) is not dict:
             return None
-        content = payload.get("content")
         stream_id = target.get("streamId")
         topic = target.get("topic")
         if (
-            not cls._bounded_text(content, MAX_CONTENT_BYTES, allow_empty=True)
-            or target.get("platform") != "zulip"
+            target.get("platform") != "zulip"
             or type(stream_id) is not int
             or stream_id <= 0
             or stream_id > MAX_SAFE_INTEGER
             or not cls._bounded_text(topic, MAX_TOPIC_BYTES)
         ):
             return None
-        return (*identity, stream_id, topic, content)
+        delete_message_id = payload.get("zulipMessageId")
+        if payload.get("kind") == "interaction_prompt_delete":
+            if (
+                set(payload) != {"schemaVersion", "kind", "zulipMessageId"}
+                or payload.get("schemaVersion") != 2
+                or type(delete_message_id) is not int
+                or delete_message_id <= 0
+                or delete_message_id > MAX_SAFE_INTEGER
+            ):
+                return None
+            return (*identity, stream_id, topic, "", None, None, delete_message_id)
+        content = payload.get("content")
+        if (
+            not cls._bounded_text(content, MAX_CONTENT_BYTES, allow_empty=True)
+        ):
+            return None
+        try:
+            widget_content = cls._widget_content(payload)
+            document = cls._document(payload)
+        except (TypeError, ValueError):
+            return None
+        if widget_content is not None and document is not None:
+            return None
+        return (*identity, stream_id, topic, content, widget_content, document, None)
 
     def _bounded_diagnostic(self, value: object) -> str:
         text = str(value)
@@ -433,8 +599,27 @@ class DeliverySidecar:
             if identity is not None:
                 self._settle(self.hco.nack, *identity, "CLAIM_INVALID", False)
             return
-        delivery_id, lease_token, stream_id, topic, content = validated
-        result = self.sender.send(stream_id, topic, content)
+        delivery_id, lease_token, stream_id, topic, content, widget_content, document, delete_message_id = validated
+        if delete_message_id is not None:
+            result = self.sender.delete(delete_message_id)
+        elif document is not None:
+            display_name, document_bytes, sha256 = document
+            result = self.sender.send_document(
+                stream_id,
+                topic,
+                content,
+                display_name=display_name,
+                document_bytes=document_bytes,
+                sha256=sha256,
+            )
+        else:
+            result = (
+                self.sender.send(stream_id, topic, content)
+                if widget_content is None
+                else self.sender.send(
+                    stream_id, topic, content, widget_content=widget_content
+                )
+            )
         self._after_send(claim, result)
         if result.message_id is not None:
             self._settle(self.hco.ack, delivery_id, lease_token, result.message_id)

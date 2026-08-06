@@ -1,6 +1,8 @@
 # Hermes Codex Orchestrator
 
-Hermes Codex Orchestrator 包含两套彼此独立的执行面：
+> 当前目标方案以 [`docs/HCO_CODEX_SERVICE_BRIDGE_PRD.md`](docs/HCO_CODEX_SERVICE_BRIDGE_PRD.md) 为准：Hermes 保留消息、会话、Agent、提醒和用户投递，HCO 只负责 Zulip 项目范围、Codex App Server 长任务桥、反向事件和文档交换。本文下面的 Option C/Runner 操作说明属于现有实现或兼容面，不代表目标架构已经完成。
+
+当前仓库包含两套彼此独立的历史执行面：
 
 - **Option C 生产面**：`hco/`、`plugin/hermes-codex-bridge/` 和 delivery sidecar，通过 Codex App Server 保持话题上下文。这里以数字 Zulip stream ID 和 SQLite 为唯一权威状态，使用 `scripts/install-hermes-codex-bridge.sh` 安装。
 - **旧 Runner/tmux 兼容面**：`runner/` 和 `adapter/`，把任务写成项目文件并通过 `tmux` 投递给 Codex TUI。它仍使用频道显示名称和 JSON adapter state，只用于旧部署、harness 与回滚，不参与 Option C 路由，也不能提供 App Server thread 续接。
@@ -318,6 +320,8 @@ curl -H "Authorization: Bearer $HCO_API_TOKEN" "http://127.0.0.1:8731/tasks/<tas
 
 继续阅读这些文档：
 
+- [docs/CODEX_ORCHESTRATOR_OVERVIEW.md](docs/CODEX_ORCHESTRATOR_OVERVIEW.md)：整体机制、安装、特性、模型选择和运行边界
+- [docs/ARTIFACT_PROTOCOL.md](docs/ARTIFACT_PROTOCOL.md)：Option C 正式 artifact manifest 文件中转协议
 - [docs/JARVIS_HERMES_QUICKSTART.md](docs/JARVIS_HERMES_QUICKSTART.md)：Jarvis 主 Hermes 接入和使用本项目的最短说明
 - [docs/SETUP.md](docs/SETUP.md)：安装、Token、配置和项目注册
 - [docs/OPERATIONS.md](docs/OPERATIONS.md)：launchd/systemd、运维检查、网络边界和部署验证清单
@@ -331,3 +335,40 @@ curl -H "Authorization: Bearer $HCO_API_TOKEN" "http://127.0.0.1:8731/tasks/<tas
 macOS 上的生产化 Hermes bridge 使用 `scripts/install-hermes-codex-bridge.sh`。安装器以不可变版本目录和原子 symlink 激活独立插件，配置受限 multiplex profile，并分别管理 HCO 与 send-only Zulip delivery LaunchAgent；它不会修改 Hermes core 或 Hermes 生成的 gateway plist。
 
 先按 [docs/SETUP.md](docs/SETUP.md) 准备 owner-only 配置并运行严格 dry-run，再按 [docs/OPERATIONS.md](docs/OPERATIONS.md) 完成独立服务检查、升级与回滚。安装前会分别验证 HCO bridge protocol、当前 Hermes 安装和当前 Codex App Server；这些结果只证明当次检测到的版本与能力，不代表未来版本兼容。
+
+### Option C 模型与推理深度
+
+Option C 可在项目配置的 `projects[].threadOptions` 中指定 Codex 模型和推理深度：
+
+```json
+{
+  "threadOptions": {
+    "model": "gpt-5",
+    "modelReasoningEffort": "high",
+    "approvalPolicy": "on-request",
+    "sandbox": "workspace-write"
+  }
+}
+```
+
+不要硬编码旧模型名。先通过运行中的 HCO bridge 查询当前 Codex 源提供的模型清单：
+
+```sh
+curl --unix-socket /Users/hula/.hco/hco.sock \
+  -H "Authorization: Bearer $(cat /Users/hula/.hco/hco.bearer)" \
+  "http://localhost/v1/models?includeHidden=true&limit=100"
+```
+
+从 `result.models[].id` 选择 `threadOptions.model`，从同一模型的 `supportedReasoningEfforts` 选择 `threadOptions.modelReasoningEffort`。`result.stale=true` 或 `sourceStatus=unavailable` 时只用于诊断，不应据此更新生产配置。完整配置步骤见 [docs/CHANNEL_TOPIC_MANAGEMENT.md](docs/CHANNEL_TOPIC_MANAGEMENT.md)，运维判读见 [docs/OPERATIONS.md](docs/OPERATIONS.md)。
+
+### Option C Artifact 文件中转
+
+Option C 支持协商能力 `artifact_manifest`。Hermes 可以在 `DISPATCH` 中声明项目 `cwd` 内的输入和输出文件，由 HCO 在执行前校验输入、在完成时校验输出，并把状态、字节数和 SHA-256 写入持久状态及 outbox 回执。
+
+- 文档 A 就地编辑：A 同时声明为 input 和 output。
+- 文档 A 生成文档 B：A 声明为 input，B 声明为 required output。
+- 所有 input 当前都必须存在；`required: false` 只让 output 缺失时不阻塞完成。
+- required output 缺失、无效或哈希不匹配时进入 `reconciliation_needed`。
+- Zulip delivery 只发送文本摘要，不自动上传文件附件。
+
+完整 schema、安全边界、状态机和示例见 [docs/ARTIFACT_PROTOCOL.md](docs/ARTIFACT_PROTOCOL.md)。

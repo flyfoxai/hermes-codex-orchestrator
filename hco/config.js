@@ -8,7 +8,14 @@ const BRIDGE_FIELDS = new Set(["tokenPath", "contextKeyPath", "socketPath", "rou
 const SNAPSHOT_FIELDS = new Set(["ttlMs", "maxBytes"]);
 const PROJECT_FIELDS = new Set(["projectId", "cwd", "backend", "staticStreamIds", "acl", "threadOptions"]);
 const ACL_FIELDS = new Set(["viewers", "contributors", "maintainers"]);
-const THREAD_FIELDS = new Set(["model", "approvalPolicy", "sandbox", "baseInstructions", "developerInstructions"]);
+const THREAD_FIELDS = new Set([
+  "model",
+  "modelReasoningEffort",
+  "approvalPolicy",
+  "sandbox",
+  "baseInstructions",
+  "developerInstructions"
+]);
 
 function configError(code, message) {
   const error = new Error(message);
@@ -39,6 +46,12 @@ function validateIdArray(value) {
 
 function absolutePath(value) {
   return typeof value === "string" && path.isAbsolute(value) && Buffer.byteLength(value, "utf8") <= 4096;
+}
+
+function validThreadOption(key, value) {
+  if (typeof value !== "string" || Buffer.byteLength(value, "utf8") > 16_384) return false;
+  if (key === "modelReasoningEffort" && value.length === 0) return false;
+  return true;
 }
 
 function ownerFile(filePath, maxBytes, code) {
@@ -127,8 +140,8 @@ export function loadHcoConfig({ configPath, env = process.env } = {}) {
     if (canonicalCwds.has(cwd)) invalid();
 
     const threadOptions = project.threadOptions ?? {};
-    if (!exactObject(threadOptions, THREAD_FIELDS, new Set()) || Object.values(threadOptions).some((value) =>
-      typeof value !== "string" || Buffer.byteLength(value, "utf8") > 16_384)) invalid();
+    if (!exactObject(threadOptions, THREAD_FIELDS, new Set()) ||
+        Object.entries(threadOptions).some(([key, value]) => !validThreadOption(key, value))) invalid();
     projectIds.add(project.projectId);
     canonicalCwds.add(cwd);
     staticStreamIds.forEach((id) => streamIds.add(id));

@@ -43,6 +43,26 @@ Hermes Codex Bridge Plugin (plugin.py)
 | `acl.contributors` | 可向该项目发消息的 Zulip 用户 ID |
 | `admins` | 顶级管理员（可执行所有管理操作） |
 
+### 全局默认收件人规则
+
+所有 Zulip stream/topic 使用同一套收件人规则，不能按频道单独放宽：
+
+1. 消息没有任何 Zulip 原生 mention 时，视为发给配置的默认收件人。默认值是 `self`，即当前 `zulip-ingress` bot（现网为 Jarvis PM）。
+2. 消息包含一个或多个原生 mention 时，不再隐式追加默认收件人。只 mention 其他用户或用户组时，Jarvis 不创建 session、不调用模型、不回复。
+3. 显式 mention Jarvis 时正常处理；同时 mention Jarvis 和其他人仍只触发一次 Jarvis。Zulip 的 `@all`/`@everyone` 保持显式通配 mention 语义。
+4. 一对一或群组 DM 已由 Zulip 收件人列表明确寻址，不使用 stream 的默认 mention 规则。
+
+推荐在 `~/.hermes/profiles/zulip-ingress/config.yaml` 配置：
+
+```yaml
+platforms:
+  zulip:
+    extra:
+      default_addressee: self
+```
+
+也可以在该 profile 的 owner-only `.env` 中设置 `ZULIP_DEFAULT_ADDRESSEE`。支持 `self`、当前 bot 的完整名称、email 或数字 user ID；`none`、`disabled`、`off` 表示没有默认收件人。`extra.default_addressee` 的优先级高于环境变量。安装器只在其拥有的 `zulip-ingress` 上启用这项策略，不会让同一 Hermes 进程中的其他 bot 自动继承 `self`。若指定另一个 bot，当前 ingress 会忽略无 mention 消息；目标 bot 必须在自己的 profile 中显式启用同一策略，使用自己的凭据和唯一 inbound poller，不能复用同一 credential 启动第二个 poller。
+
 ### 话题路由模式
 
 | 模式 | 含义 |
@@ -150,6 +170,16 @@ ls -la /path/to/new-project   # 确认存在
 
 #### 步骤 2：编辑 `~/.hco/hco.json`，在 `projects` 数组末尾追加
 
+如果需要指定模型或推理深度，先通过 HCO bridge 查询当前 Codex 源可用清单：
+
+```bash
+curl --unix-socket /Users/hula/.hco/hco.sock \
+  -H "Authorization: Bearer $(cat /Users/hula/.hco/hco.bearer)" \
+  "http://localhost/v1/models?includeHidden=false&limit=100"
+```
+
+从返回的 `result.models[].id` 选择 `threadOptions.model`，从同一模型的 `supportedReasoningEfforts` 选择 `threadOptions.modelReasoningEffort`。不要用旧文档或记忆里的模型名替代运行时查询结果。
+
 ```json
 {
   "projectId": "your-project-id",
@@ -162,6 +192,8 @@ ls -la /path/to/new-project   # 确认存在
     "maintainers": [8]
   },
   "threadOptions": {
+    "model": "gpt-5",
+    "modelReasoningEffort": "high",
     "approvalPolicy": "on-request",
     "sandbox": "workspace-write"
   }
@@ -458,6 +490,8 @@ B. 通过 Hermes 发送 CANCEL 指令取消
         "maintainers": [8]
       },
       "threadOptions": {
+        "model": "gpt-5",
+        "modelReasoningEffort": "high",
         "approvalPolicy": "on-request",
         "sandbox": "workspace-write"
       }
@@ -477,11 +511,15 @@ B. 通过 Hermes 发送 CANCEL 指令取消
 | `acl.viewers` | number[] | 可查看项目状态的 Zulip 用户 ID |
 | `acl.contributors` | number[] | 可发起 Codex 任务的 Zulip 用户 ID |
 | `acl.maintainers` | number[] | 可修改项目配置的 Zulip 用户 ID |
-| `threadOptions.approvalPolicy` | string | `"on-request"` 或 `"always"` |
-| `threadOptions.sandbox` | string | `"workspace-write"` 等沙箱级别 |
-| `threadOptions.model` | string | （可选）指定 Codex 使用的模型 |
+| `threadOptions.model` | string | （可选）指定 Codex 使用的模型；用 `/v1/models` 或 App Server `model/list` 查询当前源可用 ID |
+| `threadOptions.modelReasoningEffort` | string | （可选）指定 Codex 推理深度；从对应模型的 `supportedReasoningEfforts` 中选择，HCO 会映射为 Codex App Server 的 `config.model_reasoning_effort` |
+| `threadOptions.approvalPolicy` | string | `"untrusted"`、`"on-failure"`、`"on-request"` 或 `"never"` |
+| `threadOptions.sandbox` | string | `"read-only"`、`"workspace-write"` 或 `"danger-full-access"` |
 | `threadOptions.baseInstructions` | string | （可选）注入 Codex 的基础指令 |
+| `threadOptions.developerInstructions` | string | （可选）注入 Codex 的 developer instructions |
 | `admins` | number[] | 顶级管理员 Zulip 用户 ID |
+
+模型目录查询是运行时只读能力，不参与 `hco.json` 加载校验。HCO 启动时只检查 `model` 和 `modelReasoningEffort` 是非空字符串；账号权限、模型下线、隐藏模型可见性或源端策略变化，会在实际创建/续接 Codex thread 时由 Codex App Server 决定。
 
 ---
 
@@ -494,6 +532,16 @@ curl --unix-socket /Users/hula/.hco/hco.sock \
   -H "Authorization: Bearer $(cat /Users/hula/.hco/hco.bearer)" \
   http://localhost/v1/health
 ```
+
+### 查询 Codex 模型和推理深度
+
+```bash
+curl --unix-socket /Users/hula/.hco/hco.sock \
+  -H "Authorization: Bearer $(cat /Users/hula/.hco/hco.bearer)" \
+  "http://localhost/v1/models?includeHidden=true&limit=100"
+```
+
+查看 `result.models[].id`、`supportedReasoningEfforts` 和 `defaultReasoningEffort`，再更新项目的 `threadOptions`。
 
 ### 服务管理
 

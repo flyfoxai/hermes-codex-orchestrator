@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import signal
 import socket
@@ -136,6 +137,21 @@ def test_compatibility_uses_authenticated_unix_socket_and_exact_headers(tmp_path
             "body": None,
         }
     ]
+
+
+def test_compatibility_accepts_optional_server_capabilities(tmp_path: Path) -> None:
+    response = _compatibility()
+    response["serverCapabilities"] = [
+        "interaction_exchange_v2",
+        "zulip_zform_v1",
+    ]
+    with UnixHttpFixture(tmp_path, [(200, response)]) as server:
+        client = HcoClient(str(server.path), b"bridge-secret", "worker-a", 2, 30_000)
+        client.check_compatibility()
+
+    assert client.server_capabilities == frozenset(
+        {"interaction_exchange_v2", "zulip_zform_v1"}
+    )
 
 
 def test_claim_ack_and_nack_use_exact_bodies_and_escaped_delivery_routes(tmp_path: Path) -> None:
@@ -435,6 +451,199 @@ def _claim(
     }
 
 
+def _interaction_claim() -> dict:
+    claim = _claim(content="完整正文与 fallback commands")
+    claim["payload"] = {
+        "schemaVersion": 2,
+        "kind": "interaction_request",
+        "content": "完整正文与 fallback commands",
+        "interaction": {
+            "interactionId": "interaction-1",
+            "actions": [
+                {
+                    "actionId": "act-allow",
+                    "label": "仅本次允许",
+                    "style": "primary",
+                    "class": "one_time_allow",
+                    "naturalAliasEligible": True,
+                },
+                {
+                    "actionId": "act-policy",
+                    "label": "允许并更新命令策略",
+                    "style": "warning",
+                    "class": "policy_change",
+                    "naturalAliasEligible": False,
+                },
+            ],
+        },
+        "ui": {
+            "type": "choices",
+            "heading": "请选择本次操作",
+            "actionIds": ["act-allow", "act-policy"],
+        },
+    }
+    return claim
+
+
+def test_interaction_ui_is_validated_and_sent_as_one_zform_message() -> None:
+    sent = []
+    hco = RecordingHco()
+
+    class Sender:
+        def send(self, stream_id, topic, content, *, widget_content=None):
+            sent.append((stream_id, topic, content, widget_content))
+            return zulip_sender.SendResult.success(811)
+
+    DeliverySidecar(hco, Sender()).process_claim(_interaction_claim())
+
+    assert hco.acks == [("delivery-1", "lease-1", 811)]
+    assert hco.nacks == []
+    widget = json.loads(sent[0][3])
+    assert widget["widget_type"] == "zform"
+    assert [choice["reply"] for choice in widget["extra_data"]["choices"]] == [
+        "/codex interact interaction-1 act-allow",
+        "/codex interact interaction-1 act-policy",
+    ]
+
+
+def test_interaction_prompt_delete_is_strictly_validated_deleted_and_acked() -> None:
+    claim = _claim()
+    claim["payload"] = {
+        "schemaVersion": 2,
+        "kind": "interaction_prompt_delete",
+        "zulipMessageId": 811,
+    }
+    deleted = []
+    hco = RecordingHco()
+
+    class Sender:
+        def delete(self, message_id):
+            deleted.append(message_id)
+            return zulip_sender.SendResult.success(message_id)
+
+    DeliverySidecar(hco, Sender()).process_claim(claim)
+
+    assert deleted == [811]
+    assert hco.acks == [("delivery-1", "lease-1", 811)]
+    assert hco.nacks == []
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"schemaVersion": 1, "kind": "interaction_prompt_delete", "zulipMessageId": 811},
+        {"schemaVersion": 2, "kind": "interaction_prompt_delete", "zulipMessageId": True},
+        {"schemaVersion": 2, "kind": "interaction_prompt_delete", "zulipMessageId": 0},
+        {
+            "schemaVersion": 2,
+            "kind": "interaction_prompt_delete",
+            "zulipMessageId": 811,
+            "content": "smuggled",
+        },
+    ],
+    ids=["wrong-schema", "boolean-id", "non-positive-id", "extra-field"],
+)
+def test_invalid_interaction_prompt_delete_is_permanently_nacked(payload) -> None:
+    claim = _claim()
+    claim["payload"] = payload
+    hco = RecordingHco()
+
+    DeliverySidecar(hco, object()).process_claim(claim)
+
+    assert hco.acks == []
+    assert hco.nacks == [("delivery-1", "lease-1", "CLAIM_INVALID", False)]
+
+
+def test_interaction_prompt_delete_requires_a_valid_zulip_target() -> None:
+    claim = _claim()
+    claim["payload"] = {
+        "schemaVersion": 2,
+        "kind": "interaction_prompt_delete",
+        "zulipMessageId": 811,
+    }
+    claim["targetSnapshot"] = {"platform": "zulip", "streamId": 42, "topic": ""}
+    hco = RecordingHco()
+
+    DeliverySidecar(hco, object()).process_claim(claim)
+
+    assert hco.acks == []
+    assert hco.nacks == [("delivery-1", "lease-1", "CLAIM_INVALID", False)]
+
+
+def test_malformed_interaction_ui_is_permanently_nacked_without_send() -> None:
+    claim = _interaction_claim()
+    claim["payload"]["ui"]["actionIds"] = ["unknown-action"]
+    hco = RecordingHco()
+
+    class Sender:
+        def send(self, *_args, **_kwargs):
+            raise AssertionError("malformed UI must not be sent")
+
+    DeliverySidecar(hco, Sender()).process_claim(claim)
+
+    assert hco.acks == []
+    assert hco.nacks == [("delivery-1", "lease-1", "CLAIM_INVALID", False)]
+
+
+def test_verified_interaction_document_is_uploaded_before_message_ack() -> None:
+    document_bytes = "完整审批文档".encode()
+    sha256 = hashlib.sha256(document_bytes).hexdigest()
+    claim = _claim(content="完整审批详情见文档")
+    claim["payload"] = {
+        "schemaVersion": 2,
+        "kind": "interaction_document",
+        "content": "完整审批详情见文档",
+        "document": {
+            "schemaVersion": 1,
+            "kind": "interaction_detail",
+            "displayName": "interaction-abc-approval.md",
+            "mimeType": "text/markdown",
+            "bytes": len(document_bytes),
+            "sha256": sha256,
+            "textContent": document_bytes.decode(),
+        },
+    }
+    uploaded = []
+    hco = RecordingHco()
+
+    class Sender:
+        def send_document(self, stream_id, topic, content, **document):
+            uploaded.append((stream_id, topic, content, document))
+            return zulip_sender.SendResult.success(812)
+
+    DeliverySidecar(hco, Sender()).process_claim(claim)
+
+    assert uploaded[0][3] == {
+        "display_name": "interaction-abc-approval.md",
+        "document_bytes": document_bytes,
+        "sha256": sha256,
+    }
+    assert hco.acks == [("delivery-1", "lease-1", 812)]
+
+
+def test_interaction_document_hash_mismatch_is_permanently_nacked() -> None:
+    claim = _claim(content="document")
+    claim["payload"] = {
+        "schemaVersion": 2,
+        "kind": "interaction_document",
+        "content": "document",
+        "document": {
+            "schemaVersion": 1,
+            "kind": "interaction_detail",
+            "displayName": "interaction-abc-approval.md",
+            "mimeType": "text/markdown",
+            "bytes": 3,
+            "sha256": "0" * 64,
+            "textContent": "abc",
+        },
+    }
+    hco = RecordingHco()
+
+    DeliverySidecar(hco, object()).process_claim(claim)
+
+    assert hco.nacks == [("delivery-1", "lease-1", "CLAIM_INVALID", False)]
+
+
 def test_real_zulip_import_builds_one_no_retry_client_and_reuses_it(monkeypatch) -> None:
     constructed = []
 
@@ -459,6 +668,7 @@ def test_real_zulip_import_builds_one_no_retry_client_and_reuses_it(monkeypatch)
 
     first = sender.send(42, "Build", "first")
     second = sender.send(43, "Review", "second")
+    third = sender.send(44, "Approve", "third", widget_content='{"widget_type":"zform"}')
 
     assert constructed == [
         {"config_file": "/private/config/zuliprc", "retry_on_errors": False}
@@ -466,8 +676,105 @@ def test_real_zulip_import_builds_one_no_retry_client_and_reuses_it(monkeypatch)
     assert fake_client.messages == [
         {"type": "stream", "to": "42", "topic": "Build", "content": "first"},
         {"type": "stream", "to": "43", "topic": "Review", "content": "second"},
+        {
+            "type": "stream",
+            "to": "44",
+            "topic": "Approve",
+            "content": "third",
+            "widget_content": '{"widget_type":"zform"}',
+        },
     ]
-    assert (first.message_id, second.message_id) == (1, 2)
+    assert (first.message_id, second.message_id, third.message_id) == (1, 2, 3)
+
+
+def test_zulip_sender_deletes_exact_message_id(monkeypatch) -> None:
+    deleted = []
+
+    class FakeClient:
+        api_key = ""
+
+        def delete_message(self, message_id):
+            deleted.append(message_id)
+            return {"result": "success"}
+
+    monkeypatch.setattr(zulip_sender.zulip, "Client", lambda **_options: FakeClient())
+    sender = ZulipSender("/private/config/zuliprc")
+
+    result = sender.delete(811)
+
+    assert deleted == [811]
+    assert result == zulip_sender.SendResult.success(811)
+
+
+def test_zulip_sender_falls_back_only_after_explicit_widget_rejection(monkeypatch) -> None:
+    messages = []
+
+    class FakeClient:
+        api_key = ""
+
+        def send_message(self, message):
+            messages.append(dict(message))
+            if "widget_content" in message:
+                return {
+                    "result": "error",
+                    "code": "BAD_REQUEST",
+                    "status_code": 400,
+                    "msg": "zform widget is not supported",
+                }
+            return {"result": "success", "id": 991}
+
+    monkeypatch.setattr(
+        zulip_sender.zulip,
+        "Client",
+        lambda **_options: FakeClient(),
+    )
+    sender = ZulipSender("/private/config/zuliprc")
+
+    result = sender.send(42, "Build", "fallback", widget_content="widget-json")
+
+    assert result.message_id == 991
+    assert len(messages) == 2
+    assert messages[0]["widget_content"] == "widget-json"
+    assert "widget_content" not in messages[1]
+
+
+def test_zulip_sender_uploads_verified_document_then_links_it(monkeypatch) -> None:
+    uploads = []
+    messages = []
+
+    class FakeClient:
+        api_key = ""
+
+        def upload_file(self, file):
+            uploads.append((file.name, file.read()))
+            return {"result": "success", "uri": "/user_uploads/1/approval.md"}
+
+        def send_message(self, message):
+            messages.append(dict(message))
+            return {"result": "success", "id": 992}
+
+    monkeypatch.setattr(
+        zulip_sender.zulip,
+        "Client",
+        lambda **_options: FakeClient(),
+    )
+    sender = ZulipSender("/private/config/zuliprc")
+    content = b"full approval detail"
+    digest = hashlib.sha256(content).hexdigest()
+
+    result = sender.send_document(
+        42,
+        "Build",
+        "详情文档",
+        display_name="interaction-approval.md",
+        document_bytes=content,
+        sha256=digest,
+    )
+
+    assert result.message_id == 992
+    assert uploads == [("interaction-approval.md", content)]
+    assert "[interaction-approval.md](/user_uploads/1/approval.md)" in messages[0]["content"]
+    assert digest in messages[0]["content"]
 
 
 def test_zulip_client_startup_exception_does_not_expose_config_secret(

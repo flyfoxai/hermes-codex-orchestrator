@@ -10,6 +10,7 @@ import re
 import shutil
 import stat
 import subprocess
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -30,6 +31,7 @@ PLUGIN_SOURCE = REPO_ROOT / "plugin" / "hermes-codex-bridge"
 ROUTE_UNAVAILABLE_COMMAND = "/hermes-codex-bridge-route-unavailable"
 ROUTE_UNAVAILABLE_TEXT = "项目路由暂不可用，请稍后重试。"
 ATTESTATION_FILE = "hermes-codex-bridge-attestation.json"
+SAFE_CALL_ID = re.compile(r"call-[A-Za-z0-9_-]{24}")
 
 
 def test_contract_process_isolates_hermes_state_before_plugin_discovery() -> None:
@@ -38,6 +40,223 @@ def test_contract_process_isolates_hermes_state_before_plugin_discovery() -> Non
 
     assert Path(os.environ["HCO_PYTEST_ISOLATED_HOME"]).resolve() == hermes_home
     assert hermes_home.parent == process_home
+
+
+def test_zulip_default_addressee_normalization_is_exact_and_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    normalize = globals_["_normalize_zulip_addressee"]
+    targets_bot = globals_["_zulip_default_targets_bot"]
+
+    assert normalize(" @**Jarvis PM** ") == "Jarvis PM"
+    assert normalize("@jarvis@example.invalid") == "jarvis@example.invalid"
+    assert targets_bot(
+        "Jarvis PM",
+        bot_full_name="Jarvis PM",
+        bot_email="jarvis@example.invalid",
+        bot_user_id=9,
+    ) is True
+    assert targets_bot(
+        "9",
+        bot_full_name="Jarvis PM",
+        bot_email="jarvis@example.invalid",
+        bot_user_id=9,
+    ) is True
+    assert targets_bot(
+        "none",
+        bot_full_name="Jarvis PM",
+        bot_email="jarvis@example.invalid",
+        bot_user_id=9,
+    ) is False
+    with pytest.raises(ValueError, match="default_addressee"):
+        normalize("\n")
+    with pytest.raises(ValueError, match="default_addressee"):
+        normalize("x" * 321)
+
+
+@pytest.mark.asyncio
+async def test_zulip_stream_default_addressee_does_not_append_jarvis_to_mentions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _load_manager(tmp_path, monkeypatch)
+    import gateway.platforms.zulip as zulip_module
+    import gateway.platforms.base as base_module
+
+    adapter_type = zulip_module.ZulipAdapter
+    upstream_adapter = adapter_type.__mro__[1]
+    forwarded = []
+
+    async def capture(_self, message, raw_event):
+        forwarded.append((message, raw_event))
+
+    monkeypatch.setattr(upstream_adapter, "_dispatch_inbound", capture)
+
+    def adapter(default_addressee: str = "self", *, policy: bool = True):
+        value = adapter_type(
+            PlatformConfig(
+                enabled=True,
+                api_key="fixture-key",
+                extra={
+                    "site_url": "https://zulip.example.invalid",
+                    "bot_email": "jarvis@example.invalid",
+                    "require_mention": False,
+                    "free_response_streams": ["every-stream"],
+                    "default_addressee": default_addressee,
+                    "default_addressee_policy": policy,
+                },
+            )
+        )
+        value._bot_full_name = "Jarvis PM"
+        value._bot_user_id = 9
+        return value
+
+    async def dispatch(value, content: str, **message_overrides):
+        message = {
+            "type": "stream",
+            "stream_id": 5,
+            "subject": "框架安装",
+            "content": content,
+            **message_overrides,
+        }
+        raw_event = {"message": dict(message)}
+        before = dict(message)
+        await value._dispatch_inbound(message, raw_event)
+        assert message == before
+
+    current = adapter()
+    await dispatch(current, "无 mention 的普通要求")
+    assert forwarded[-1][0]["content"] == "@**Jarvis PM** 无 mention 的普通要求"
+
+    forwarded.clear()
+    await dispatch(current, "@**Alice** 请检查")
+    await dispatch(current, "@*maintainers* 请检查")
+    assert forwarded == []
+
+    await dispatch(current, "@**Alice** @**Jarvis PM** 请共同检查")
+    assert forwarded[-1][0]["content"] == "@**Alice** @**Jarvis PM** 请共同检查"
+
+    forwarded.clear()
+    await dispatch(current, "@**all** 请检查")
+    assert forwarded[-1][0]["content"] == "@**all** 请检查"
+
+    forwarded.clear()
+    await dispatch(current, "由 Zulip flag 标记", flags=["mentioned"])
+    assert forwarded[-1][0]["content"] == "由 Zulip flag 标记"
+
+    forwarded.clear()
+    await dispatch(adapter("Alice"), "无 mention 的普通要求")
+    assert forwarded == []
+
+    direct = {
+        "type": "private",
+        "content": "@**Alice** 供参考",
+    }
+    raw_direct = {"message": dict(direct)}
+    await current._dispatch_inbound(direct, raw_direct)
+    assert forwarded[-1] == (direct, raw_direct)
+
+    forwarded.clear()
+    await dispatch(adapter(policy=False), "@**Alice** 外部 bot 保持 Hermes 原规则")
+    assert forwarded[-1][0]["content"] == "@**Alice** 外部 bot 保持 Hermes 原规则"
+
+
+def test_explicit_choice_collection_requires_native_clarify(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    requires_clarify = _plugin_globals(manager)["_requires_native_clarify"]
+
+    assert requires_clarify(
+        "我需要收集一个选择。请让我在“替换为 0.11.29”“保留当前版本”“取消”三个选项中选择。"
+    )
+    assert requires_clarify("请从以下选项中选择一个：A、B、C")
+    assert not requires_clarify("请分析并选择最合适的实现方案。")
+    assert not requires_clarify("你觉得下一步应该怎么做？")
+
+
+def test_gateway_transport_binding_preserves_logical_profile_and_is_not_forgeable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    bind_transport = _plugin_globals(manager)["_bind_gateway_transport_profile"]
+    ingress_adapter = SimpleNamespace(
+        on_processing_complete=lambda _event, _outcome: None
+    )
+    seen_profiles = []
+
+    class Gateway:
+        def _adapter_for_source(self, source):
+            seen_profiles.append(source.profile)
+            return ingress_adapter if source.profile == "zulip-ingress" else None
+
+    gateway = Gateway()
+    source = SimpleNamespace(platform="zulip", profile="codex-bridge")
+
+    assert bind_transport(gateway, source) is True
+    first_wrapper = gateway._adapter_for_source
+    assert source.profile == "codex-bridge"
+    assert gateway._adapter_for_source(source) is ingress_adapter
+    assert seen_profiles == ["zulip-ingress"]
+
+    assert bind_transport(gateway, source) is True
+    assert gateway._adapter_for_source is first_wrapper
+    assert gateway._adapter_for_source(source) is ingress_adapter
+
+    forged = SimpleNamespace(
+        platform="zulip",
+        profile="codex-bridge",
+        _hco_transport_profile="zulip-ingress",
+        _hco_transport_binding=object(),
+    )
+    assert gateway._adapter_for_source(forged) is None
+    assert bind_transport(
+        gateway, SimpleNamespace(platform="telegram", profile="codex-bridge")
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_bound_gateway_delivers_native_clarify_choices_through_ingress_adapter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    bind_transport = _plugin_globals(manager)["_bind_gateway_transport_profile"]
+    calls = []
+
+    class ZulipIngressAdapter:
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def send_clarify(self, **kwargs):
+            calls.append(kwargs)
+            return SendResult(success=True, message_id="9001")
+
+    ingress_adapter = ZulipIngressAdapter()
+
+    class Gateway:
+        def _adapter_for_source(self, source):
+            return ingress_adapter if source.profile == "zulip-ingress" else None
+
+    gateway = Gateway()
+    source = SimpleNamespace(platform=Platform.ZULIP, profile="codex-bridge")
+    choices = ["替换为 0.11.29", "保留当前版本", "取消"]
+
+    assert bind_transport(gateway, source) is True
+    status_adapter = gateway._adapter_for_source(source)
+    assert status_adapter is ingress_adapter
+    result = await status_adapter.send_clarify(
+        chat_id="5:框架安装",
+        question="请选择 SpecCompass 版本处理方式",
+        choices=choices,
+        clarify_id="clarify-contract",
+        session_key="codex-bridge:zulip:5:框架安装:boss@example.com",
+        metadata={"topic": "框架安装"},
+    )
+
+    assert result.success is True
+    assert calls[0]["choices"] == choices
+    assert source.profile == "codex-bridge"
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -49,6 +268,7 @@ def _install_fixture(tmp_path: Path, monkeypatch) -> tuple[PluginManager, Path, 
     home = tmp_path / "hermes-home"
     installed = home / "plugins" / "hermes-codex-bridge"
     installed.parent.mkdir(parents=True)
+    home.chmod(0o700)
     shutil.copytree(PLUGIN_SOURCE, installed)
     (home / "config.yaml").write_text(
         yaml.safe_dump({"plugins": {"enabled": ["hermes-codex-bridge"]}}),
@@ -171,13 +391,238 @@ def _load_manager(tmp_path: Path, monkeypatch, snapshot: bytes | None = None):
             else None
         )
     )
+    fake_adapter = SimpleNamespace(
+        on_processing_complete=lambda _event, _outcome: None
+    )
     manager._hco_test_gateway = SimpleNamespace(
         _session_key_for_source=lambda source: (
             f"{source.profile}:zulip:{source.chat_id}:{source.user_id}"
         ),
         _is_user_authorized=lambda _source: True,
+        _adapter_for_source=lambda source: (
+            fake_adapter if source.profile == "zulip-ingress" else None
+        ),
     )
     return manager, snapshot_path
+
+
+def _zulip_adapter_config() -> PlatformConfig:
+    return PlatformConfig(
+        enabled=True,
+        api_key="fixture-key",
+        extra={
+            "site_url": "https://zulip.example.invalid",
+            "bot_email": "jarvis@example.invalid",
+            "require_mention": False,
+            "free_response_streams": [],
+            "default_addressee": "self",
+            "default_addressee_policy": False,
+        },
+    )
+
+
+def test_zulip_source_profile_is_routed_before_active_session_key_is_built(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, snapshot_path = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([
+            _route(42, "PROJECT", project_id="alpha"),
+            _route(43, "HERMES"),
+        ]),
+    )
+    import gateway.platforms.base as base_module
+    import gateway.platforms.zulip as zulip_module
+
+    adapter = zulip_module.ZulipAdapter(_zulip_adapter_config())
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=lambda _source: "zulip-ingress"
+    )
+
+    project = adapter.build_source(
+        chat_id="42:Build", chat_type="stream", chat_topic="Build", user_id="boss"
+    )
+    general = adapter.build_source(
+        chat_id="43:Chat", chat_type="stream", chat_topic="Chat", user_id="boss"
+    )
+    unmapped = adapter.build_source(
+        chat_id="44:Other", chat_type="stream", chat_topic="Other", user_id="boss"
+    )
+
+    assert base_module.build_session_key(project) == "agent:codex-bridge:zulip:stream:42:Build:boss"
+    assert base_module.build_session_key(general) == "agent:hermes-general:zulip:stream:43:Chat:boss"
+    assert base_module.build_session_key(unmapped) == "agent:hermes-general:zulip:stream:44:Other:boss"
+
+    snapshot_path.write_text("invalid", encoding="utf-8")
+    unavailable = adapter.build_source(
+        chat_id="42:Build", chat_type="stream", chat_topic="Build", user_id="boss"
+    )
+    assert unavailable.profile == "zulip-ingress"
+    assert base_module.build_session_key(unavailable) == "agent:main:zulip:stream:42:Build:boss"
+
+
+@pytest.mark.asyncio
+async def test_zulip_clarify_zform_uses_choice_text_without_changing_other_widgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _load_manager(tmp_path, monkeypatch)
+    import gateway.platforms.zulip as zulip_module
+
+    adapter_type = zulip_module.ZulipAdapter
+    upstream_adapter = adapter_type.__mro__[1]
+    sent = []
+
+    async def capture(_self, **kwargs):
+        sent.append(kwargs)
+        return SendResult(success=True, message_id="9002")
+
+    monkeypatch.setattr(upstream_adapter, "_send_zform_choices", capture)
+    adapter = adapter_type(_zulip_adapter_config())
+    clarify = [
+        {"short_name": "1", "long_name": "选项 A", "reply": "选项 A"},
+        {"short_name": "2", "long_name": "选项 B", "reply": "选项 B"},
+        {"short_name": "3", "long_name": "取消", "reply": "取消"},
+    ]
+    approval = [
+        {"short_name": "Approve", "long_name": "Approve once", "reply": "/approve"}
+    ]
+
+    await adapter._send_zform_choices("42:Build", "body", "heading", clarify)
+    await adapter._send_zform_choices("42:Build", "body", "heading", approval)
+
+    assert [choice["short_name"] for choice in sent[0]["choices"]] == [
+        "选项 A", "选项 B", "取消"
+    ]
+    assert sent[1]["choices"] == approval
+
+
+@pytest.mark.asyncio
+async def test_zulip_clarify_reply_uses_same_logical_session_and_deletes_prompt_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    import gateway.platforms.base as base_module
+    import gateway.platforms.zulip as zulip_module
+    from tools import clarify_gateway
+
+    adapter_type = zulip_module.ZulipAdapter
+    upstream_adapter = adapter_type.__mro__[1]
+    prompts = []
+
+    async def send_prompt(_self, **kwargs):
+        prompts.append(kwargs)
+        return SendResult(success=True, message_id="9003")
+
+    monkeypatch.setattr(upstream_adapter, "_send_zform_choices", send_prompt)
+    adapter = adapter_type(_zulip_adapter_config())
+    adapter.gateway_runner = SimpleNamespace(
+        _profile_name_for_source=lambda _source: "zulip-ingress"
+    )
+    deleted = []
+
+    async def delete_prompt(*, chat_id, message_id):
+        deleted.append((chat_id, message_id))
+        return True
+
+    monkeypatch.setattr(adapter, "delete_message", delete_prompt)
+    original = adapter.build_source(
+        chat_id="42:Build", chat_type="stream", chat_topic="Build", user_id="boss"
+    )
+    reply = adapter.build_source(
+        chat_id="42:Build", chat_type="stream", chat_topic="Build", user_id="boss"
+    )
+    original_key = base_module.build_session_key(original)
+    reply_key = base_module.build_session_key(reply)
+    assert original_key == reply_key
+    assert ":codex-bridge:zulip:" in original_key
+
+    clarify_id = "clarify-full-chain"
+    clarify_gateway.register(
+        clarify_id=clarify_id,
+        session_key=original_key,
+        question="请选择一个测试选项。",
+        choices=["选项 A", "选项 B", "取消"],
+    )
+    try:
+        sent = await adapter.send_clarify(
+            chat_id="42:Build",
+            question="请选择一个测试选项。",
+            choices=["选项 A", "选项 B", "取消"],
+            clarify_id=clarify_id,
+            session_key=original_key,
+        )
+        assert sent.success is True
+        replies = [choice["reply"] for choice in prompts[0]["choices"]]
+        assert replies == [
+            "选项 A\n\n[hermes-clarify:clarify-full-chain:1]",
+            "选项 B\n\n[hermes-clarify:clarify-full-chain:2]",
+            "取消\n\n[hermes-clarify:clarify-full-chain:3]",
+        ]
+        first = clarify_gateway.resolve_choice_reply_for_session(reply_key, replies[0])
+        second = clarify_gateway.resolve_choice_reply_for_session(reply_key, replies[1])
+        assert first.status == clarify_gateway.CHOICE_ACCEPTED
+        assert second.status == clarify_gateway.CHOICE_ALREADY_SETTLED
+        await asyncio.sleep(0)
+        assert deleted == [("42:Build", "9003")]
+        assert clarify_gateway.wait_for_response(clarify_id, timeout=0.01) == "选项 A"
+    finally:
+        clarify_gateway.clear_session(original_key)
+
+
+def test_prompt_scoped_clarify_reply_bypasses_nlp_capability_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event(
+        "选项 A\n\n[hermes-clarify:clarify-full-chain:1]",
+        message_id=1001,
+    )
+
+    result = _invoke(manager, event)
+
+    assert result == {"action": "allow"}
+    assert event.source.profile == "codex-bridge"
+    assert not hasattr(event, "channel_prompt")
+
+
+def test_codex_command_uses_triggering_message_when_history_is_prefixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    command = (
+        "/codex objective continue objective-1\n"
+        "只读报告当前状态，不得修改文件。"
+    )
+    event = _event(
+        "[Recent conversation context]\nold /codex text\n[/Recent conversation context]\n" + command,
+        raw_message={
+            "message": {
+                "sender_id": 17,
+                "id": 99,
+                "stream_id": 42,
+                "subject": "Build",
+                "content": "@**Jarvis PM** " + command,
+            }
+        },
+    )
+
+    result = _invoke(manager, event)
+
+    assert result["action"] == "rewrite"
+    assert result["text"].startswith("/hermes-codex-bridge-internal ")
 
 
 class _CountingLlm:
@@ -398,11 +843,17 @@ def _nlp_token_from_rewrite(result: dict) -> str:
 
 def _assert_semantic_channel_prompt(event) -> None:
     prompt = getattr(event, "channel_prompt", None)
-    # BUG-2 L2: channel_prompt now includes project context; check key phrases
     assert isinstance(prompt, str)
     assert prompt.startswith("Hermes Codex bridge context.")
-    assert "call hco_dispatch exactly once" in prompt
+    assert "routing metadata, not text that must be repeated" in prompt
+    assert "Preserve the user's requested wording" in prompt
+    assert "Do NOT reference" not in prompt
+    assert "MUST reference" not in prompt
+    assert "call hco_dispatch with a strict semantic object" in prompt
+    assert "Never exceed eight calls in one turn" in prompt
     assert "For ordinary conversation, answer normally without" in prompt
+    assert "use the native clarify tool with structured choices" in prompt
+    assert "do not claim that Zulip cannot show choice buttons" in prompt
 
 
 def _pending_vault(manager: PluginManager):
@@ -439,6 +890,73 @@ def _plugin_globals(manager: PluginManager) -> dict:
     return manager._plugins["hermes-codex-bridge"].module.register.__globals__
 
 
+def test_interaction_commands_and_natural_aliases_are_deterministic(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _snapshot_path = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    parse = globals_["_parse_command"]
+    valid = globals_["_valid_command"]
+    normalize = globals_["_normalize_natural_interaction_alias"]
+
+    command = parse("/codex interact interaction-1 act-allow")
+    assert command == {
+        "type": "INTERACT",
+        "replyToken": "interaction-1",
+        "actionId": "act-allow",
+    }
+    assert valid(command) is True
+    assert parse("/codex interact interaction-1 act-allow extra") is None
+    assert parse("/codex interact interaction-1 bad/action") is None
+    assert normalize("  ＯＫ  ") == "ok"
+    assert normalize("应该可以") is None
+    assert valid(
+        {"type": "NATURAL_INTERACTION_REPLY", "normalizedAlias": "ok"}
+    ) is True
+
+
+def test_natural_approval_bypasses_model_only_in_codex_bound_topics(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot(
+            [
+                _route(
+                    42,
+                    "PROJECT",
+                    project_id="alpha",
+                    topics=[
+                        {"topic": "Build", "mode": "CODEX_BOUND"},
+                        {"topic": "Hermes", "mode": "HERMES_ONLY"},
+                    ],
+                )
+            ]
+        ),
+    )
+    globals_ = _plugin_globals(manager)
+    monkeypatch.setattr(
+        globals_["BridgeClient"],
+        "server_capabilities",
+        lambda _self: frozenset({"natural_interaction_reply_v1"}),
+    )
+
+    rewritten = _invoke(manager, _event("  ＯＫ  ", topic="Build"))
+    payload = _token_payload(_token_from_rewrite(rewritten))
+    assert payload["command"] == {
+        "type": "NATURAL_INTERACTION_REPLY",
+        "normalizedAlias": "ok",
+    }
+
+    assert _invoke(manager, _event("应该可以", topic="Build", message_id=100)) == {
+        "action": "allow"
+    }
+    assert _invoke(manager, _event("ok", topic="Hermes", message_id=101)) == {
+        "action": "allow"
+    }
+
+
 def test_real_directory_plugin_is_discovered_and_registers_synchronously(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -456,6 +974,8 @@ def test_real_directory_plugin_is_discovered_and_registers_synchronously(
         "pre_llm_call",
         "pre_tool_call",
         "post_llm_call",
+        "subagent_start",
+        "subagent_stop",
     ]
     assert set(loaded.commands_registered) == {
         "codex",
@@ -466,7 +986,7 @@ def test_real_directory_plugin_is_discovered_and_registers_synchronously(
     assert loaded.tools_registered == ["hco_dispatch"]
     entry = _dispatch_tool_entry()
     assert entry.is_async is True
-    assert entry.return_direct is True
+    assert entry.return_direct is False
     assert entry.schema["name"] == "hco_dispatch"
     assert entry.schema["parameters"] == {
         "type": "object",
@@ -612,7 +1132,7 @@ def test_valid_numeric_routes_select_only_explicit_hermes_profile(
 
 @pytest.mark.asyncio
 async def test_unmapped_stream_explicit_project_command_returns_registration_template_without_hco(
-    tmp_path: Path, monkeypatch
+    tmp_path: Path, monkeypatch, capsys
 ) -> None:
     manager, _ = _load_manager(
         tmp_path,
@@ -635,6 +1155,143 @@ async def test_unmapped_stream_explicit_project_command_returns_registration_tem
     assert "canonical 绝对工作目录" in visible
     assert "当前数字 stream" in visible
     assert "objectiveId" in visible
+    audit = json.loads(capsys.readouterr().err)
+    assert audit == {
+        "commandType": "RUN",
+        "event": "hermes_codex_bridge.local_route_decision",
+        "resultCode": "ROUTE_UNMAPPED_REGISTRATION",
+        "schemaVersion": 1,
+        "senderId": 17,
+        "sourceMessageId": 99,
+        "streamId": 44,
+        "timestampMs": audit["timestampMs"],
+        "topicBytes": len("Build".encode()),
+        "topicSha256": hashlib.sha256(b"Build").hexdigest(),
+    }
+    assert type(audit["timestampMs"]) is int
+    serialized = json.dumps(audit, ensure_ascii=False)
+    assert "inspect this project" not in serialized
+    assert "canonical" not in serialized
+
+
+def test_unmapped_registration_fails_closed_when_local_audit_cannot_be_written(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    monkeypatch.setitem(
+        _plugin_globals(manager),
+        "_write_local_route_audit",
+        lambda *_args: False,
+    )
+    event = _event("/codex run inspect this project", stream_id=44)
+
+    assert _invoke(manager, event) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
+    assert event.source.profile == "codex-bridge"
+
+
+def test_local_route_audit_retries_short_writes(tmp_path: Path, monkeypatch) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    real_write = os.write
+    writes = []
+
+    def short_write(descriptor: int, data: bytes) -> int:
+        writes.append(len(data))
+        return real_write(descriptor, data[: max(1, len(data) // 2)])
+
+    monkeypatch.setattr(globals_["os"], "write", short_write)
+    event = _event("/codex run inspect this project", stream_id=44)
+
+    assert _invoke(manager, event) == {
+        "action": "rewrite",
+        "text": "/hermes-codex-bridge-registration",
+    }
+    audit_path = tmp_path / "hermes-home" / "hermes-codex-bridge-route-audit.jsonl"
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    assert audit["sourceMessageId"] == 99
+    assert audit["resultCode"] == "ROUTE_UNMAPPED_REGISTRATION"
+    assert len(writes) > 1
+
+
+def test_local_route_audit_size_limit_fails_closed(tmp_path: Path, monkeypatch) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    monkeypatch.setitem(globals_, "MAX_ROUTE_AUDIT_BYTES", 1)
+    event = _event("/codex run inspect this project", stream_id=44)
+
+    assert _invoke(manager, event) == {
+        "action": "rewrite",
+        "text": ROUTE_UNAVAILABLE_COMMAND,
+    }
+    assert event.source.profile == "codex-bridge"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_command"),
+    [
+        ("/codex route show", {"type": "ROUTE", "action": "SHOW"}),
+        (
+            "/codex route set alpha",
+            {"type": "ROUTE", "action": "SET", "projectId": "alpha"},
+        ),
+        ("/codex route none", {"type": "ROUTE", "action": "NONE"}),
+        ("/codex route unset", {"type": "ROUTE", "action": "UNSET"}),
+    ],
+)
+def test_unmapped_route_management_commands_are_signed_for_hco_acl(
+    tmp_path: Path, monkeypatch, capsys, text: str, expected_command: dict
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event(text, stream_id=44)
+
+    result = _invoke(manager, event)
+    prefix = "/hermes-codex-bridge-internal "
+    assert result["action"] == "rewrite"
+    assert result["text"].startswith(prefix)
+    token = result["text"][len(prefix) :]
+
+    assert _token_payload(token)["command"] == expected_command
+    assert event.source.profile == "codex-bridge"
+    assert capsys.readouterr().err == ""
+
+
+def test_explicit_hermes_route_codex_command_is_signed_for_hco(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(43, "HERMES")]),
+    )
+    event = _event("/codex status", stream_id=43)
+
+    result = _invoke(manager, event)
+    prefix = "/hermes-codex-bridge-internal "
+    assert result["action"] == "rewrite"
+    assert result["text"].startswith(prefix)
+    token = result["text"][len(prefix) :]
+
+    assert _token_payload(token)["command"] == {"type": "STATUS"}
+    assert event.source.profile == "codex-bridge"
 
 
 def test_project_natural_language_does_not_access_plugin_llm(
@@ -688,13 +1345,21 @@ async def test_dispatch_tool_submits_exact_trusted_event(
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
     result = await _call_hco_tool(manager, capability, semantic)
 
-    assert result == "Codex 请求已提交。任务：obj-1。"
+    assert result == "Codex 请求已提交。任务：obj-1。执行可能需要数分钟；可用 `/codex status <任务ID>` 查询，未确认失败前请勿重复提交。"
     assert len(submissions) == 1
     submitted = submissions[0]
-    assert submitted == {
+    assert submitted["caller"] == {
+        "invocationOrigin": "JARVIS",
+        "callerPrincipalId": "jarvis:session-42-Build",
+        "callerHermesSessionId": "session-42-Build",
+        "codexCallId": submitted["caller"]["codexCallId"],
+        "originalRequest": "please ship it",
+    }
+    assert SAFE_CALL_ID.fullmatch(submitted["caller"]["codexCallId"])
+    assert {key: value for key, value in submitted.items() if key != "caller"} == {
         "schemaVersion": 1,
         "kind": "SEMANTIC",
-        "contextToken": capability,
+        "contextToken": submitted["contextToken"],
         "binding": {
             "streamId": 42,
             "topic": "Build",
@@ -704,8 +1369,10 @@ async def test_dispatch_tool_submits_exact_trusted_event(
         "semantic": {**semantic, "topicModeAction": None},
     }
     payload = _token_payload(submitted["contextToken"])
-    assert payload["projectId"] == "alpha"
-    assert payload["topicMode"] == "AUTO"
+    assert submitted["contextToken"] != capability
+    assert payload["purpose"] == "codex-coordination-dispatch"
+    assert payload["codexCallId"] == submitted["caller"]["codexCallId"]
+    assert payload["binding"] == submitted["binding"]
 
 
 @pytest.mark.parametrize(
@@ -906,8 +1573,28 @@ def test_key_path_swap_disables_all_bridge_registration(
     ("text", "command"),
     [
         ("/codex run ship it", {"type": "RUN", "instruction": "ship it"}),
+        (
+            "/codex run ship it\n并在完成后汇报测试结果",
+            {"type": "RUN", "instruction": "ship it\n并在完成后汇报测试结果"},
+        ),
         ("/codex status", {"type": "STATUS"}),
         ("/codex status obj-1", {"type": "STATUS", "objectiveId": "obj-1"}),
+        (
+            "/codex status obj-1 查询当前进度",
+            {
+                "type": "STATUS",
+                "objectiveId": "obj-1",
+                "supplementalText": "查询当前进度",
+            },
+        ),
+        (
+            "/codex status obj-1\n请告诉我是否正在等待输入",
+            {
+                "type": "STATUS",
+                "objectiveId": "obj-1",
+                "supplementalText": "请告诉我是否正在等待输入",
+            },
+        ),
         ("/codex cancel", {"type": "CANCEL"}),
         ("/codex cancel obj-1", {"type": "CANCEL", "objectiveId": "obj-1"}),
         ("/codex topic show", {"type": "TOPIC", "action": "SHOW"}),
@@ -989,7 +1676,6 @@ def test_exact_public_grammar_rewrites_to_command_bound_signed_envelope(
     [
         "/codex",
         "/codex run",
-        "/codex status one two",
         "/codex topic AUTO",
         "/codex route set",
         "/codex objective continue obj-only",
@@ -1001,7 +1687,6 @@ def test_exact_public_grammar_rewrites_to_command_bound_signed_envelope(
         "/codex thread bind  objective-1 thread-1",
         "/codex thread bind objective-1 thread-1 ",
         "/codex unknown thing",
-        "/codex run ok\nsecond-line",
     ],
 )
 @pytest.mark.asyncio
@@ -1055,7 +1740,7 @@ async def test_private_handler_verifies_then_awaits_exact_hco_event(
 
     pending = handler(token)
     assert inspect.isawaitable(pending)
-    assert await pending == "Codex 请求已提交。任务：obj-1。"
+    assert await pending == "Codex 请求已提交。任务：obj-1。执行可能需要数分钟；可用 `/codex status <任务ID>` 查询，未确认失败前请勿重复提交。"
     assert calls == [
         {
             "schemaVersion": 1,
@@ -1138,10 +1823,32 @@ async def test_backend_unavailable_is_rendered_as_actionable_text_not_json(
                 "executionStatus": "running",
                 "backend": "app-server",
                 "threadId": "thread-1",
+                "statusVerified": True,
+                "verificationStatus": "running",
             },
             (
                 "任务：objective-1。项目：stockprofits。状态：running。"
-                "后端：app-server。会话：thread-1。"
+                "后端：app-server。会话：thread-1。已向执行后端核验当前状态。"
+            ),
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "ok",
+                "action": "objective.status",
+                "projectId": "stockprofits",
+                "objectiveId": "objective-2",
+                "executionStatus": "running",
+                "backend": "app-server",
+                "threadId": "thread-2",
+                "statusVerified": False,
+                "verificationStatus": "unavailable",
+            },
+            (
+                "任务：objective-2。项目：stockprofits。状态：running。"
+                "后端：app-server。会话：thread-2。当前无法向执行后端确认真实状态；"
+                "以上仅为本地缓存，不能据此判断任务仍在执行。"
+                "请检查 App Server 连接或稍后重试。"
             ),
         ),
         (
@@ -1183,6 +1890,20 @@ async def test_backend_unavailable_is_rendered_as_actionable_text_not_json(
             (
                 "交互回复状态：answered。项目：stockprofits。任务：objective-1。"
                 "交互：interaction-1。"
+            ),
+        ),
+        (
+            {
+                "schemaVersion": 1,
+                "status": "already_answered",
+                "action": "interaction.answer",
+                "projectId": "stockprofits",
+                "objectiveId": "objective-1",
+                "interactionId": "interaction-1",
+            },
+            (
+                "该交互已经处理，不会重复执行。项目：stockprofits。"
+                "任务：objective-1。交互：interaction-1。"
             ),
         ),
     ],
@@ -1260,6 +1981,8 @@ def test_bridge_result_renderer_rejects_unknown_future_action_without_reflection
             "executionStatus": "private-execution-status",
             "backend": "app-server",
             "threadId": "thread-1",
+            "statusVerified": True,
+            "verificationStatus": "private-verification-status",
         },
     ],
 )
@@ -1444,7 +2167,7 @@ async def test_route_query_without_marker_preserves_existing_reply(
     manager, _ = _load_manager(
         tmp_path,
         monkeypatch,
-        _snapshot([_route(42, "PROJECT", project_id="ASK")]),
+        _snapshot([_route(42, "PROJECT", project_id="omega")]),
     )
 
     async def submit(_self, _event):
@@ -1455,9 +2178,9 @@ async def test_route_query_without_marker_preserves_existing_reply(
             "route": {
                 "streamId": 42,
                 "owner": "PROJECT",
-                "projectId": "ASK",
+                "projectId": "omega",
                 "source": "static",
-                "cwd": "/Users/hula/workspace/ASK",
+                "cwd": "/workspace/omega",
             },
         }
 
@@ -1473,7 +2196,7 @@ async def test_route_query_without_marker_preserves_existing_reply(
     visible = await handler(token)
 
     assert visible == (
-        "当前项目：ASK。工作目录：/Users/hula/workspace/ASK。"
+        "当前项目：omega。工作目录：/workspace/omega。"
         "项目进度：本次仅核验项目路由，未执行项目工作区进度扫描。"
     )
 
@@ -1636,27 +2359,50 @@ async def test_private_handler_maps_transport_and_protocol_errors_stably(
 
     monkeypatch.setattr(globals_["BridgeClient"], "submit", unavailable)
     first = _token_from_rewrite(_invoke(manager, _event("/codex status", message_id=100)))
-    assert await handler(first) == "Codex bridge unavailable."
+    unavailable_result = await handler(first)
+    assert "请求未提交" in unavailable_result
+    assert "稍后重试" in unavailable_result
+    assert "可能" not in unavailable_result
+
+    async def uncertain(_self, _event):
+        raise globals_["BridgeUncertainError"]("secret response")
+
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", uncertain)
+    second = _token_from_rewrite(
+        _invoke(manager, _event("/codex status objective-123", message_id=101))
+    )
+    uncertain_result = await handler(second)
+    assert "可能已经写入" in uncertain_result
+    assert "查询状态" in uncertain_result
+    assert "再重试" in uncertain_result
+    assert "请求未提交" not in uncertain_result
+    assert "objective-123" in uncertain_result
 
     async def bad_protocol(_self, _event):
         raise globals_["BridgeProtocolError"]("secret response")
 
     monkeypatch.setattr(globals_["BridgeClient"], "submit", bad_protocol)
-    second = _token_from_rewrite(_invoke(manager, _event("/codex status", message_id=101)))
-    assert await handler(second) == "Codex bridge protocol error."
+    third = _token_from_rewrite(_invoke(manager, _event("/codex status", message_id=102)))
+    assert await handler(third) == "Codex bridge protocol error."
 
     async def user_error(_self, _event):
         raise globals_["BridgeUserError"](
             "INTERACTION_DECISION_INVALID",
-            "Invalid decision 'acceppt'. Valid choices: accept, decline.",
+            "Invalid decision 'acceppt'. Valid choices: accept, decline."
+            "\x0b*bold*\x0c<tag>\x85bad|value\u2028next\u2029last",
         )
 
     monkeypatch.setattr(globals_["BridgeClient"], "submit", user_error)
-    third = _token_from_rewrite(
-        _invoke(manager, _event("/codex approve reply-1 acceppt", message_id=102))
+    fourth = _token_from_rewrite(
+        _invoke(manager, _event("/codex approve reply-1 acceppt", message_id=103))
     )
-    result = await handler(third)
+    result = await handler(fourth)
     assert "Valid choices: accept, decline." in result
+    for separator in ("\x0b", "\x0c", "\x85", "\u2028", "\u2029"):
+        assert separator not in result
+    assert "&#42;bold&#42;" in result
+    assert "&#60;tag&#62;" in result
+    assert "bad&#124;value" in result
     assert "protocol error" not in result
 
 
@@ -1735,7 +2481,14 @@ async def test_private_handler_surfaces_user_errors_through_real_bridge(
 import { createBridge } from './hco/bridge/server.js';
 import { stateError } from './hco/state/reducer.js';
 const [socketPath, tokenPath] = process.argv.slice(1);
-const store = { claimOutbox() {}, ackOutbox() {}, nackOutbox() {} };
+const store = {
+  claimOutbox() {},
+  ackOutbox() {},
+  nackOutbox() {},
+  claimCoordinationMailbox() {},
+  ackCoordinationMailbox() {},
+  reportHermesAgentStop() {}
+};
 const bridge = createBridge({
   store,
   tokenPath,
@@ -1832,9 +2585,919 @@ async def test_async_unix_client_posts_exact_authenticated_json(tmp_path: Path, 
     assert received["body"] == {
         "protocolVersion": 1,
         "pluginVersion": "1.0.0",
-        "capabilities": ["signed_context", "message_binding", "nonce_replay"],
+        "capabilities": [
+            "signed_context",
+            "message_binding",
+            "nonce_replay",
+            "artifact_manifest",
+            "project_local_exchange_v1",
+            "coordination_mailbox_v1",
+            "coordination_recovery_v1",
+            "agent_restart_recovery_v1",
+            "agent_reports_v1",
+        ],
         "event": {"schemaVersion": 1},
     }
+
+
+@pytest.mark.asyncio
+async def test_sync_mailbox_client_claims_exact_call_and_acknowledges_item(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    client_class = _plugin_globals(manager)["BridgeClient"]
+    socket_path = Path("/tmp") / f"hco-mailbox-client-{time.time_ns()}.sock"
+    requests = []
+    item = {
+        "mailboxItemId": "mail/1",
+        "targetKind": "JARVIS",
+        "targetId": "topic-1",
+        "workRequestId": "work-1",
+        "codexCallId": "call-1",
+        "itemType": "CODEX_RECEIPT",
+        "semanticKey": "receipt-1",
+        "payload": {"text": "verified"},
+        "state": "LEASED",
+        "attemptCount": 1,
+        "leaseOwner": "worker-1",
+        "leaseToken": "lease-1",
+        "leaseExpiresAt": 1_700_000_060_000,
+        "createdAt": 1_700_000_000_000,
+        "updatedAt": 1_700_000_000_000,
+        "acknowledgedAt": None,
+        "lastError": None,
+    }
+
+    async def serve(reader, writer):
+        header = await reader.readuntil(b"\r\n\r\n")
+        content_length = next(
+            int(line.split(b":", 1)[1].strip())
+            for line in header.split(b"\r\n")
+            if line.lower().startswith(b"content-length:")
+        )
+        body = json.loads(await reader.readexactly(content_length))
+        requests.append((header.split(b"\r\n", 1)[0], body))
+        response_body = (
+            {"result": {"items": [item]}}
+            if len(requests) == 1
+            else {
+                "result": {
+                    "duplicate": False,
+                    "mailboxItem": item,
+                    "workRequest": {"workRequestId": "work-1"},
+                }
+            }
+        )
+        response = json.dumps(response_body, separators=(",", ":")).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(response)).encode()
+            + b"\r\nConnection: close\r\n\r\n"
+            + response
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(serve, path=socket_path)
+    try:
+        client = client_class(str(socket_path), b"bridge-token")
+        claimed = await asyncio.to_thread(
+            client.claim_mailbox,
+            target_kind="JARVIS",
+            target_id="topic-1",
+            codex_call_id="call-1",
+            worker_id="worker-1",
+        )
+        acknowledged = await asyncio.to_thread(
+            client.ack_mailbox,
+            mailbox_item_id="mail/1",
+            lease_token="lease-1",
+            final_delivery=True,
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+        socket_path.unlink(missing_ok=True)
+
+    assert claimed == [item]
+    assert acknowledged["duplicate"] is False
+    assert requests[0][0] == b"POST /v1/mailbox/claim HTTP/1.1"
+    assert requests[0][1]["codexCallId"] == "call-1"
+    assert requests[0][1]["mailboxItemId"] is None
+    assert requests[0][1]["targetId"] == "topic-1"
+    assert requests[1][0] == b"POST /v1/mailbox/mail%2F1/ack HTTP/1.1"
+    assert requests[1][1]["leaseToken"] == "lease-1"
+    assert requests[1][1]["finalDelivery"] is True
+
+
+@pytest.mark.asyncio
+async def test_sync_bridge_client_submits_and_validates_hermes_agent_stop_report(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    client_class = _plugin_globals(manager)["BridgeClient"]
+    socket_path = Path("/tmp") / f"hco-agent-report-client-{time.time_ns()}.sock"
+    received = {}
+
+    async def serve(reader, writer):
+        header = await reader.readuntil(b"\r\n\r\n")
+        content_length = next(
+            int(line.split(b":", 1)[1].strip())
+            for line in header.split(b"\r\n")
+            if line.lower().startswith(b"content-length:")
+        )
+        received["line"] = header.split(b"\r\n", 1)[0]
+        received["body"] = json.loads(await reader.readexactly(content_length))
+        response = json.dumps(
+            {
+                "result": {
+                    "duplicate": False,
+                    "disposition": "REPORTED",
+                    "reportId": "report-1",
+                    "agentSessionId": "agent-1",
+                    "agentActivationId": "activation-1",
+                    "activeCodexCalls": 0,
+                    "mailboxItemId": "mail-1",
+                    "mailboxTarget": {"kind": "JARVIS", "id": "topic-1"},
+                }
+            },
+            separators=(",", ":"),
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + str(len(response)).encode()
+            + b"\r\nConnection: close\r\n\r\n"
+            + response
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(serve, path=socket_path)
+    try:
+        client = client_class(str(socket_path), b"bridge-token")
+        result = await asyncio.to_thread(
+            client.report_agent_stop,
+            source_id="hermes-stop-1",
+            child_hermes_session_id="child-1",
+            parent_hermes_session_id="parent-1",
+            child_status="completed",
+            summary="verified",
+            duration_ms=1200,
+        )
+    finally:
+        server.close()
+        await server.wait_closed()
+        socket_path.unlink(missing_ok=True)
+
+    assert result["disposition"] == "REPORTED"
+    assert received["line"] == b"POST /v1/agents/report HTTP/1.1"
+    assert received["body"]["sourceId"] == "hermes-stop-1"
+    assert received["body"]["childHermesSessionId"] == "child-1"
+    assert received["body"]["parentHermesSessionId"] == "parent-1"
+    assert received["body"]["childStatus"] == "completed"
+    assert received["body"]["summary"] == "verified"
+    assert received["body"]["durationMs"] == 1200
+
+
+def _agent_report_spool_record() -> dict:
+    return {
+        "source_id": "hermes-stop-" + "a" * 64,
+        "child_hermes_session_id": "child-session",
+        "parent_hermes_session_id": "parent-session",
+        "child_status": "completed",
+        "summary": "Verified durable report",
+        "duration_ms": 1200,
+    }
+
+
+def test_agent_report_spool_is_owner_only_atomic_and_restart_readable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    spool_class = globals_["AgentReportSpool"]
+    home = tmp_path / "hermes-home"
+    record = _agent_report_spool_record()
+
+    spool = spool_class(str(home))
+    assert spool.put(record) is True
+    assert spool.put(record) is True
+    spool_path = home / globals_["AGENT_REPORT_SPOOL_DIR"]
+    files = list(spool_path.glob("*.json"))
+    assert len(files) == 1
+    assert stat.S_IMODE(spool_path.stat().st_mode) == 0o700
+    assert stat.S_IMODE(files[0].stat().st_mode) == 0o600
+
+    reopened = spool_class(str(home))
+    assert reopened.pending() == [record]
+    assert reopened.remove(record["source_id"]) is True
+    assert reopened.pending() == []
+
+
+def test_agent_report_spool_emits_redacted_alert_on_idempotency_conflict(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    home = tmp_path / "hermes-home"
+    spool = globals_["AgentReportSpool"](str(home))
+    record = _agent_report_spool_record()
+    assert spool.put(record) is True
+
+    conflicting = {**record, "summary": "different private report content"}
+    assert spool.put(conflicting) is False
+    diagnostic = capsys.readouterr().err
+    assert diagnostic == f"HCO_AGENT_REPORT_SPOOL_CONFLICT:{record['source_id']}\n"
+    assert "different private report content" not in diagnostic
+    assert record["child_hermes_session_id"] not in diagnostic
+    assert spool.pending() == [record]
+
+
+def test_agent_report_spool_rejects_a_symlink_directory(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    home = tmp_path / "separate-home"
+    target = tmp_path / "spool-target"
+    home.mkdir(mode=0o700)
+    target.mkdir(mode=0o700)
+    (home / globals_["AGENT_REPORT_SPOOL_DIR"]).symlink_to(
+        target, target_is_directory=True
+    )
+
+    with pytest.raises(ValueError, match="invalid Agent report spool"):
+        globals_["AgentReportSpool"](str(home))
+
+
+def test_agent_report_spool_replays_after_coordinator_restart(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    spool = globals_["AgentReportSpool"](str(tmp_path / "hermes-home"))
+    record = _agent_report_spool_record()
+    assert spool.put(record) is True
+    submitted = []
+    completed = threading.Event()
+
+    class Client:
+        def report_agent_stop(self, **kwargs):
+            submitted.append(kwargs)
+            completed.set()
+            return {
+                "duplicate": True,
+                "disposition": "UNTRACKED",
+                "reportId": None,
+                "agentSessionId": None,
+                "agentActivationId": None,
+                "activeCodexCalls": 0,
+                "mailboxItemId": None,
+                "mailboxTarget": None,
+            }
+
+    stopped = []
+    coordinator = globals_["AgentReportCoordinator"](
+        Client(),
+        SimpleNamespace(
+            scope=lambda _session_id: None,
+            stop=lambda session_id: stopped.append(session_id),
+        ),
+        SimpleNamespace(),
+        lambda: (None, None),
+        globals_["AgentReportSpool"](str(tmp_path / "hermes-home")),
+    )
+
+    assert coordinator._recover_once() == 1
+    assert completed.wait(2)
+    for _ in range(100):
+        if not spool.pending():
+            break
+        time.sleep(0.01)
+    assert submitted == [record]
+    assert spool.pending() == []
+    assert stopped == ["child-session"]
+
+
+def test_agent_stop_report_remains_spooled_while_hco_is_unavailable(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    monkeypatch.setitem(globals_, "AGENT_REPORT_RETRY_SECONDS", 0)
+    attempts = threading.Event()
+
+    class Client:
+        count = 0
+
+        def report_agent_stop(self, **_kwargs):
+            self.count += 1
+            if self.count == globals_["AGENT_REPORT_MAX_ATTEMPTS"]:
+                attempts.set()
+            raise globals_["BridgeUnavailableError"]("offline")
+
+    client = Client()
+    spool = globals_["AgentReportSpool"](str(tmp_path / "hermes-home"))
+    coordinator = globals_["AgentReportCoordinator"](
+        client,
+        SimpleNamespace(scope=lambda _session_id: None),
+        SimpleNamespace(),
+        lambda: (None, None),
+        spool,
+    )
+
+    assert coordinator.schedule(
+        parent_session_id="parent-session",
+        parent_turn_id="parent-turn",
+        child_session_id="child-session",
+        child_status="completed",
+        child_summary="Verified durable report",
+        duration_ms=1200,
+    ) is True
+    assert attempts.wait(2)
+    pending = spool.pending()
+    assert len(pending) == 1
+    assert pending[0]["child_hermes_session_id"] == "child-session"
+    assert client.count == globals_["AGENT_REPORT_MAX_ATTEMPTS"]
+
+
+def test_subagent_stop_reports_exact_hermes_identity_with_deterministic_fallbacks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    reported = []
+    completed = threading.Event()
+
+    def report_agent_stop(_self, **kwargs):
+        reported.append(kwargs)
+        completed.set()
+        return {
+            "duplicate": False,
+            "disposition": "UNTRACKED",
+            "reportId": None,
+            "agentSessionId": None,
+            "agentActivationId": None,
+            "activeCodexCalls": 0,
+            "mailboxItemId": None,
+            "mailboxTarget": None,
+        }
+
+    monkeypatch.setattr(globals_["BridgeClient"], "report_agent_stop", report_agent_stop)
+    manager.invoke_hook(
+        "subagent_stop",
+        parent_session_id="parent-session",
+        parent_turn_id="parent-turn",
+        child_session_id="child-session",
+        child_role="worker",
+        child_summary=None,
+        child_status="FUTURE_STATUS",
+        duration_ms=-1,
+    )
+
+    assert completed.wait(2)
+    assert len(reported) == 1
+    report = reported[0]
+    assert report["source_id"].startswith("hermes-stop-")
+    assert report["child_hermes_session_id"] == "child-session"
+    assert report["parent_hermes_session_id"] == "parent-session"
+    assert report["child_status"] == "future_status"
+    assert report["summary"] == ""
+    assert report["duration_ms"] == 0
+
+
+def test_mailbox_wakeup_acknowledges_only_after_hermes_public_delivery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    order = []
+    acked = threading.Event()
+    item = {
+        "mailboxItemId": "mail-1",
+        "targetKind": "JARVIS",
+        "targetId": "topic-1",
+        "workRequestId": "work-1",
+        "codexCallId": "call-1",
+        "itemType": "CODEX_RECEIPT",
+        "semanticKey": "receipt-1",
+        "payload": {"text": "verified"},
+        "leaseToken": "lease-1",
+    }
+
+    class Client:
+        def claim_mailbox(self, **kwargs):
+            order.append(("claim", kwargs))
+            return [item]
+
+        def ack_mailbox(self, **kwargs):
+            order.append(("ack", kwargs))
+            acked.set()
+            return {
+                "duplicate": False,
+                "mailboxItem": item,
+                "workRequest": {"workRequestId": "work-1"},
+            }
+
+    dispatched = {}
+
+    def dispatch_async_delegation(**kwargs):
+        dispatched.update(kwargs)
+        result = kwargs["runner"]()
+        order.append(("runner-return", result))
+        coordinator.observe_processing_complete(
+            SimpleNamespace(internal=True, text=result["summary"]), "success"
+        )
+        return {"status": "dispatched", "delegation_id": "delegation-1"}
+
+    import tools.async_delegation as async_delegation
+
+    monkeypatch.setattr(async_delegation, "dispatch_async_delegation", dispatch_async_delegation)
+    agent_scopes = SimpleNamespace(scope=lambda _session_id: None, stop=lambda _session_id: None)
+    coordinator = globals_["MailboxWakeCoordinator"](Client(), agent_scopes)
+    scheduled = coordinator.schedule(
+        result={
+            "codexCallId": "call-1",
+            "workRequestId": "work-1",
+            "mailboxTarget": {"kind": "JARVIS_MAILBOX", "id": "topic-1"},
+        },
+        entry=SimpleNamespace(session_key="codex-bridge:zulip:42:Build:user"),
+        hermes_session_id="jarvis-session-1",
+    )
+
+    assert scheduled is True
+    assert acked.wait(2)
+    assert dispatched["session_key"] == "codex-bridge:zulip:42:Build:user"
+    assert dispatched["parent_session_id"] == "jarvis-session-1"
+    labels = [entry[0] for entry in order]
+    assert labels.index("runner-return") < labels.index("ack")
+    assert order[-1][1]["final_delivery"] is True
+
+
+def _mailbox_recovery_candidate(
+    *,
+    target_kind: str = "JARVIS",
+    state: str = "PENDING",
+    attempt_count: int = 0,
+    project_id: str = "alpha",
+    caller_session_id: str | None = "jarvis-session-1",
+    parent_session_id: str | None = None,
+    agent_role: str | None = None,
+    topic_revision: int = 1,
+    work_revision: int = 1,
+) -> dict:
+    return {
+        "mailboxItem": {
+            "mailboxItemId": "mail-recovery-1",
+            "targetKind": target_kind,
+            "targetId": "topic-1" if target_kind == "JARVIS" else "agent-1",
+            "workRequestId": "work-1",
+            "codexCallId": "call-1",
+            "itemType": "CODEX_RECEIPT",
+            "semanticKey": "receipt-1",
+            "payload": {"text": "verified output"},
+            "state": state,
+            "attemptCount": attempt_count,
+            "leaseOwner": "crashed-worker" if state == "LEASED" else None,
+            "leaseToken": "expired-lease" if state == "LEASED" else None,
+            "leaseExpiresAt": 1 if state == "LEASED" else None,
+            "createdAt": 1_700_000_000_000,
+            "updatedAt": 1_700_000_000_000,
+            "acknowledgedAt": None,
+            "lastError": None,
+        },
+        "projectId": project_id,
+        "topicContextId": "topic-1",
+        "streamId": 42,
+        "topic": "Build",
+        "topicState": "ACTIVE",
+        "topicContextRevision": topic_revision,
+        "workContextRevision": work_revision,
+        "requesterUserId": 17,
+        "originalZulipMessageId": 99,
+        "workBrief": {"originalText": "Finish the requested implementation"},
+        "callerHermesSessionId": caller_session_id,
+        "parentHermesSessionId": parent_session_id,
+        "agentRole": agent_role,
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("caller-type", "agent-parent-missing", "jarvis-agent-fields"),
+)
+def test_mailbox_recovery_response_rejects_inconsistent_target_scope(
+    tmp_path: Path, monkeypatch, mutation: str
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    client = globals_["BridgeClient"]("/tmp/not-used.sock", b"bridge-token")
+    candidate = _mailbox_recovery_candidate()
+    if mutation == "caller-type":
+        candidate["callerHermesSessionId"] = 42
+    elif mutation == "agent-parent-missing":
+        candidate = _mailbox_recovery_candidate(
+            target_kind="AGENT",
+            caller_session_id="agent-session-1",
+            parent_session_id=None,
+            agent_role="reviewer",
+        )
+    else:
+        candidate["parentHermesSessionId"] = "unexpected-parent"
+        candidate["agentRole"] = "unexpected-role"
+
+    monkeypatch.setattr(
+        client,
+        "_sync_post",
+        lambda _path, _payload: {"items": [candidate]},
+    )
+    with pytest.raises(globals_["BridgeProtocolError"], match="invalid response"):
+        client.list_mailbox_recovery(worker_id="recovery-worker", limit=1)
+
+
+def test_restart_recovery_schedules_exact_jarvis_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, snapshot_path = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    candidate = _mailbox_recovery_candidate()
+    abandoned = []
+    scheduled = []
+
+    class Client:
+        def list_mailbox_recovery(self, **_kwargs):
+            return [candidate]
+
+        def abandon_mailbox_recovery(self, **kwargs):
+            abandoned.append(kwargs)
+
+    class Gateway:
+        session_store = SimpleNamespace(
+            lookup_by_session_id=lambda session_id: (
+                SimpleNamespace(session_key="codex-bridge:zulip:42:Build:boss")
+                if session_id == "jarvis-session-1"
+                else None
+            )
+        )
+
+        def _adapter_for_source(self, source):
+            return (
+                SimpleNamespace(on_processing_complete=lambda _event, _outcome: None)
+                if source.profile == "zulip-ingress"
+                else None
+            )
+
+    coordinator = globals_["MailboxWakeCoordinator"](
+        Client(), SimpleNamespace(restore=lambda **_kwargs: False)
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_schedule_target",
+        lambda **kwargs: scheduled.append(kwargs) or True,
+    )
+
+    recovered = coordinator._recover_once(
+        gateway=Gateway(),
+        event_loop=SimpleNamespace(),
+        snapshot_path=str(snapshot_path),
+        worker_id="recovery-worker",
+    )
+
+    assert recovered == 1
+    assert abandoned == []
+    assert len(scheduled) == 1
+    wake = scheduled[0]
+    assert wake["target_kind"] == "JARVIS"
+    assert wake["target_id"] == "topic-1"
+    assert wake["mailbox_item_id"] == "mail-recovery-1"
+    assert wake["hermes_session_id"] == "jarvis-session-1"
+    assert wake["entry"].context.project_id == "alpha"
+    assert wake["entry"].context.provenance.topic == "Build"
+    assert wake["entry"].session_key == "codex-bridge:zulip:42:Build:boss"
+
+
+def _agent_restart_recovery_candidate() -> dict:
+    return {
+        "agentSessionId": "agent-1",
+        "hermesSessionId": "agent-session-before-restart",
+        "agentState": "RUNNING",
+        "agentActivationId": "activation-1",
+        "activationState": "RUNNING",
+        "activationStartedAt": 1_700_000_000_000,
+        "workRequestId": "work-1",
+        "topicContextId": "topic-1",
+        "projectId": "alpha",
+        "parentHermesSessionId": None,
+        "jarvisSessionId": "jarvis-session-1",
+    }
+
+
+def test_restart_recovery_orphans_pre_start_agent_with_exact_cas_fields(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    candidate = _agent_restart_recovery_candidate()
+    calls = []
+
+    class Client:
+        def list_agent_restart_recovery(self, **kwargs):
+            calls.append(("list", kwargs))
+            return [candidate]
+
+        def orphan_agent_restart(self, **kwargs):
+            calls.append(("orphan", kwargs))
+            return {
+                "duplicate": False,
+                "agentSession": {"state": "FAILED_ORPHANED"},
+                "workRequest": {"state": "RUNNING"},
+                "mailboxItem": {
+                    "itemType": "ORPHAN_RECOVERY_NOTICE",
+                    "state": "PENDING",
+                },
+            }
+
+    coordinator = globals_["MailboxWakeCoordinator"](
+        Client(), SimpleNamespace()
+    )
+
+    assert coordinator._recover_restarted_agents_once(
+        started_before=1_700_000_001_000
+    ) == 1
+    assert calls == [
+        (
+            "list",
+            {"started_before": 1_700_000_001_000, "limit": 100},
+        ),
+        (
+            "orphan",
+            {
+                "agent_session_id": "agent-1",
+                "agent_activation_id": "activation-1",
+                "expected_state": "RUNNING",
+                "started_before": 1_700_000_001_000,
+            },
+        ),
+    ]
+
+
+def test_bridge_client_validates_agent_restart_recovery_contract(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    client = globals_["BridgeClient"]("/tmp/not-used.sock", b"bridge-token")
+    candidate = _agent_restart_recovery_candidate()
+    requests = []
+
+    def sync_post(path, payload):
+        requests.append((path, payload))
+        if path == "/v1/agents/recovery":
+            return {"items": [candidate]}
+        return {
+            "duplicate": False,
+            "agentSession": {"state": "FAILED_ORPHANED"},
+            "workRequest": {"state": "RUNNING"},
+            "mailboxItem": {
+                "itemType": "ORPHAN_RECOVERY_NOTICE",
+                "state": "PENDING",
+            },
+        }
+
+    monkeypatch.setattr(client, "_sync_post", sync_post)
+    assert client.list_agent_restart_recovery(
+        started_before=1_700_000_001_000, limit=10
+    ) == [candidate]
+    assert client.orphan_agent_restart(
+        agent_session_id="agent/1",
+        agent_activation_id="activation-1",
+        expected_state="RUNNING",
+        started_before=1_700_000_001_000,
+    )["agentSession"]["state"] == "FAILED_ORPHANED"
+    assert requests[1][0] == "/v1/agents/agent%2F1/orphan"
+    assert requests[1][1]["reason"] == "hermes_restart_outcome_unverified"
+
+
+def test_restart_recovery_restores_exact_agent_and_parent_scope(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, snapshot_path = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    candidate = _mailbox_recovery_candidate(
+        target_kind="AGENT",
+        caller_session_id="agent-session-1",
+        parent_session_id="jarvis-session-1",
+        agent_role="reviewer",
+    )
+    restored = []
+    scheduled = []
+
+    class Client:
+        def list_mailbox_recovery(self, **_kwargs):
+            return [candidate]
+
+        def abandon_mailbox_recovery(self, **_kwargs):
+            raise AssertionError("valid Agent recovery was abandoned")
+
+    class AgentScopes:
+        def restore(self, **kwargs):
+            restored.append(kwargs)
+            return True
+
+    class Gateway:
+        session_store = SimpleNamespace(
+            lookup_by_session_id=lambda session_id: (
+                SimpleNamespace(session_key="codex-bridge:zulip:42:Build:worker")
+                if session_id == "agent-session-1"
+                else None
+            )
+        )
+
+        def _adapter_for_source(self, source):
+            return (
+                SimpleNamespace(on_processing_complete=lambda _event, _outcome: None)
+                if source.profile == "zulip-ingress"
+                else None
+            )
+
+    coordinator = globals_["MailboxWakeCoordinator"](Client(), AgentScopes())
+    monkeypatch.setattr(
+        coordinator,
+        "_schedule_target",
+        lambda **kwargs: scheduled.append(kwargs) or True,
+    )
+
+    assert coordinator._recover_once(
+        gateway=Gateway(),
+        event_loop=SimpleNamespace(),
+        snapshot_path=str(snapshot_path),
+        worker_id="recovery-worker",
+    ) == 1
+    assert len(restored) == 1
+    assert restored[0]["child_session_id"] == "agent-session-1"
+    assert restored[0]["parent_session_id"] == "jarvis-session-1"
+    assert restored[0]["child_role"] == "reviewer"
+    assert scheduled[0]["target_kind"] == "AGENT"
+    assert scheduled[0]["agent_parent_session_id"] == "jarvis-session-1"
+
+
+@pytest.mark.parametrize(
+    ("candidate", "reason"),
+    [
+        (
+            _mailbox_recovery_candidate(state="LEASED", attempt_count=1),
+            "recovery_outcome_unverified",
+        ),
+        (
+            _mailbox_recovery_candidate(caller_session_id=None),
+            "caller_session_unavailable",
+        ),
+        (
+            _mailbox_recovery_candidate(project_id="wrong-project"),
+            "recovery_scope_mismatch",
+        ),
+        (
+            _mailbox_recovery_candidate(topic_revision=2, work_revision=1),
+            "recovery_scope_mismatch",
+        ),
+    ],
+    ids=("expired-lease", "missing-session", "project", "revision"),
+)
+def test_restart_recovery_abandons_every_uncertain_or_mismatched_candidate(
+    tmp_path: Path, monkeypatch, candidate: dict, reason: str
+) -> None:
+    manager, snapshot_path = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+    abandoned = []
+
+    class Client:
+        def list_mailbox_recovery(self, **_kwargs):
+            return [candidate]
+
+        def abandon_mailbox_recovery(self, **kwargs):
+            abandoned.append(kwargs)
+
+    gateway = SimpleNamespace(
+        session_store=SimpleNamespace(
+            lookup_by_session_id=lambda _session_id: SimpleNamespace(
+                session_key="codex-bridge:zulip:42:Build:boss"
+            )
+        ),
+        _adapter_for_source=lambda source: (
+            SimpleNamespace(on_processing_complete=lambda _event, _outcome: None)
+            if source.profile == "zulip-ingress"
+            else None
+        ),
+    )
+    coordinator = globals_["MailboxWakeCoordinator"](
+        Client(), SimpleNamespace(restore=lambda **_kwargs: True)
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "_schedule_target",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe recovery was scheduled")
+        ),
+    )
+
+    assert coordinator._recover_once(
+        gateway=gateway,
+        event_loop=SimpleNamespace(),
+        snapshot_path=str(snapshot_path),
+        worker_id="recovery-worker",
+    ) == 0
+    assert len(abandoned) == 1
+    assert abandoned[0]["mailbox_item_id"] == "mail-recovery-1"
+    assert abandoned[0]["expected_state"] == candidate["mailboxItem"]["state"]
+    assert abandoned[0]["expected_attempt_count"] == candidate["mailboxItem"]["attemptCount"]
+    assert abandoned[0]["reason"] == reason
+
+
+@pytest.mark.asyncio
+async def test_agent_mailbox_resume_is_internal_and_bypasses_public_adapter_delivery(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+    handled = []
+    public_deliveries = []
+
+    class IngressAdapter:
+        async def on_processing_complete(self, _event, _outcome):
+            return None
+
+        async def send(self, *_args, **_kwargs):
+            public_deliveries.append((_args, _kwargs))
+            return SendResult(success=True, message_id="unexpected")
+
+    ingress = IngressAdapter()
+
+    class Gateway:
+        session_store = SimpleNamespace(
+            lookup_by_session_id=lambda _session_id: SimpleNamespace(
+                session_key="codex-bridge:zulip:42:Build:person@example.com"
+            )
+        )
+
+        def _build_process_event_source(self, payload):
+            assert payload == {
+                "session_key": "codex-bridge:zulip:42:Build:person@example.com"
+            }
+            return SessionSource(
+                platform=Platform.ZULIP,
+                profile="codex-bridge",
+                chat_id="42:Build",
+                chat_type="stream",
+                chat_topic="Build",
+                user_id="person@example.com",
+            )
+
+        def _adapter_for_source(self, source):
+            return ingress if source.profile == "zulip-ingress" else None
+
+        async def _handle_message(self, event):
+            handled.append(event)
+            return "Agent verified and summarized the Codex result."
+
+    coordinator = globals_["MailboxWakeCoordinator"](
+        SimpleNamespace(),
+        SimpleNamespace(scope=lambda _session_id: None, stop=lambda _session_id: None),
+    )
+    item = {
+        "mailboxItemId": "mail-agent-1",
+        "workRequestId": "work-1",
+        "codexCallId": "call-1",
+        "itemType": "CODEX_RECEIPT",
+        "payload": {"text": "raw Codex output"},
+    }
+
+    response = await coordinator._resume_agent(
+        item=item,
+        gateway=Gateway(),
+        hermes_session_id="agent-session-1",
+    )
+
+    assert response == "Agent verified and summarized the Codex result."
+    assert len(handled) == 1
+    assert handled[0].internal is True
+    assert handled[0].metadata == {"gateway_session_id": "agent-session-1"}
+    assert handled[0].message_id == "hco-mailbox:mail-agent-1"
+    assert "HCO_PRIVATE_AGENT_MAILBOX_ITEM" in handled[0].text
+    assert public_deliveries == []
 
 
 @pytest.mark.asyncio
@@ -1866,7 +3529,7 @@ async def test_natural_handler_submits_exact_event_and_rejects_authority_fields(
     token = _nlp_token_from_rewrite(_invoke(manager, _event()))
     result = await handler(token)
 
-    assert result == "Codex 请求已提交。任务：obj-1。"
+    assert result == "Codex 请求已提交。任务：obj-1。执行可能需要数分钟；可用 `/codex status <任务ID>` 查询，未确认失败前请勿重复提交。"
     assert len(llm.calls) == 1
     assert len(calls) == 1
     submitted = calls[0]
@@ -1881,8 +3544,8 @@ async def test_natural_handler_submits_exact_event_and_rejects_authority_fields(
     assert submitted["semantic"] == {**semantic, "topicModeAction": None}
     payload = _token_payload(submitted["contextToken"])
     assert payload["binding"] == submitted["binding"]
-    assert payload["projectId"] == "alpha"
-    assert payload["topicMode"] == "AUTO"
+    assert payload["purpose"] == "codex-coordination-dispatch"
+    assert payload["codexCallId"] == submitted["caller"]["codexCallId"]
 
     for message_id, forbidden in enumerate(
         (
@@ -2222,29 +3885,39 @@ async def _dispatch_through_real_gateway(manager, monkeypatch, event):
     from gateway.run import GatewayRunner
 
     monkeypatch.setattr(plugin_module, "_plugin_manager", manager)
-    runner = object.__new__(GatewayRunner)
-    runner.config = {}
-    runner.session_store = manager._hco_test_session_store
-    runner.adapters = {}
-    runner.hooks = SimpleNamespace(emit_collect=_empty_hook_results)
-    runner._running_agents = {}
-    runner._running_agents_ts = {}
-    runner._pending_messages = {}
-    runner._session_model_overrides = {}
-    runner._update_prompt_pending = {}
-    runner._external_drain_active = False
-    runner._draining = False
-    runner._busy_input_mode = "interrupt"
-    runner._scale_to_zero_note_real_inbound = lambda: None
-    runner._is_user_authorized = lambda _source: True
-    runner._session_key_for_source = manager._hco_test_gateway._session_key_for_source
-    runner._check_slash_access = lambda _source, _command: None
-    runner._is_telegram_topic_root_lobby = lambda _source: False
-    runner._claim_active_session_slot = lambda _key, _source: (None, None)
-    runner._persist_active_agents = lambda: None
-    runner._begin_session_run_generation = lambda _key: 1
-    runner._restore_moa_one_shot = lambda _event, _key: None
-    runner._release_running_agent_state = lambda _key: None
+    runner = getattr(manager, "_hco_test_real_runner", None)
+    if runner is None:
+        runner = object.__new__(GatewayRunner)
+        runner.config = {}
+        runner.session_store = manager._hco_test_session_store
+        runner.adapters = {}
+        runner._profile_adapters = {
+            "zulip-ingress": {
+                Platform.ZULIP: SimpleNamespace(
+                    on_processing_complete=lambda _event, _outcome: None
+                )
+            }
+        }
+        runner.hooks = SimpleNamespace(emit_collect=_empty_hook_results)
+        runner._running_agents = {}
+        runner._running_agents_ts = {}
+        runner._pending_messages = {}
+        runner._session_model_overrides = {}
+        runner._update_prompt_pending = {}
+        runner._external_drain_active = False
+        runner._draining = False
+        runner._busy_input_mode = "interrupt"
+        runner._scale_to_zero_note_real_inbound = lambda: None
+        runner._is_user_authorized = lambda _source: True
+        runner._session_key_for_source = manager._hco_test_gateway._session_key_for_source
+        runner._check_slash_access = lambda _source, _command: None
+        runner._is_telegram_topic_root_lobby = lambda _source: False
+        runner._claim_active_session_slot = lambda _key, _source: (None, None)
+        runner._persist_active_agents = lambda: None
+        runner._begin_session_run_generation = lambda _key: 1
+        runner._restore_moa_one_shot = lambda _event, _key: None
+        runner._release_running_agent_state = lambda _key: None
+        manager._hco_test_real_runner = runner
     agent_entries = []
 
     async def run_through_agent(agent_event, *_args, **_kwargs):
@@ -2257,6 +3930,8 @@ async def _dispatch_through_real_gateway(manager, monkeypatch, event):
         return await _natural_tool_handler(manager, semantic_source)(capability)
 
     runner._handle_message_with_agent = run_through_agent
+    runner._running_agents.clear()
+    runner._running_agents_ts.clear()
     result = await GatewayRunner._handle_message(runner, event)
     return result, agent_entries
 
@@ -2398,6 +4073,85 @@ def _dispatch(*, objective=None) -> dict:
     }
 
 
+def test_dispatch_semantic_accepts_artifact_manifest_and_advertises_capability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _, _ = _load_manager_with_llm(tmp_path, monkeypatch, _dispatch())
+    globals_ = _plugin_globals(manager)
+    bridge_client_module = inspect.getmodule(globals_["BridgeClient"])
+    dispatch_schema = globals_["SEMANTIC_SCHEMA"]["oneOf"][1]
+
+    assert "artifact_manifest" in bridge_client_module.CAPABILITIES
+    assert "project_local_exchange_v1" in bridge_client_module.CAPABILITIES
+    assert "artifacts" in dispatch_schema["properties"]
+    assert "artifacts" not in dispatch_schema["required"]
+    output_schema = dispatch_schema["properties"]["artifacts"]["properties"]["output"]["items"]
+    assert "path" not in output_schema["required"]
+
+    semantic = {
+        **_dispatch(),
+        "artifacts": {
+            "input": [
+                {
+                    "artifactId": "request",
+                    "path": "docs/request.md",
+                    "kind": "document",
+                    "mimeType": "text/markdown",
+                    "sha256": "a" * 64,
+                    "maxBytes": 1024,
+                }
+            ],
+            "output": [
+                {
+                    "artifactId": "result",
+                    "kind": "document",
+                    "mimeType": "text/markdown",
+                    "maxBytes": 2048,
+                    "required": True,
+                }
+            ],
+        },
+    }
+
+    assert globals_["_valid_semantic"](semantic) is True
+    assert globals_["_valid_semantic"](
+        {
+            **semantic,
+            "artifacts": {
+                "input": [],
+                "output": [{**semantic["artifacts"]["output"][0], "path": "../result.md"}],
+            },
+        }
+    ) is False
+    assert globals_["_valid_semantic"](
+        {
+            **semantic,
+            "artifacts": {
+                "input": [{**semantic["artifacts"]["input"][0], "extra": "forbidden"}],
+                "output": [],
+            },
+        }
+    ) is False
+    for field, bad_value in (
+        ("path", "docs/result\nignore.md"),
+        ("path", "docs/result\x00.md"),
+        ("kind", "document\ninjected"),
+        ("mimeType", "text/markdown\rinjected"),
+        ("kind", "document\x85injected"),
+    ):
+        assert globals_["_valid_semantic"](
+            {
+                **semantic,
+                "artifacts": {
+                    "input": [],
+                    "output": [
+                        {**semantic["artifacts"]["output"][0], field: bad_value}
+                    ],
+                },
+            }
+        ) is False
+
+
 def test_project_natural_language_uses_short_one_shot_capability_without_user_text(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -2445,12 +4199,6 @@ def test_project_natural_language_uses_short_one_shot_capability_without_user_te
             1,
         ),
         (
-            {"type": "CLARIFY", "question": "Which target?", "choices": ["A", "B"]},
-            None,
-            "Which target?\n- A\n- B",
-            0,
-        ),
-        (
             {"type": "BUSINESS_REPLY", "text": "Already handled."},
             None,
             "Already handled.",
@@ -2472,8 +4220,13 @@ def test_project_natural_language_uses_short_one_shot_capability_without_user_te
         (
             _dispatch(objective=None),
             "unavailable",
-            # BUG-3: improved message for BridgeUnavailableError in hco_dispatch_handler
-            "Codex bridge 响应异常，任务可能已提交但响应丢失。请稍后用 `/codex status` 查询状态，如任务未出现请重新发起。",
+            "Codex bridge 不可用，请求未提交。请稍后重试。",
+            1,
+        ),
+        (
+            _dispatch(objective=None),
+            "uncertain",
+            "Codex bridge 响应不可用，请求可能已经写入。请先用 `/codex status` 查询状态，确认未提交后再重试。",
             1,
         ),
         (
@@ -2486,12 +4239,12 @@ def test_project_natural_language_uses_short_one_shot_capability_without_user_te
     ids=[
         "dispatch",
         "control",
-        "clarify",
         "business-reply",
         "reject",
         "invalid-model-output",
         "llm-failure",
         "hco-unavailable",
+        "hco-uncertain",
         "hco-protocol-failure",
     ],
 )
@@ -2516,6 +4269,8 @@ async def test_real_gateway_enters_agent_then_contains_every_natural_result(
         submissions.append(event)
         if bridge_failure == "unavailable":
             raise globals_["BridgeUnavailableError"]("offline")
+        if bridge_failure == "uncertain":
+            raise globals_["BridgeUncertainError"]("lost response")
         if bridge_failure == "protocol":
             raise globals_["BridgeProtocolError"]("bad response")
         return {"accepted": True}
@@ -2582,6 +4337,60 @@ async def test_natural_capability_is_consumed_before_first_await_and_never_resto
     assert len(submissions) == 1
 
 
+@pytest.mark.asyncio
+async def test_one_bound_turn_allows_eight_independent_signed_calls_then_revokes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    submissions = []
+
+    async def submit(_self, event):
+        submissions.append(event)
+        return {"accepted": True, "objectiveId": f"objective-{len(submissions)}"}
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event("run several checks")))
+    manager._hco_test_session_keys["session-a"] = (
+        "codex-bridge:zulip:42:Build:person@example.com"
+    )
+    _bind_turn(
+        manager,
+        session_id="session-a",
+        turn_id="turn-a",
+        user_message="run several checks",
+        message_id=99,
+    )
+    semantic = _dispatch()
+
+    for _ in range(8):
+        assert _pre_tool_block(manager, token, "session-a", "turn-a", semantic) is None
+        assert "Codex 请求已提交" in await _dispatch_tool_entry().handler(
+            {"semantic": semantic}, session_id="session-a", turn_id="turn-a"
+        )
+
+    assert _pre_tool_block(manager, token, "session-a", "turn-a", semantic) == (
+        "Codex bridge request rejected."
+    )
+    assert len(submissions) == 8
+    signed_tokens = [event["contextToken"] for event in submissions]
+    signed_call_ids = [event["caller"]["codexCallId"] for event in submissions]
+    assert len(set(signed_tokens)) == 8
+    assert len(set(signed_call_ids)) == 8
+    for event in submissions:
+        payload = _token_payload(event["contextToken"])
+        assert payload["purpose"] == "codex-coordination-dispatch"
+        assert payload["codexCallId"] == event["caller"]["codexCallId"]
+
+    manager.invoke_hook("post_llm_call", session_id="session-a", turn_id="turn-a")
+    assert _pre_tool_block(manager, token, "session-a", "turn-a", semantic) == (
+        "Codex bridge request rejected."
+    )
+
+
 def _lifecycle_runtime(session_keys: dict[str, str]):
     entries = {
         session_id: SimpleNamespace(session_key=session_key)
@@ -2590,10 +4399,16 @@ def _lifecycle_runtime(session_keys: dict[str, str]):
     session_store = SimpleNamespace(
         lookup_by_session_id=lambda session_id: entries.get(session_id)
     )
+    fake_adapter = SimpleNamespace(
+        on_processing_complete=lambda _event, _outcome: None
+    )
     gateway = SimpleNamespace(
         _session_key_for_source=lambda source: (
             f"{source.profile}:zulip:{source.chat_id}:{source.user_id}"
-        )
+        ),
+        _adapter_for_source=lambda source: (
+            fake_adapter if source.profile == "zulip-ingress" else None
+        ),
     )
     return gateway, session_store
 
@@ -2668,7 +4483,7 @@ async def test_natural_capability_succeeds_only_in_its_bound_turn(
     result = await _dispatch_tool_entry().handler(
         {"semantic": _dispatch()}, session_id="session-a"
     )
-    assert "任务可能已提交但响应丢失" in result  # BUG-3: improved unavailable message
+    assert "请求未提交" in result
 
 
 @pytest.mark.asyncio
@@ -2860,7 +4675,7 @@ async def test_identical_fifo_messages_bind_by_their_own_message_ids(
     result = await _dispatch_tool_entry().handler(
         {"semantic": semantic}, session_id="session-a"
     )
-    assert "任务可能已提交但响应丢失" in result  # BUG-3: improved unavailable message
+    assert "请求未提交" in result
     assert _pre_tool_block(manager, second, "session-a", "turn-second") is None
 
 
@@ -2996,11 +4811,9 @@ async def test_hermes_only_dispatch_stays_blocked_but_explicit_control_reaches_h
 
 
 @pytest.mark.asyncio
-async def test_dispatch_instruction_referencing_foreign_project_is_rejected(
+async def test_dispatch_instruction_referencing_another_project_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """BUG-2 L1: DISPATCH semantic whose instruction text names a different project
-    must be rejected before reaching HCO, with a clear conflict warning."""
     snapshot = _snapshot([_route(42, "PROJECT", project_id="alpha")])
     contaminated_dispatch = {
         "type": "DISPATCH",
@@ -3011,11 +4824,6 @@ async def test_dispatch_instruction_referencing_foreign_project_is_rejected(
         "objective": None,
     }
     manager, _, llm = _load_manager_with_llm(tmp_path, monkeypatch, contaminated_dispatch, snapshot)
-
-    # Inject project_cwd_map into the live closure via dict mutation (captured by reference)
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    cwd_map = inspect.getclosurevars(hook).nonlocals["project_cwd_map"]
-    cwd_map.update({"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)})
 
     submissions = []
 
@@ -3029,11 +4837,10 @@ async def test_dispatch_instruction_referencing_foreign_project_is_rejected(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=501)))
     result = await _call_hco_tool(manager, token, contaminated_dispatch)
 
-    # Must reject without calling HCO
-    assert submissions == [], "contaminated instruction must not reach HCO"
-    assert "指令上下文冲突" in result, f"expected conflict warning, got: {result!r}"
-    assert "alpha" in result
-    assert "beta" in result
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == contaminated_dispatch["instruction"]
+    assert submissions[0]["semantic"]["topicModeAction"] is None
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
@@ -3059,7 +4866,7 @@ async def test_dispatch_instruction_referencing_foreign_project_is_rejected(
         ("reminders", "工作目录是 /workspace/beta"),
     ],
 )
-async def test_dispatch_foreign_project_reference_in_any_text_field_is_rejected(
+async def test_dispatch_project_references_in_any_text_field_are_forwarded(
     tmp_path: Path, monkeypatch, field: str, foreign_reference: str
 ) -> None:
     semantic = {
@@ -3080,9 +4887,6 @@ async def test_dispatch_foreign_project_reference_in_any_text_field_is_rejected(
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
     )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    cwd_map = inspect.getclosurevars(hook).nonlocals["project_cwd_map"]
-    cwd_map.update({"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)})
     submissions = []
 
     async def submit(_self, event):
@@ -3094,14 +4898,14 @@ async def test_dispatch_foreign_project_reference_in_any_text_field_is_rejected(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=503)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert submissions == []
-    assert "指令上下文冲突" in result
-    assert field in result
-    assert "beta" in result
+    assert len(submissions) == 1
+    submitted = submissions[0]["semantic"]
+    assert submitted[field] == semantic[field]
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
-async def test_dispatch_ask_common_english_does_not_false_positive(
+async def test_dispatch_common_english_is_forwarded_without_project_name_scanning(
     tmp_path: Path, monkeypatch
 ) -> None:
     semantic = {**_dispatch(), "instruction": "Ask the user before changing the API."}
@@ -3110,10 +4914,6 @@ async def test_dispatch_ask_common_english_does_not_false_positive(
         monkeypatch,
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-    )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
-        {"alpha": ("/workspace/alpha", None), "ASK": ("/workspace/ASK", None)}
     )
     submissions = []
 
@@ -3143,7 +4943,7 @@ async def test_dispatch_ask_common_english_does_not_false_positive(
         "Inspect /workspace/beta.backup only.",
     ],
 )
-async def test_dispatch_project_and_cwd_boundaries_do_not_false_positive(
+async def test_dispatch_arbitrary_project_and_path_text_is_forwarded(
     tmp_path: Path, monkeypatch, instruction: str
 ) -> None:
     semantic = {**_dispatch(), "instruction": instruction}
@@ -3152,15 +4952,6 @@ async def test_dispatch_project_and_cwd_boundaries_do_not_false_positive(
         monkeypatch,
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-    )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
-        {
-            "a": ("/workspace/a", None),
-            "alpha": ("/workspace/alpha", None),
-            "beta": ("/workspace/beta", None),
-            "ASK": ("/workspace/ASK", None),
-        }
     )
     submissions = []
 
@@ -3178,7 +4969,7 @@ async def test_dispatch_project_and_cwd_boundaries_do_not_false_positive(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_exact_foreign_cwd_boundary_is_rejected(
+async def test_dispatch_exact_foreign_cwd_text_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
     semantic = {**_dispatch(), "instruction": "在 /workspace/beta 中执行"}
@@ -3187,10 +4978,6 @@ async def test_dispatch_exact_foreign_cwd_boundary_is_rejected(
         monkeypatch,
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-    )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
-        {"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)}
     )
     submissions = []
 
@@ -3203,12 +4990,13 @@ async def test_dispatch_exact_foreign_cwd_boundary_is_rejected(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=507)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert submissions == []
-    assert "指令上下文冲突" in result
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == semantic["instruction"]
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
-async def test_dispatch_foreign_cwd_subpath_is_rejected(
+async def test_dispatch_foreign_cwd_subpath_text_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
     semantic = {
@@ -3220,10 +5008,6 @@ async def test_dispatch_foreign_cwd_subpath_is_rejected(
         monkeypatch,
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-    )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
-        {"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)}
     )
     submissions = []
 
@@ -3236,62 +5020,26 @@ async def test_dispatch_foreign_cwd_subpath_is_rejected(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=801)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert submissions == []
-    assert "指令上下文冲突" in result
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == semantic["instruction"]
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
-async def test_dispatch_normalizes_configured_cwd_and_ignores_root(
+async def test_plugin_does_not_load_project_registry_for_text_scanning(
     tmp_path: Path, monkeypatch
 ) -> None:
-    semantic = {
-        **_dispatch(),
-        "instruction": "Edit /workspace/beta/src/main.py to fix the bug.",
-    }
-    manager, _, _llm = _load_manager_with_llm(
-        tmp_path,
-        monkeypatch,
-        semantic,
-        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-    )
+    manager, _ = _load_manager(tmp_path, monkeypatch)
     globals_ = _plugin_globals(manager)
-    config_path = tmp_path / "cwd-map.json"
-    _write_private(
-        config_path,
-        json.dumps(
-            {
-                "projects": [
-                    {"projectId": "alpha", "cwd": "/workspace/alpha"},
-                    {"projectId": "beta", "cwd": "/workspace/beta/"},
-                    {"projectId": "root", "cwd": "/"},
-                ]
-            }
-        ).encode(),
-    )
-    loaded = globals_["_load_project_cwd_map"](str(config_path))
-    assert loaded == {
-        "alpha": ("/workspace/alpha", None),
-        "beta": ("/workspace/beta", None),
-        "root": (None, None),
-    }
     hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(loaded)
-    submissions = []
-
-    async def submit(_self, event):
-        submissions.append(event)
-        return {"accepted": True}
-
-    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
-    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=802)))
-    result = await _call_hco_tool(manager, token, semantic)
-
-    assert submissions == []
-    assert "指令上下文冲突" in result
+    assert "project_cwd_map" not in inspect.getclosurevars(hook).nonlocals
+    assert "_semantic_references_foreign_project" not in globals_
+    assert "_mentions_project_id" not in globals_
+    assert "_cwd_referenced" not in globals_
 
 
 @pytest.mark.asyncio
-async def test_dispatch_resolves_symlinked_project_cwd_before_conflict_check(
+async def test_dispatch_text_with_canonical_project_path_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
     canonical_beta = tmp_path / "canonical" / "beta"
@@ -3308,39 +5056,23 @@ async def test_dispatch_resolves_symlinked_project_cwd_before_conflict_check(
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
     )
-    globals_ = _plugin_globals(manager)
-    config_path = tmp_path / "cwd-map-symlink.json"
-    _write_private(
-        config_path,
-        json.dumps(
-            {
-                "projects": [
-                    {"projectId": "alpha", "cwd": str(tmp_path / "alpha")},
-                    {"projectId": "beta", "cwd": str(symlink_beta)},
-                ]
-            }
-        ).encode(),
-    )
-    loaded = globals_["_load_project_cwd_map"](str(config_path))
-    assert loaded["beta"] == (str(symlink_beta), str(canonical_beta))
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(loaded)
     submissions = []
 
     async def submit(_self, event):
         submissions.append(event)
         return {"accepted": True}
 
-    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=803)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert submissions == []
-    assert "指令上下文冲突" in result
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == semantic["instruction"]
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
-async def test_dispatch_rejects_configured_symlink_alias_subpath(
+async def test_dispatch_text_with_symlink_alias_path_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
     canonical_beta = tmp_path / "canonical-alias" / "beta"
@@ -3357,46 +5089,31 @@ async def test_dispatch_rejects_configured_symlink_alias_subpath(
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
     )
-    globals_ = _plugin_globals(manager)
-    config_path = tmp_path / "cwd-map-alias.json"
-    _write_private(
-        config_path,
-        json.dumps(
-            {
-                "projects": [
-                    {"projectId": "alpha", "cwd": str(tmp_path / "alpha")},
-                    {"projectId": "beta", "cwd": str(symlink_beta)},
-                ]
-            }
-        ).encode(),
-    )
-    loaded = globals_["_load_project_cwd_map"](str(config_path))
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(loaded)
     submissions = []
 
     async def submit(_self, event):
         submissions.append(event)
         return {"accepted": True}
 
-    monkeypatch.setattr(globals_["BridgeClient"], "submit", submit)
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=804)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert submissions == []
-    assert "指令上下文冲突" in result
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == semantic["instruction"]
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("instruction", "blocked"),
+    "instruction",
     [
-        ("Fix root's failing tests.", True),
-        ("Inspect /anywhere/path without naming another project.", False),
+        "Fix root's failing tests.",
+        "Inspect /anywhere/path without naming another project.",
     ],
 )
-async def test_root_project_keeps_identity_without_matching_all_paths(
-    tmp_path: Path, monkeypatch, instruction: str, blocked: bool
+async def test_project_named_root_is_plain_instruction_text(
+    tmp_path: Path, monkeypatch, instruction: str
 ) -> None:
     semantic = {**_dispatch(), "instruction": instruction}
     manager, _, _llm = _load_manager_with_llm(
@@ -3405,10 +5122,6 @@ async def test_root_project_keeps_identity_without_matching_all_paths(
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
     )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
-        {"alpha": ("/workspace/alpha", None), "root": (None, None)}
-    )
     submissions = []
 
     async def submit(_self, event):
@@ -3416,27 +5129,24 @@ async def test_root_project_keeps_identity_without_matching_all_paths(
         return {"accepted": True}
 
     monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
-    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=805 if blocked else 806)))
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=805)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert (submissions == []) is blocked
-    assert ("指令上下文冲突" in result) is blocked
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == instruction
+    assert "指令上下文冲突" not in result
 
 
 @pytest.mark.asyncio
-async def test_dispatch_explicit_ask_project_reference_is_rejected(
+async def test_dispatch_explicit_uppercase_project_reference_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
-    semantic = {**_dispatch(), "instruction": "请在 ASK 仓库中执行"}
+    semantic = {**_dispatch(), "instruction": "请在 OMEGA 仓库中执行"}
     manager, _, _llm = _load_manager_with_llm(
         tmp_path,
         monkeypatch,
         semantic,
         _snapshot([_route(42, "PROJECT", project_id="alpha")]),
-    )
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    inspect.getclosurevars(hook).nonlocals["project_cwd_map"].update(
-        {"alpha": ("/workspace/alpha", None), "ASK": ("/workspace/ASK", None)}
     )
     submissions = []
 
@@ -3449,9 +5159,9 @@ async def test_dispatch_explicit_ask_project_reference_is_rejected(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=505)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert submissions == []
-    assert "指令上下文冲突" in result
-    assert "ASK" in result
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == semantic["instruction"]
+    assert "指令上下文冲突" not in result
 
 
 def test_safe_question_id_rejects_whitespace_and_accepts_simple_ids(
@@ -3484,19 +5194,129 @@ def test_safe_question_id_rejects_node_special_chars(
     assert is_safe("question-id_1.2") is True
 
 
-def test_project_reference_detection_handles_boundaries_verbs_and_short_names(
+@pytest.mark.parametrize(
+    "separator",
+    ["\r\n", "\r", "\n", "\x0b", "\x0c", "\x85", "\u2028", "\u2029"],
+)
+def test_markdown_escape_preserves_identifiers_and_flattens_structure(
+    tmp_path: Path, monkeypatch, separator: str
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    escape = _plugin_globals(manager)["_escape_markdown_inline"]
+
+    visible = escape(f"LIVE-POSTFIX.S-001 @**all**{separator}next|<tag>")
+
+    assert "LIVE-POSTFIX.S-001" in visible
+    assert "&#64;&#42;&#42;all&#42;&#42;" in visible
+    assert separator not in visible
+    assert " next" in visible
+    assert "&#124;" in visible
+    assert "&#60;tag&#62;" in visible
+
+
+def test_markdown_escape_encodes_ampersand_before_entities(
     tmp_path: Path, monkeypatch
 ) -> None:
     manager, _ = _load_manager(tmp_path, monkeypatch)
-    mentions = _plugin_globals(manager)["_mentions_project_id"]
+    escape = _plugin_globals(manager)["_escape_markdown_inline"]
 
-    assert mentions("Please handle beta failures", "beta") is True
-    assert mentions("Please investigate beta failures", "beta") is True
-    assert mentions("请处理 beta 中的失败", "beta") is True
-    assert mentions("fix api", "api") is True
-    assert mentions("run test", "test") is True
-    assert mentions("debug test", "test") is True
-    assert mentions("work in foo.bar", "foo") is False
+    assert escape("LIVE-POSTFIX.S-001") == "LIVE-POSTFIX.S-001"
+    assert escape("&#42; *") == "&#38;&#35;42; &#42;"
+
+
+def test_bridge_uncertain_message_only_includes_safe_objective_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    message = _plugin_globals(manager)["_bridge_uncertain_message"]
+
+    safe = message("objective-123")
+    unsafe = message("bad\nid")
+
+    assert "objective-123" in safe
+    assert "bad" not in unsafe
+    assert "可能已经写入" in unsafe
+    assert "查询状态" in unsafe
+
+
+@pytest.mark.asyncio
+async def test_semantic_bridge_user_error_is_single_line_and_markdown_escaped(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = _dispatch()
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    globals_ = _plugin_globals(manager)
+
+    async def user_error(_self, _event):
+        raise globals_["BridgeUserError"](
+            "INTERACTION_DECISION_INVALID",
+            "error\x0b*bold*\x0c<tag>\x85bad|value\u2028next\u2029last",
+        )
+
+    monkeypatch.setattr(globals_["BridgeClient"], "submit", user_error)
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=903)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    for separator in ("\x0b", "\x0c", "\x85", "\u2028", "\u2029"):
+        assert separator not in result
+    assert "&#42;bold&#42;" in result
+    assert "&#60;tag&#62;" in result
+    assert "bad&#124;value" in result
+
+
+def test_channel_prompt_does_not_prohibit_other_project_names_or_paths(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(
+        tmp_path,
+        monkeypatch,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+    event = _event("compare alpha with beta")
+
+    assert _invoke(manager, event) == {"action": "allow"}
+    assert "Do NOT reference" not in event.channel_prompt
+    assert "must be repeated" in event.channel_prompt
+    assert "canonical working directory" in event.channel_prompt
+
+
+def test_partial_answer_rejects_unsafe_interaction_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    render = _plugin_globals(manager)["_render_bridge_result"]
+
+    result = render({
+        "schemaVersion": 1,
+        "status": "partial",
+        "action": "interaction.answer",
+        "projectId": "alpha",
+        "interactionId": "bad id",
+        "missingQuestionIds": ["q2"],
+    })
+
+    assert result == "Codex bridge protocol error."
+
+
+def test_project_reference_scanner_helpers_are_not_registered(
+    tmp_path: Path, monkeypatch
+) -> None:
+    manager, _ = _load_manager(tmp_path, monkeypatch)
+    globals_ = _plugin_globals(manager)
+
+    for name in (
+        "_load_project_cwd_map",
+        "_check_mentions_project_id",
+        "_mentions_project_id",
+        "_cwd_referenced",
+        "_semantic_references_foreign_project",
+    ):
+        assert name not in globals_
 
 
 @pytest.mark.asyncio
@@ -3570,7 +5390,7 @@ async def test_partial_answer_filters_unsafe_missing_question_ids(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_continue_bridge_unavailable_includes_objective_id(
+async def test_dispatch_continue_bridge_unavailable_omits_objective_id(
     tmp_path: Path, monkeypatch
 ) -> None:
     semantic = {
@@ -3592,16 +5412,43 @@ async def test_dispatch_continue_bridge_unavailable_includes_objective_id(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=506)))
     result = await _call_hco_tool(manager, token, semantic)
 
-    assert "任务可能已提交但响应丢失" in result
+    assert "请求未提交" in result
+    assert "objective-123" not in result
+
+
+@pytest.mark.asyncio
+async def test_dispatch_continue_bridge_uncertain_includes_safe_objective_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    semantic = {
+        **_dispatch(objective={"mode": "CONTINUE", "objectiveId": "objective-123"}),
+        "instruction": "继续任务",
+    }
+    manager, _, _llm = _load_manager_with_llm(
+        tmp_path,
+        monkeypatch,
+        semantic,
+        _snapshot([_route(42, "PROJECT", project_id="alpha")]),
+    )
+
+    async def submit(_self, _event):
+        raise _plugin_globals(manager)["BridgeUncertainError"]("lost response")
+
+    monkeypatch.setattr(_plugin_globals(manager)["BridgeClient"], "submit", submit)
+
+    token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=507)))
+    result = await _call_hco_tool(manager, token, semantic)
+
+    assert "可能已经写入" in result
+    assert "查询状态" in result
+    assert "请求未提交" not in result
     assert "objective-123" in result
 
 
 @pytest.mark.asyncio
-async def test_dispatch_instruction_with_own_project_name_is_accepted(
+async def test_dispatch_instruction_with_routed_project_name_is_forwarded(
     tmp_path: Path, monkeypatch
 ) -> None:
-    """BUG-2 L1: DISPATCH semantic whose instruction mentions the trusted project
-    must not be rejected (no false positive)."""
     snapshot = _snapshot([_route(42, "PROJECT", project_id="alpha")])
     clean_dispatch = {
         "type": "DISPATCH",
@@ -3612,11 +5459,6 @@ async def test_dispatch_instruction_with_own_project_name_is_accepted(
         "objective": None,
     }
     manager, _, llm = _load_manager_with_llm(tmp_path, monkeypatch, clean_dispatch, snapshot)
-
-    # Inject project_cwd_map: alpha→beta conflict only triggered for foreign names
-    hook = manager._hooks["pre_gateway_dispatch"][0]
-    cwd_map = inspect.getclosurevars(hook).nonlocals["project_cwd_map"]
-    cwd_map.update({"alpha": ("/workspace/alpha", None), "beta": ("/workspace/beta", None)})
 
     submissions = []
 
@@ -3630,8 +5472,8 @@ async def test_dispatch_instruction_with_own_project_name_is_accepted(
     token = _nlp_token_from_rewrite(_invoke(manager, _event(message_id=502)))
     result = await _call_hco_tool(manager, token, clean_dispatch)
 
-    # Must reach HCO normally — no false positive on own project name
-    assert len(submissions) == 1, "clean instruction must reach HCO"
+    assert len(submissions) == 1
+    assert submissions[0]["semantic"]["instruction"] == clean_dispatch["instruction"]
     assert "指令上下文冲突" not in result
 
 
@@ -3834,8 +5676,6 @@ def _semantic_boundary_pair(case: str, globals_: dict) -> tuple[dict, dict]:
         exact["instruction"] = _utf8_exact_bytes(globals_["MAX_INSTRUCTION_BYTES"])
     elif case == "objective-id":
         exact = _dispatch(objective={"mode": "CONTINUE", "objectiveId": _utf8_exact_bytes(512)})
-    elif case == "clarify-question":
-        exact = {"type": "CLARIFY", "question": _utf8_exact_bytes(4 * 1024), "choices": []}
     elif case == "business-text":
         exact = {"type": "BUSINESS_REPLY", "text": _utf8_exact_bytes(globals_["MAX_VISIBLE_TEXT_BYTES"])}
     elif case == "reject-text":
@@ -3847,8 +5687,6 @@ def _semantic_boundary_pair(case: str, globals_: dict) -> tuple[dict, dict]:
     elif case == "dispatch-list-entry":
         exact = _dispatch()
         exact["constraints"] = [_utf8_exact_bytes(globals_["MAX_LIST_ENTRY_BYTES"])]
-    elif case == "clarify-choice":
-        exact = {"type": "CLARIFY", "question": "Choose", "choices": [_utf8_exact_bytes(1024)]}
     elif case == "constraints-count":
         exact = _dispatch()
         exact["constraints"] = ["x"] * 16
@@ -3858,8 +5696,6 @@ def _semantic_boundary_pair(case: str, globals_: dict) -> tuple[dict, dict]:
     elif case == "reminders-count":
         exact = _dispatch()
         exact["reminders"] = ["x"] * 8
-    elif case == "choices-count":
-        exact = {"type": "CLARIFY", "question": "Choose", "choices": ["x"] * 5}
     elif case == "total-json":
         exact = _dispatch()
         exact["instruction"] = "i" * globals_["MAX_INSTRUCTION_BYTES"]
@@ -3875,21 +5711,16 @@ def _semantic_boundary_pair(case: str, globals_: dict) -> tuple[dict, dict]:
         plus["instruction"] += "a"
     elif case == "objective-id":
         plus["objective"]["objectiveId"] += "a"
-    elif case in {"clarify-question", "business-text", "reject-text"}:
-        field = "question" if case == "clarify-question" else "text"
-        plus[field] += "a"
+    elif case in {"business-text", "reject-text"}:
+        plus["text"] += "a"
     elif case == "dispatch-list-entry":
         plus["constraints"][0] += "a"
-    elif case == "clarify-choice":
-        plus["choices"][0] += "a"
     elif case == "constraints-count":
         plus["constraints"].append("x")
     elif case == "acceptance-count":
         plus["acceptanceCriteria"].append("x")
     elif case == "reminders-count":
         plus["reminders"].append("x")
-    elif case == "choices-count":
-        plus["choices"].append("x")
     elif case == "total-json":
         plus["constraints"][-1] += "a"
         assert len(globals_["_canonical_json"](plus)) == globals_["MAX_SEMANTIC_BYTES"] + 1
@@ -3902,15 +5733,12 @@ def _semantic_boundary_pair(case: str, globals_: dict) -> tuple[dict, dict]:
     [
         "instruction",
         "objective-id",
-        "clarify-question",
         "business-text",
         "reject-text",
         "dispatch-list-entry",
-        "clarify-choice",
         "constraints-count",
         "acceptance-count",
         "reminders-count",
-        "choices-count",
         "total-json",
     ],
 )
@@ -3952,8 +5780,6 @@ async def test_semantic_utf8_count_and_total_json_exact_plus_one_boundaries(
     assert plus_agent_entries == ["ordinary-agent"]
     if exact_submits:
         assert exact_result == "Codex 请求已提交。"
-    elif exact["type"] == "CLARIFY":
-        assert exact_result.startswith(exact["question"])
     else:
         assert exact_result == exact["text"]
 

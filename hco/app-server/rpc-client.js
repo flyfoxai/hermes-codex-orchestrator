@@ -105,7 +105,8 @@ function classifyMessage(message) {
     return { kind: "request" };
   }
   if (!hasId && hasMethod && !hasResult && !hasError && validMethod(message.method) &&
-      hasOnlyKeys(message, new Set(["method", "params"]))) {
+      hasOnlyKeys(message, new Set(["method", "params", "emittedAtMs"])) &&
+      (!Object.hasOwn(message, "emittedAtMs") || isSignedInt64(message.emittedAtMs))) {
     return { kind: "notification" };
   }
   return null;

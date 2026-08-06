@@ -7,6 +7,7 @@ import { DEFER_SERVER_REQUEST } from "./app-server/rpc-client.js";
 import { createBearerAuthenticatorFromToken } from "./bridge/auth.js";
 import { createBridge as defaultCreateBridge } from "./bridge/server.js";
 import { loadHcoConfig, loadOwnerSecret } from "./config.js";
+import { reconcileActiveCodexCalls } from "./coordination-recovery.js";
 import { createAppServerBackend } from "./execution/app-server-backend.js";
 import { executionBackendError, validateExecutionBackend } from "./execution/backend.js";
 import { createHcoService } from "./service.js";
@@ -23,8 +24,15 @@ const DIAGNOSTICS = Object.freeze({
   HCO_APP_SERVER_UNAVAILABLE: "Codex App Server is unavailable.",
   HCO_CONNECTION_LOSS_FAILED: "App Server connection loss could not be persisted.",
   HCO_NOTIFICATION_ADAPTER_FAILED: "App Server notification adapter failed.",
-  HCO_REVERSE_REQUEST_ADAPTER_FAILED: "App Server reverse request adapter failed."
+  HCO_REVERSE_REQUEST_ADAPTER_FAILED: "App Server reverse request adapter failed.",
+  HCO_STARTUP_RECONCILIATION_FAILED: "Active Codex calls could not be reconciled after connection."
 });
+
+function modelCatalogUnavailable() {
+  const error = new Error("Codex model catalog is unavailable.");
+  error.code = "MODEL_CATALOG_UNAVAILABLE";
+  return error;
+}
 
 async function unavailable() {
   throw executionBackendError("EXECUTION_BACKEND_UNAVAILABLE", "Execution backend is unavailable.");
@@ -139,18 +147,25 @@ export async function createHcoRuntime({
       throw new TypeError("HCO runtime identifiers are invalid.");
     }
     const appServerGate = createAppServerAvailabilityGate();
+    const modelCatalog = Object.freeze({
+      async listModels(options) {
+        if (!client || !appServerGate.isAvailable()) throw modelCatalogUnavailable();
+        return client.listModels(options);
+      }
+    });
     controller = createController({
       store,
       appServerBackend: appServerGate.backend,
       tmuxBackend,
       leaseOwner
     });
-    service = createService({ config, store, turnController: controller, contextKey, idFactory, now });
+    service = createService({ config, store, turnController: controller, contextKey, modelCatalog, idFactory, now });
     const bridge = createBridge({
       store,
       authenticator,
       eventHandler: (event) => service.handleBridgeEvent(event),
-      healthProvider: () => ({ appServerAvailable: appServerGate.isAvailable() })
+      healthProvider: () => ({ appServerAvailable: appServerGate.isAvailable() }),
+      modelProvider: (options) => service.listModels(options)
     });
 
     await service.start();
@@ -268,6 +283,15 @@ export async function createHcoRuntime({
           appServerGate.install(backend);
           appServerAvailable = true;
           retryAttempt = 0;
+          try {
+            await reconcileActiveCodexCalls({
+              store,
+              turnController: controller,
+              sourcePrefix: `connection-recovery:${candidate.connectionId}`
+            });
+          } catch {
+            emitDiagnostic("HCO_STARTUP_RECONCILIATION_FAILED");
+          }
         } catch {
           if (connection === candidate) {
             connection = null;

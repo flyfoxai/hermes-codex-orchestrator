@@ -71,14 +71,17 @@ function assertText(value, field, { maximum = 256 } = {}) {
   }
 }
 
-export function canonicalJson(value) {
+export function canonicalJson(value, { maximumBytes = MAX_CANONICAL_JSON_BYTES } = {}) {
+  if (!Number.isSafeInteger(maximumBytes) || maximumBytes <= 0 || maximumBytes > 64 * 1024 * 1024) {
+    throw stateError("FACT_INVALID", "Canonical JSON size limit is invalid.");
+  }
   const ancestors = new Set();
   const chunks = [];
   let byteLength = 0;
 
   function append(chunk) {
     byteLength += Buffer.byteLength(chunk, "utf8");
-    if (byteLength > MAX_CANONICAL_JSON_BYTES) {
+    if (byteLength > maximumBytes) {
       throw stateError("FACT_INVALID", "Fact JSON exceeds the size limit.");
     }
     chunks.push(chunk);

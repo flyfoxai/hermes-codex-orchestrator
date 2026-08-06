@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -44,6 +45,18 @@ def _exception_status(error: Exception) -> int | None:
 
 def _retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUS_CODES or 500 <= status <= 599
+
+
+def _widget_unsupported(response: object) -> bool:
+    if not isinstance(response, Mapping) or response.get("result") != "error":
+        return False
+    code = response.get("code")
+    message = response.get("msg")
+    detail = f"{code or ''} {message or ''}".lower()
+    return (
+        (code in {"BAD_REQUEST", "INVALID_WIDGET_CONTENT"} or response.get("status_code") == 400)
+        and ("widget" in detail or "zform" in detail)
+    )
 
 
 def _response_failure(response: object, secrets: tuple[str, ...]) -> SendResult:
@@ -98,16 +111,27 @@ class ZulipSender:
         api_key = getattr(self.client, "api_key", "")
         self.secrets = (api_key,) if type(api_key) is str and api_key else ()
 
-    def send(self, stream_id: int, topic: str, content: str) -> SendResult:
+    def send(
+        self,
+        stream_id: int,
+        topic: str,
+        content: str,
+        *,
+        widget_content: str | None = None,
+    ) -> SendResult:
+        message = {
+            "type": "stream",
+            "to": str(stream_id),
+            "topic": topic,
+            "content": content,
+        }
+        if widget_content is not None:
+            message["widget_content"] = widget_content
         try:
-            response = self.client.send_message(
-                {
-                    "type": "stream",
-                    "to": str(stream_id),
-                    "topic": topic,
-                    "content": content,
-                }
-            )
+            response = self.client.send_message(message)
+            if widget_content is not None and _widget_unsupported(response):
+                message.pop("widget_content", None)
+                response = self.client.send_message(message)
         except Exception as error:
             status = _exception_status(error)
             retryable = status is None or _retryable_status(status)
@@ -126,3 +150,63 @@ class ZulipSender:
                 return SendResult.success(message_id)
             return SendResult.failure("ZULIP_RESPONSE_UNCERTAIN", True)
         return _response_failure(response, self.secrets)
+
+    def delete(self, message_id: int) -> SendResult:
+        try:
+            response = self.client.delete_message(message_id)
+        except Exception as error:
+            status = _exception_status(error)
+            retryable = status is None or _retryable_status(status)
+            if status is not None and 400 <= status <= 499 and not _retryable_status(status):
+                retryable = False
+            category = "ZULIP_RETRYABLE" if retryable else "ZULIP_PERMANENT"
+            return SendResult.failure(
+                bounded_diagnostic(
+                    f"{category}:{type(error).__name__}:{error}", self.secrets
+                ),
+                retryable,
+            )
+        if isinstance(response, Mapping) and response.get("result") == "success":
+            return SendResult.success(message_id)
+        return _response_failure(response, self.secrets)
+
+    def send_document(
+        self,
+        stream_id: int,
+        topic: str,
+        content: str,
+        *,
+        display_name: str,
+        document_bytes: bytes,
+        sha256: str,
+    ) -> SendResult:
+        buffer = io.BytesIO(document_bytes)
+        buffer.name = display_name
+        try:
+            response = self.client.upload_file(buffer)
+        except Exception as error:
+            status = _exception_status(error)
+            retryable = status is None or _retryable_status(status)
+            if status is not None and 400 <= status <= 499 and not _retryable_status(status):
+                retryable = False
+            category = "ZULIP_RETRYABLE" if retryable else "ZULIP_PERMANENT"
+            return SendResult.failure(
+                bounded_diagnostic(
+                    f"{category}:{type(error).__name__}:{error}", self.secrets
+                ),
+                retryable,
+            )
+        if not isinstance(response, Mapping) or response.get("result") != "success":
+            return _response_failure(response, self.secrets)
+        uri = response.get("uri")
+        if (
+            type(uri) is not str
+            or not uri.startswith("/user_uploads/")
+            or any(character.isspace() or character in "()[]" for character in uri)
+        ):
+            return SendResult.failure("ZULIP_RESPONSE_UNCERTAIN", True)
+        linked_content = (
+            f"{content}\n\n[{display_name}]({uri})\n"
+            f"SHA-256: `{sha256}` | {len(document_bytes)} bytes"
+        )
+        return self.send(stream_id, topic, linked_content)

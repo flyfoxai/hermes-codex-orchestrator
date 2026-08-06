@@ -1,7 +1,9 @@
 # Hermes / Zulip 对接与故障支持手册
 
-**状态：** 支持基线（由 2026-07-13 至 2026-07-18 项目记录整理）  
-**适用范围：** Hermes、Zulip、Hermes Codex Orchestrator（HCO）、Codex App Server、Gateway、Delivery sidecar 以及 macOS launchd 部署  
+> 本文是历史 Option C/sidecar 支持基线，不是当前目标架构的 PRD。当前目标以 [`HCO_CODEX_SERVICE_BRIDGE_PRD.md`](HCO_CODEX_SERVICE_BRIDGE_PRD.md) 为准；新实现不得继续扩大 HCO 的用户消息 outbox、直接 Zulip delivery、提醒调度或通用多 Agent 控制面。
+
+**状态：** 支持基线（由 2026-07-13 至 2026-07-18 项目记录整理）
+**适用范围：** Hermes、Zulip、Hermes Codex Orchestrator（HCO）、Codex App Server、Gateway、Delivery sidecar 以及 macOS launchd 部署
 **安全要求：** 本文不包含 bearer、HMAC、Zulip API key、模型 key 或完整环境变量；命令中的 `$TOKEN`、`$HCO_CONFIG` 等均为占位符。
 
 本文不是某一次发布的变更说明，而是未来开展 Hermes、Zulip 及类似入口对接时的支持基线。历史证据主要来自根目录的 [`findings.md`](../findings.md)、[`progress.md`](../progress.md)、`.planning/` 阶段记录，以及 [`docs/reviews/`](reviews/) 和 [`docs/superpowers/`](superpowers/) 下的设计/评审文件。
@@ -35,7 +37,7 @@ flowchart LR
 
 新增对接、修复故障或审核部署时，先检查这些不变量，再讨论实现细节。
 
-1. **项目路由唯一权威：** 数字 `stream_id` + 新鲜、完整性校验通过的 HCO route snapshot。stream 名称、topic 文本、cwd、memory、Task Guard、模型输出都不是路由权威。
+1. **项目路由唯一权威：** 数字 `stream_id` + 新鲜、完整性校验通过的 HCO route snapshot。stream 名称、topic 文本、cwd、memory、Task Guard、模型输出都不是路由权威。自然语言可以提到任何项目名或路径；插件不得据此改路由或拒绝，HCO 必须继续使用签名 route、ACL 和注册表 canonical cwd。
 2. **未映射与路由损坏分开：** snapshot 有效但数字 stream 未映射时，普通对话进入 `hermes-general`，明确的项目执行/进度请求返回固定登记模板；snapshot 缺失、过期、损坏或签名错误时才留在项目中立的 `zulip-ingress` 并返回固定不可用提示。两者都不能继承 ASK 或其他项目上下文。
 3. **来源规则分离：** Zulip 使用 `stream -> projectId`；飞书、Hermes 原生会话使用显式 `projectId`、conversation 绑定或明确默认项目，不能套用 Zulip topic 规则。参考 [`HERMES_ZULIP_ADAPTER_INTEGRATION.md`](HERMES_ZULIP_ADAPTER_INTEGRATION.md)。
 4. **模型边界固定：** 完整 `/codex` 命令、审批/问答回执和状态通知不调用 Hermes 模型；其他有效自然语言最多调用一个当前配置模型；模型输出只允许严格的已知 union，不能二次“修复”或猜项目。
@@ -45,12 +47,14 @@ flowchart LR
 8. **安装原子化：** plugin、profile、dotenv、plist、进程、SQLite 主库及 WAL/SHM、route snapshot 均处于同一安装/回滚证据边界。
 9. **消息身份端到端一致：** 原始 Zulip `message.id`、`MessageEvent.message_id`、`SessionSource.message_id` 和 Gateway 的 `HERMES_SESSION_MESSAGE_ID` 必须是同一个规范化正整数。缺失、格式异常或冲突一律失败关闭，不能仅凭相同文本或 session 猜测一次性 capability 属于哪个 turn。
 10. **签名 capability 不经过模型：** capability 只存在于插件的有界内存和 HCO wire envelope。模型看到的 `hco_dispatch` 参数只能是一个 `semantic` 属性，不能提供 `capability` 或 `topicModeAction`；插件仍必须按 session、turn、source message、sender、stream、topic、project、request digest、ACL、有效期和 replay 状态逐项校验。
+11. **默认收件人不与显式 mention 混合：** 所有 stream/topic 中，零原生 mention 的消息才寻址到配置的 `default_addressee`（默认 `self`/Jarvis）。一旦存在任意用户或用户组 mention，就不隐式追加 Jarvis；只有当前 bot 的显式 mention 或 Zulip wildcard mention 才能进入该 bot。原来的 `free_response_streams` 不能绕过这一全局规则。
+12. **非幂等发送不得盲目重试：** Hermes 直接向 Zulip 发送消息时，SDK 不得自动重复 POST。POST 异常、5xx 或响应丢失必须进入明确的 `delivery_uncertain` 分支，禁止重发原文、纯文本 fallback 和失败告警；服务端明确拒绝的格式错误仍可安全降级。HCO outbox/delivery 的持久化投递合同与这条 Hermes 直接发送规则分别管理，不得混用状态。
 
 ## 3. 典型事故与经验教训
 
 | 现象 | 已确认根因 | 必须采取的防护 | 记录依据 |
 |---|---|---|---|
-| Zulip `stream=5` 的请求修改了 ASK | 消息走了 Hermes native tools，未进入 HCO；全局 `TERMINAL_CWD` 回退到 ASK，正确的 adapter 映射因此没有生效 | 在 ingress 入口确定路由；工具/执行前再次校验 project/cwd；未确定时拒绝写入 | [wrong-project evidence brief](../.planning/2026-07-15-zulip-wrong-project-investigation/evidence-brief.md) |
+| Zulip `stream=5` 的请求修改了 ASK | 消息走了 Hermes native tools，未进入 HCO；全局 `TERMINAL_CWD` 回退到 ASK，正确的 adapter 映射因此没有生效 | 在 ingress 入口确定路由；multiplex profile 用会话 `ContextVar` 隔离 cwd 和 `AGENTS.md`；HCO 执行前再次校验签名 project、ACL 和 canonical cwd；未确定时拒绝写入 | [wrong-project evidence brief](../.planning/2026-07-15-zulip-wrong-project-investigation/evidence-brief.md) |
 | HCO 路由正确但旧 Gateway 回答了错误项目 | 插件未加载或快照过期，默认 profile 仍可执行 | `zulip-ingress` 项目中立隔离；快照新鲜度/签名校验；安装后必须做 live hook/profile attestation | [`2026-07-17-option-c-routing-containment-remediation-design.md`](superpowers/specs/2026-07-17-option-c-routing-containment-remediation-design.md) |
 | 兼容性探针通过，真实 secondary profile 却拿不到 Zulip 凭据 | Hermes 把 profile `.env` 放到 `agent.secret_scope` 并清理 `os.environ`，旧适配器只读 `os.getenv()` | 探针必须复现真实 `_profile_runtime_scope()`；插件兼容层按 profile 读取 `get_secret()`，不写全局环境 | [`findings.md`](../findings.md)「Hermes secondary-profile secret propagation」 |
 | 新 ingress 在 live attestation 阶段失败 | `ask-jarvis-pm` 等旧 profile 使用同一 Zulip credential，Hermes 只允许后排序的一个 poller | 安装器精确发现并临时禁用同 credential 的外部 Zulip profile，只改 `enabled`，失败时恢复原字节 | [`findings.md`](../findings.md)「Duplicate Zulip poller activation failure」 |
@@ -63,6 +67,7 @@ flowchart LR
 | 普通自我介绍可回复，但项目进度请求返回 `Codex bridge request rejected` | Zulip adapter 只把 ID 放在 `MessageEvent.message_id`，创建 `SessionSource` 时未传入；Gateway 从空的 `SessionSource.message_id` 生成空 `HERMES_SESSION_MESSAGE_ID`，严格 turn capability 无法绑定 | 插件只在身份完整且一致、签名快照已确认项目自然语言 turn、source ID 为空时回填已验证 ID；General/命令不改字段，已有冲突值不覆盖，不可写时返回固定 route-unavailable；合同 fixture 必须复刻实际 adapter | [`findings.md`](../findings.md)「exact message binding investigation」 |
 | 已映射 ASK 的旧 topic 返回 `Codex bridge request rejected` | 路由和消息身份都正确，但模型从 prompt 复制 515 字符 capability 时改坏了内容；插件在 HCO 之前正确拒绝 | capability 完全留在插件内存；工具 schema 只暴露 `semantic`；安装器同时校验源码 prompt、安装后 SOUL、真实 Gateway prompt 和已注册 schema | [`2026-07-19-hermes-adaptive-topic-dispatch-design.md`](superpowers/specs/2026-07-19-hermes-adaptive-topic-dispatch-design.md) |
 | App Server 丢失旧 thread 后自动替换结果不确定，旧话题永久卡住 | HCO 有人工绑定状态迁移，但生产消息入口不可达；重复绑定也没有区分“确定尚未发送”和“可能已经发送” | 提供 maintainer-only 的精确 `/codex thread bind` 命令；用受信 Zulip message ID 幂等；只恢复 durable pre-send `intent`，外部调用前先写 `submission_unknown`，之后重放绝不再次发送 | [ADR 0003](adr/0003-zulip-channel-topic-ownership.md)「Continuity」 |
+| Gateway 只有一次 `response ready` 和一次发送日志，Zulip 却在一秒内出现两条相同回复 | Zulip Python SDK 默认对消息 POST 的 5xx/连接错误内部重试；首个请求可能已经被服务端接受，第二次 POST 生成重复消息 | 消息专用 client 使用 `retry_on_errors=False`；POST 异常和 5xx 返回 `delivery_uncertain`；Gateway 公共发送层在该状态立即停止，不发送任何二次 fallback | [2026-07-30 at-most-once verification](superpowers/test-artifacts/2026-07-30-hermes-zulip-send-at-most-once-auto/automated-test-result.md) |
 
 这些事故共同说明：**“配置文本正确”或“HTTP 请求被接受”都不是运行成功的证据；只有真实运行路径、持久化状态和最终 Zulip 回读同时成立，才算完成。**
 
@@ -72,6 +77,8 @@ flowchart LR
 
 - 只负责事件检查、精确命令、结构化自然语言入口、bridge envelope 和短的确定性错误。
 - `pre_gateway_dispatch` 必须是本地、同步、无网络、无持久化、无后台任务的前置检查。
+- Zulip 兼容层必须在创建 Hermes session 前执行收件人过滤。零 mention 时只为匹配 `default_addressee` 的当前 bot 合成一次内部 self mention，并在模型看到文本前由上游 adapter 删除；只 mention 其他人时直接忽略，不能让模型判断是否“顺便回复”。原始 event 和消息正文不得被就地修改。
+- 自然语言字段不是路由或 containment 权威；不得维护项目名/cwd 正则黑名单。项目增删或改名只更新 HCO 注册表和 route，不修改插件规则或 prompt。
 - 私有命令必须带短期、单次、带来源绑定的签名 envelope；拒绝直接调用、过期、重放、篡改和跨 stream/topic 使用。
 - 自然语言 capability 必须绑定精确的 `session_key + sourceMessageId + request + Hermes turn`，但只能由插件创建、保存和提交，不能出现在模型 prompt、工具参数、回复或日志中。模型工具调用必须恰好是 `{"semantic": ...}`；多余字段失败关闭。
 - 兼容层只能在签名 snapshot 已确认项目自然语言 turn 后，把已经交叉验证的 `MessageEvent.message_id` 补入空的 `SessionSource.message_id`；General、命令和无效路由保持原样，不能覆盖冲突值或从文本/session 推断 ID。
@@ -84,6 +91,7 @@ flowchart LR
 - HCO 是项目注册、路由 snapshot、topic mode、objective/thread 绑定、App Server 生命周期、journal/reducer、reconciliation、outbox 和诊断的唯一 owner。
 - bridge 只监听 loopback 或 owner-only Unix socket，使用仓库外 bearer 文件；不把 token 放入命令行、plist 或日志。
 - 路由命令建议复用现有合同：`/codex route show|set|none|unset`、`/codex topic show|auto|hermes`。项目频道内的显式 `--project` 只能作为 route 一致性断言，不能越权覆盖 route。
+- 模型目录由 HCO 的只读 `GET /v1/models` 暴露，底层真源是当前 Codex App Server 的 `model/list`。设置 `projects[].threadOptions.model` 和 `projects[].threadOptions.modelReasoningEffort` 前必须查询运行时清单；`result.stale=true` 或 `sourceStatus=unavailable` 只能用于诊断，不能作为生产配置依据。
 - topic mode 至少包含 `AUTO`、`CODEX_BOUND`、`HERMES_ONLY`；进入 `HERMES_ONLY` 不会取消已运行 objective，取消必须显式执行。
 - 已映射 stream 的新旧 topic 都按同一懒创建规则处理：无 topic row 等价于 `AUTO`；首次真实执行可创建 objective/thread，只有 durable thread binding 成功后才写为 `CODEX_BOUND`。模型不能决定这一状态迁移。
 
@@ -98,10 +106,12 @@ flowchart LR
 - 精确缺失时最多创建一个替代 thread；objective 与其全部 `CODEX_BOUND` topic 在同一 SQLite 事务中改绑，原始请求文本和 `clientUserMessageId` 原样复用，并记录 `oldThreadId`、`newThreadId`、`reason=proven_missing_thread`。
 - 替代 `thread/start` 结果不确定时保留旧绑定用于审计，持久化 `manual_thread_binding_required`，绝不再次自动创建。运维人员明确绑定已确认的新 thread 后，才提交一次已保存且确认从未提交的 turn；替代 thread 的 turn 再失败也不递归重建。
 
-#### 人工绑定命令
+#### 人工绑定与 legacy topic scope 恢复
 
-当状态明确为 `manual_thread_binding_required`，并且运维人员已经通过
-Codex/App Server 确认目标 thread ID 后，在该 objective 所属项目的数字
+`THREAD_BIND` 有两个受控用途：恢复 `manual_thread_binding_required` 的 Codex
+thread；或者为升级前创建、尚无不可变 `objective_scopes` 记录的 legacy
+objective 建立一次明确的 topic scope。两种情况都必须先通过 Codex/App
+Server 确认目标 thread ID，并在该 objective 原属项目、原属 topic 的数字
 stream 内发送一条独立消息：
 
 ```text
@@ -113,6 +123,13 @@ stream 内发送一条独立消息：
 - 命令是严格单行、两个无空白 token 的语法；不要附加说明文字。
 - topic 即使是 `HERMES_ONLY` 也允许执行恢复命令，但不会因此修改 topic
   mode 或 General 路由。
+- 对 legacy objective，HCO 必须从历史绑定中得到唯一记录，且 project、数字
+  stream 和完整 topic 精确匹配当前消息。缺失、多条记录、跨 topic、近似名称
+  或字符串推断全部失败关闭；命令不能移动已经具有不可变 scope 的 objective。
+- legacy objective 在完成授权重链前，普通 continuation、status 和 cancel 返回
+  `OBJECTIVE_TOPIC_MIGRATION_REQUIRED`；不能为了保持旧行为而自动认领当前 topic。
+- 重链需要当前项目的 `backend.recover` 权限（maintainer/admin）和当前 Zulip
+  message ID。它同时写入审计 source，普通用户或 Agent 的自然语言不能触发。
 - 回复 action 固定为 `objective.thread.bind`，可见状态只允许 `ready`、
   `started`、`submitting`、`running`、`submission_unknown`、
   `reconciliation_needed`。
@@ -120,9 +137,9 @@ stream 内发送一条独立消息：
   重放可恢复一次；进入 `submission_unknown` 或 reconciliation 后，重放
   只能返回状态，不能再次调用 `turn/start`。
 
-不要把普通的 `Codex bridge request rejected`、超时、断线或近似的
-`thread not loaded` 文本当成人工绑定依据。先确认 objective、原 thread、
-替代 thread 和 durable submission 状态，再执行命令。
+不要把普通的 `Codex bridge request rejected`、超时、断线、近似的
+`thread not loaded` 文本或相似 topic 名称当成人工绑定依据。先确认 objective、
+原 topic、原 thread、替代 thread 和 durable submission 状态，再执行命令。
 
 ### Zulip Delivery
 
@@ -230,7 +247,7 @@ readlink "$HERMES_HOME/plugins/hermes-codex-bridge"
 |---|---|---|
 | 代码与脚本 | `npm run verify`；`node --test test/*.test.js`；`bash -n scripts/install-hermes-codex-bridge.sh`；`git diff --check` | 不发布；先补 RED 回归，再修复并重跑完整门禁 |
 | 安装器合同 | `bash test/install-hermes-codex-bridge.test.sh`；dry-run 输出只包含路径/状态，不创建锁、文件或进程 | 停止安装，保留原配置字节和服务状态 |
-| Hermes 运行时 | 在源码 checkout 的虚拟环境执行 `PYTHONDONTWRITEBYTECODE=1 /Users/hula/Projects/hermesAgent/.venv/bin/python3 -m pytest -q`，或使用仓库规定的 `scripts/run_tests.sh` | 区分解释器/依赖问题与产品失败；不得用另一套 Python 的结果代替 |
+| Hermes 运行时 | 在源码 checkout 的虚拟环境执行 `PYTHONDONTWRITEBYTECODE=1 /Users/hula/Projects/hermesAgent/venv/bin/python3 -m pytest -q`，或使用仓库规定的 `scripts/run_tests.sh` | 区分解释器/依赖问题与产品失败；不得用另一套 Python 的结果代替 |
 | App Server | 在目标 LaunchAgent 的绝对 `PATH`、`HOME`、Node/Codex 路径下完成 initialize、`initialized` drain、可用性和断线重连 canary | HCO 保持 `appServer.available=false`，不接受执行请求 |
 | Gateway 与插件 | 重启后 PID 发生变化；live hook attestation 与 stable release、版本、served profiles、`zulip-ingress` 一致；发现树只有一个 manifest | 保持项目中立 profile，恢复旧 release/状态；不得只看磁盘 symlink |
 | Delivery | delivery sidecar 独立启动；claim/ack/nack、重试、重复窗口和脱敏错误可观测 | HCO 可继续记录 outbox，但 delivery readiness 为 false |

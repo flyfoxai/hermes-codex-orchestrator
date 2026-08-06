@@ -1,0 +1,101 @@
+{
+  "captured_at_utc": "2026-07-29T07:18:27.643180+00:00",
+  "database": "~/.hco/hco.sqlite3 (read-only; absolute path and secrets omitted)",
+  "clarify_message_record_counts": {
+    "message_ids": [
+      688,
+      689,
+      690,
+      691,
+      692,
+      693,
+      694,
+      695,
+      696,
+      697,
+      698,
+      699,
+      700,
+      701
+    ],
+    "work_requests": 0,
+    "codex_calls": 0,
+    "inbound_intents": 0
+  },
+  "work_requests": [
+    {
+      "work_request_id": "work-request-d89b1475-f8b2-4925-ac94-c665348dca4d",
+      "topic_context_id": "topic-context-b1a4006d-019a-46e9-8ea3-9541ed502162",
+      "project_id": "stockprofits",
+      "source_type": "zulip-work-request",
+      "source_id": "702",
+      "original_zulip_message_id": 702,
+      "state": "RUNNING",
+      "status_reason": "caller_review",
+      "created_at_ms": 1785309229670,
+      "updated_at_ms": 1785309295982,
+      "terminal_at_ms": null
+    }
+  ],
+  "codex_calls": [
+    {
+      "codex_call_id": "codex-call-ddc5dfe2-24b6-4a82-b1bc-dcfa31edd7dd",
+      "source_type": "zulip-work-request",
+      "source_id": "call-h2YaxkDDXYlhV0ltXnZ1g4pB",
+      "work_request_id": "work-request-d89b1475-f8b2-4925-ac94-c665348dca4d",
+      "topic_context_id": "topic-context-b1a4006d-019a-46e9-8ea3-9541ed502162",
+      "project_id": "stockprofits",
+      "objective_id": "objective-6b60124d-c1e4-4866-b5d6-d8aa13af7993",
+      "invocation_origin": "JARVIS",
+      "report_target_kind": "JARVIS_MAILBOX",
+      "interaction_target_kind": "JARVIS",
+      "state": "COMPLETED",
+      "created_at_ms": 1785309229670,
+      "updated_at_ms": 1785309295980,
+      "terminal_at_ms": 1785309295980
+    }
+  ],
+  "objectives": [
+    {
+      "objective_id": "objective-6b60124d-c1e4-4866-b5d6-d8aa13af7993",
+      "state": "completed",
+      "created_at_ms": 1785309229673,
+      "updated_at_ms": 1785309295980,
+      "backend": "app-server",
+      "execution_status": "completed",
+      "backend_objective_started": 1,
+      "app_server_thread_id": "019facb8-f272-70f0-ba28-1cf7050d86cc",
+      "execution_updated_at_ms": 1785309295980
+    }
+  ],
+  "turn_submissions": [
+    {
+      "submission_id": "submission-b7832877-60ba-4336-a284-a2d4a20e8c31",
+      "objective_id": "objective-6b60124d-c1e4-4866-b5d6-d8aa13af7993",
+      "turn_id": "019facb8-f3b0-74d0-b443-6f05afe594d8",
+      "submission_state": "completed",
+      "terminal_status": "completed",
+      "cancellation_requested": 0,
+      "reconciliation_required": 0,
+      "created_at_ms": 1785309229998,
+      "updated_at_ms": 1785309295980
+    }
+  ],
+  "coordination_mailbox": [
+    {
+      "mailbox_item_id": "mailbox-item-3a4bbfb2-9935-4d4c-9f97-eb61e3d5c5eb",
+      "target_kind": "JARVIS",
+      "target_id": "topic-context-b1a4006d-019a-46e9-8ea3-9541ed502162",
+      "work_request_id": "work-request-d89b1475-f8b2-4925-ac94-c665348dca4d",
+      "codex_call_id": "codex-call-ddc5dfe2-24b6-4a82-b1bc-dcfa31edd7dd",
+      "item_type": "CODEX_RECEIPT",
+      "state": "LEASED",
+      "attempt_count": 1,
+      "created_at_ms": 1785309295980,
+      "updated_at_ms": 1785309498107,
+      "acknowledged_at_ms": null,
+      "last_error": null
+    }
+  ],
+  "secrets_and_payloads_omitted": true
+}

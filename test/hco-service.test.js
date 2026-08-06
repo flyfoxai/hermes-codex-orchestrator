@@ -8,6 +8,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 
 import { createAcl } from "../hco/acl.js";
+import { validateArtifactManifestShape } from "../hco/artifacts.js";
 import { loadHcoConfig, loadOwnerSecret } from "../hco/config.js";
 import { signContext } from "../hco/contracts/envelope.js";
 import { createRouteResolver, publishRouteSnapshot, validateRouteSnapshot } from "../hco/routes.js";
@@ -31,7 +32,7 @@ function snapshotMutation(bytes, mutate) {
   return Buffer.from(`${JSON.stringify(snapshot)}\n`, "utf8");
 }
 
-test("Task 6 exports its control-plane surface and registers the next contiguous migration", () => {
+test("exports its control-plane surface and registers migrations contiguously", () => {
   assert.equal(typeof loadHcoConfig, "function");
   assert.equal(typeof loadOwnerSecret, "function");
   assert.equal(typeof createAcl, "function");
@@ -39,7 +40,8 @@ test("Task 6 exports its control-plane surface and registers the next contiguous
   assert.equal(typeof publishRouteSnapshot, "function");
   assert.equal(typeof validateRouteSnapshot, "function");
   assert.equal(typeof createHcoService, "function");
-  assert.equal(MIGRATIONS.at(-1).name, "interaction_partial_answers");
+  assert.equal(MIGRATIONS.at(-1).name, "managed_document_access_hardening");
+  assert.equal(MIGRATIONS.at(-2).name, "managed_file_exchange");
   assert.equal(MIGRATIONS.at(-1).version, MIGRATIONS.at(-2).version + 1);
 });
 
@@ -75,7 +77,7 @@ function writeConfig(fixture, overrides = {}) {
       cwd: fixture.project,
       staticStreamIds: [42],
       acl: { viewers: [2], contributors: [3], maintainers: [4] },
-      threadOptions: { model: "gpt-5", baseInstructions: "Use tests." }
+      threadOptions: { model: "gpt-5", modelReasoningEffort: "high", baseInstructions: "Use tests." }
     }],
     ...overrides
   };
@@ -96,7 +98,11 @@ test("loads a deeply immutable project registry and only canonical registered cw
   assert.ok(Object.isFrozen(config.projects[0].acl.viewers));
   source.projects[0].acl.viewers.push(999);
   assert.deepEqual(config.projects[0].acl.viewers, [2]);
-  assert.deepEqual(config.projects[0].threadOptions, { model: "gpt-5", baseInstructions: "Use tests." });
+  assert.deepEqual(config.projects[0].threadOptions, {
+    model: "gpt-5",
+    modelReasoningEffort: "high",
+    baseInstructions: "Use tests."
+  });
 });
 
 test("config and secret loading fail closed on untrusted files and registry ambiguity", () => {
@@ -135,6 +141,14 @@ test("config requires an absolute Codex executable path", () => {
   assert.throws(() => loadHcoConfig({ configPath: fixture.configPath }), { code: "HCO_CONFIG_INVALID" });
 
   writeConfig(fixture, { codexExecutablePath: "bin/codex" });
+  assert.throws(() => loadHcoConfig({ configPath: fixture.configPath }), { code: "HCO_CONFIG_INVALID" });
+});
+
+test("config rejects an empty model reasoning effort", () => {
+  const fixture = configFixture();
+  const source = writeConfig(fixture);
+  source.projects[0].threadOptions.modelReasoningEffort = "";
+  writeFileSync(fixture.configPath, `${JSON.stringify(source)}\n`, { mode: 0o600 });
   assert.throws(() => loadHcoConfig({ configPath: fixture.configPath }), { code: "HCO_CONFIG_INVALID" });
 });
 
@@ -408,9 +422,17 @@ test("trusted execution registration immutably binds project and atomically prom
   });
 });
 
-function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotTtlMs = 60_000 } = {}) {
+function serviceFixture(t, {
+  modelCatalog,
+  modelCatalogTtlMs,
+  projectCwdAlpha = "/canonical/alpha",
+  reconcileResult,
+  snapshotPublisher,
+  turnControllerFactory,
+  snapshotTtlMs = 60_000
+} = {}) {
   const fixture = storeFixture(t);
-  const calls = { accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: [] };
+  const calls = { accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: [], reconcile: [] };
   const config = Object.freeze({
     version: 1,
     databasePath: fixture.databasePath,
@@ -424,10 +446,10 @@ function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotT
     admins: Object.freeze([1]),
     projects: Object.freeze([
       Object.freeze({
-        projectId: "alpha", cwd: "/canonical/alpha", backend: "app-server",
+        projectId: "alpha", cwd: projectCwdAlpha, backend: "app-server",
         staticStreamIds: Object.freeze([42]),
         acl: Object.freeze({ viewers: Object.freeze([2]), contributors: Object.freeze([3]), maintainers: Object.freeze([4]) }),
-        threadOptions: Object.freeze({ model: "gpt-5", baseInstructions: "Use tests." })
+        threadOptions: Object.freeze({ model: "gpt-5", modelReasoningEffort: "high", baseInstructions: "Use tests." })
       }),
       Object.freeze({
         projectId: "beta", cwd: "/canonical/beta", backend: "app-server",
@@ -474,6 +496,15 @@ function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotT
     async handleTurnCompleted(options) {
       calls.completion.push(options);
       return Object.freeze({ status: "completed", objectiveId: options.objectiveId });
+    },
+    async reconcileObjective(options) {
+      calls.reconcile.push(options);
+      const result = typeof reconcileResult === "function"
+        ? reconcileResult(options)
+        : reconcileResult;
+      return Object.freeze(result ?? {
+        status: "running", objectiveId: options.objectiveId, turnId: "turn-active"
+      });
     }
   });
   let objectiveSequence = 0;
@@ -486,7 +517,9 @@ function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotT
     contextKey: key,
     now: () => fixture.clock.value,
     idFactory: (kind) => `${kind}-service-${++objectiveSequence}`,
-    snapshotPublisher: snapshotPublisher ?? (() => Object.freeze({ generation: fixture.store.readControlGeneration().generation }))
+    snapshotPublisher: snapshotPublisher ?? (() => Object.freeze({ generation: fixture.store.readControlGeneration().generation })),
+    ...(modelCatalog === undefined ? {} : { modelCatalog }),
+    ...(modelCatalogTtlMs === undefined ? {} : { modelCatalogTtlMs })
   });
   function event({ kind = "COMMAND", body, streamId = 42, topic = "Build", sourceMessageId, senderId = 1, extra = {} }) {
     const binding = { streamId, topic, sourceMessageId, senderId };
@@ -503,8 +536,121 @@ function serviceFixture(t, { snapshotPublisher, turnControllerFactory, snapshotT
       ...extra
     };
   }
-  return { ...fixture, calls, config, event, service };
+  return { ...fixture, calls, config, event, key, service };
 }
+
+function sampleCatalogModel(overrides = {}) {
+  return {
+    id: "gpt-catalog",
+    model: "gpt-catalog",
+    displayName: "GPT Catalog",
+    hidden: false,
+    supportedReasoningEfforts: ["low", "medium", "high"],
+    defaultReasoningEffort: "medium",
+    inputModalities: ["text"],
+    serviceTiers: ["default"],
+    defaultServiceTier: "default",
+    isDefault: true,
+    ...overrides
+  };
+}
+
+test("model catalog listing is read-only, immutable, cached, and TTL scoped", async (t) => {
+  const sourceCalls = [];
+  const model = sampleCatalogModel();
+  const fixture = serviceFixture(t, {
+    modelCatalogTtlMs: 1_000,
+    modelCatalog: Object.freeze({
+      async listModels(options) {
+        sourceCalls.push(options);
+        return { data: [model], nextCursor: null };
+      }
+    })
+  });
+
+  const first = await fixture.service.listModels({ includeHidden: true, limit: 50 });
+  assert.deepEqual(first, {
+    schemaVersion: 1,
+    status: "ok",
+    action: "models.list",
+    sourceStatus: "ok",
+    cached: false,
+    stale: false,
+    fetchedAt: fixture.clock.value,
+    expiresAt: fixture.clock.value + 1_000,
+    models: [model],
+    nextCursor: null
+  });
+  assert.equal(Object.isFrozen(first), true);
+  assert.equal(Object.isFrozen(first.models), true);
+  assert.equal(Object.isFrozen(first.models[0]), true);
+  assert.deepEqual(sourceCalls, [{ includeHidden: true, limit: 50 }]);
+
+  fixture.clock.value += 999;
+  const second = await fixture.service.listModels({ includeHidden: true, limit: 50 });
+  assert.equal(second.cached, true);
+  assert.equal(second.stale, false);
+  assert.equal(second.fetchedAt, first.fetchedAt);
+  assert.deepEqual(sourceCalls, [{ includeHidden: true, limit: 50 }]);
+
+  fixture.clock.value += 2;
+  const third = await fixture.service.listModels({ includeHidden: true, limit: 50 });
+  assert.equal(third.cached, false);
+  assert.equal(third.fetchedAt, fixture.clock.value);
+  assert.deepEqual(sourceCalls, [
+    { includeHidden: true, limit: 50 },
+    { includeHidden: true, limit: 50 }
+  ]);
+});
+
+test("model catalog returns stale cache on source failure and fails closed without cache", async (t) => {
+  let fail = false;
+  const sourceCalls = [];
+  const fixture = serviceFixture(t, {
+    modelCatalogTtlMs: 1,
+    modelCatalog: Object.freeze({
+      async listModels(options) {
+        sourceCalls.push(options);
+        if (fail) throw new Error("private model catalog outage");
+        return { data: [sampleCatalogModel({ id: "gpt-stale", model: "gpt-stale" })], nextCursor: null };
+      }
+    })
+  });
+
+  const first = await fixture.service.listModels();
+  fixture.clock.value += 2;
+  fail = true;
+  const stale = await fixture.service.listModels();
+  assert.equal(stale.cached, true);
+  assert.equal(stale.stale, true);
+  assert.equal(stale.sourceStatus, "unavailable");
+  assert.equal(stale.fetchedAt, first.fetchedAt);
+  assert.deepEqual(stale.models, first.models);
+  assert.deepEqual(sourceCalls, [{}, {}]);
+
+  const unavailable = serviceFixture(t, {
+    modelCatalog: Object.freeze({
+      async listModels() { throw new Error("private first fetch failure"); }
+    })
+  });
+  await assert.rejects(() => unavailable.service.listModels(), {
+    code: "MODEL_CATALOG_UNAVAILABLE",
+    message: "Codex model catalog is unavailable."
+  });
+});
+
+test("model catalog validates options and rejects calls after service close", async (t) => {
+  const fixture = serviceFixture(t, {
+    modelCatalog: Object.freeze({
+      async listModels() { return { data: [], nextCursor: null }; }
+    })
+  });
+
+  await assert.rejects(() => fixture.service.listModels({ limit: 0 }), { code: "MODEL_LIST_OPTIONS_INVALID" });
+  await assert.rejects(() => fixture.service.listModels({ includeHidden: "yes" }), { code: "MODEL_LIST_OPTIONS_INVALID" });
+  await fixture.service.close();
+  await assert.rejects(() => fixture.service.listModels(), { code: "HCO_SERVICE_CLOSED" });
+});
 
 function registryConfig(databasePath, assignments) {
   const project = (projectId) => Object.freeze({
@@ -833,7 +979,7 @@ test("bridge events validate exact fields, verify signed numeric bindings, and r
   mismatch.binding = { ...mismatch.binding, streamId: 43 };
   await assert.rejects(() => fixture.service.handleBridgeEvent(mismatch), { code: "CONTEXT_BINDING_MISMATCH" });
   assert.deepEqual(fixture.calls, {
-    accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: []
+    accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: [], reconcile: []
   });
 });
 
@@ -890,7 +1036,12 @@ test("exact and semantic dispatch select objectives lazily and build only regist
     sourceType: "zulip-message", sourceId: "120", objectiveId: "objective-service-1",
     projectId: "alpha", backend: "app-server", text: "Implement the parser.",
     targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 120 },
-    threadOptions: { model: "gpt-5", baseInstructions: "Use tests.", cwd: "/canonical/alpha" },
+    threadOptions: {
+      model: "gpt-5",
+      modelReasoningEffort: "high",
+      baseInstructions: "Use tests.",
+      cwd: "/canonical/alpha"
+    },
     topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
   });
 
@@ -898,7 +1049,7 @@ test("exact and semantic dispatch select objectives lazily and build only regist
     kind: "SEMANTIC", sourceMessageId: 121, senderId: 3,
     body: {
       type: "DISPATCH",
-      instruction: "Ship it.",
+      instruction: "Compare with beta at /canonical/beta, then ship it.",
       constraints: ["Keep compatibility."],
       acceptanceCriteria: ["Focused tests pass."],
       reminders: ["Do not retry uncertain writes."],
@@ -909,9 +1060,423 @@ test("exact and semantic dispatch select objectives lazily and build only regist
   assert.equal(semantic.action, "dispatch");
   assert.equal(fixture.calls.accept.length, 2);
   assert.equal(fixture.calls.accept[1].text,
-    "Instruction:\nShip it.\n\nConstraints:\n- Keep compatibility.\n\nAcceptance criteria:\n- Focused tests pass.\n\nReminders:\n- Do not retry uncertain writes.");
+    "Instruction:\nCompare with beta at /canonical/beta, then ship it.\n\nConstraints:\n- Keep compatibility.\n\nAcceptance criteria:\n- Focused tests pass.\n\nReminders:\n- Do not retry uncertain writes.");
+  assert.equal(fixture.calls.accept[1].projectId, "alpha");
   assert.equal(fixture.calls.accept[1].threadOptions.cwd, "/canonical/alpha");
   assert.equal(Object.hasOwn(fixture.calls.accept[1], "role"), false);
+});
+
+test("semantic dispatch stages caller artifacts into a project-local exchange before execution", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-project-"));
+  mkdirSync(path.join(projectDirectory, "docs"));
+  const requestPath = path.join(projectDirectory, "docs", "request.md");
+  const requestText = "# Request\nShip the artifact protocol.\n";
+  writeFileSync(requestPath, requestText);
+  const requestSha256 = createHash("sha256").update(requestText, "utf8").digest("hex");
+  const fixture = serviceFixture(t, { projectCwdAlpha: projectDirectory });
+
+  const result = await fixture.service.handleBridgeEvent(fixture.event({
+    kind: "SEMANTIC", sourceMessageId: 122, senderId: 3,
+    body: {
+      type: "DISPATCH",
+      instruction: "Read the request and write the result.",
+      constraints: [],
+      acceptanceCriteria: ["The result artifact is written."],
+      reminders: [],
+      objective: { mode: "NEW" },
+      topicModeAction: null,
+      artifacts: {
+        input: [{
+          artifactId: "request",
+          path: "docs/request.md",
+          kind: "document",
+          mimeType: "text/markdown",
+          sha256: requestSha256,
+          maxBytes: 1024
+        }],
+        output: [{
+          artifactId: "result",
+          kind: "document",
+          mimeType: "text/markdown",
+          maxBytes: 2048,
+          required: true
+        }]
+      }
+    }
+  }));
+
+  assert.equal(result.action, "dispatch");
+  assert.equal(fixture.calls.accept.length, 1);
+  assert.match(fixture.calls.accept[0].text, /\.hco\/exchanges\/v1\/objective-service-1\/exchange-service-2\/input\/context\.md/u);
+  assert.match(fixture.calls.accept[0].text, /output\/result\.md/u);
+  assert.doesNotMatch(fixture.calls.accept[0].text, /docs\/request\.md|docs\/result\.md/u);
+  assert.equal(fixture.calls.accept[0].artifactMode, "project_local");
+  assert.equal(fixture.calls.accept[0].artifactBaseDir, projectDirectory);
+  assert.deepEqual(fixture.calls.accept[0].artifacts.input.map((entry) => entry.artifactId), [
+    "hco-context",
+    "hco-task-contract"
+  ]);
+  assert.equal(
+    fixture.calls.accept[0].artifacts.output[0].path,
+    ".hco/exchanges/v1/objective-service-1/exchange-service-2/output/result.md"
+  );
+  const exchangeRoot = path.join(
+    projectDirectory,
+    ".hco", "exchanges", "v1", "objective-service-1", "exchange-service-2"
+  );
+  assert.match(readFileSync(path.join(exchangeRoot, "input", "context.md"), "utf8"), /Ship the artifact protocol\./u);
+  assert.doesNotMatch(
+    readFileSync(path.join(exchangeRoot, "input", "task-contract.json"), "utf8"),
+    /docs\/request\.md|docs\/result\.md/u
+  );
+});
+
+test("project-local semantic dispatch crosses the production controller gate without enabling legacy paths", async (t) => {
+  const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-project-local-service-controller-"));
+  const sourceText = "trusted source\n";
+  writeFileSync(path.join(projectDirectory, "source.md"), sourceText);
+  const backendCalls = [];
+  const fixture = serviceFixture(t, {
+    projectCwdAlpha: projectDirectory,
+    turnControllerFactory(store) {
+      const appServerBackend = {
+        async startObjective() { return { threadId: "thread-project-local" }; },
+        async startTurn(options) {
+          backendCalls.push(options);
+          return { turnId: "turn-project-local" };
+        },
+        async interruptTurn() { return { ok: true }; },
+        async readObjective() { return { thread: { id: "thread-project-local", turns: [] } }; },
+        async reconcileObjective() { return { thread: { id: "thread-project-local", turns: [] } }; },
+        async respondToInteraction() {},
+        getCapabilities() {
+          return { backend: "app-server", durableThreadContinuity: true, reverseInteractions: true };
+        }
+      };
+      return new TurnController({ store, appServerBackend, leaseOwner: "project-local-controller" });
+    }
+  });
+
+  const result = await fixture.service.handleBridgeEvent(fixture.event({
+    kind: "SEMANTIC", sourceMessageId: 129, senderId: 3,
+    body: {
+      type: "DISPATCH",
+      instruction: "Read the staged source.",
+      constraints: [],
+      acceptanceCriteria: [],
+      reminders: [],
+      objective: { mode: "NEW" },
+      topicModeAction: null,
+      artifacts: {
+        input: [{
+          artifactId: "source",
+          path: "source.md",
+          kind: "document",
+          mimeType: "text/markdown",
+          maxBytes: 1024,
+          sha256: createHash("sha256").update(sourceText).digest("hex")
+        }],
+        output: []
+      }
+    }
+  }));
+
+  assert.equal(result.status, "accepted");
+  assert.equal(backendCalls.length, 1);
+  assert.match(backendCalls[0].text, /\.hco\/exchanges\/v1\//u);
+  assert.doesNotMatch(backendCalls[0].text, /source\.md/u);
+  assert.equal(fixture.store.readObjectiveExecution(result.objectiveId).executionStatus, "running");
+});
+
+test("trusted Jarvis and Agent dispatches bind fresh call tokens and exact mailbox owners", async (t) => {
+  const fixture = serviceFixture(t);
+  const semantic = {
+    type: "DISPATCH",
+    instruction: "Run the delegated check.",
+    constraints: [],
+    acceptanceCriteria: ["Report evidence."],
+    reminders: [],
+    objective: { mode: "NEW" },
+    topicModeAction: null
+  };
+  const coordinatedEvent = ({ sourceMessageId, caller }) => {
+    const event = fixture.event({
+      kind: "SEMANTIC",
+      sourceMessageId,
+      senderId: 3,
+      body: semantic,
+      extra: { caller }
+    });
+    const seconds = Math.floor(fixture.clock.value / 1000);
+    event.contextToken = signContext({
+      version: 1,
+      purpose: "codex-coordination-dispatch",
+      codexCallId: caller.codexCallId,
+      issuedAt: seconds - 1,
+      expiresAt: seconds + 60,
+      nonce: `coordinated-${sourceMessageId}-${caller.codexCallId}`,
+      binding: event.binding
+    }, fixture.key);
+    return event;
+  };
+
+  const jarvisCaller = {
+    invocationOrigin: "JARVIS",
+    callerPrincipalId: "jarvis:hermes-topic-session",
+    callerHermesSessionId: "hermes-topic-session",
+    codexCallId: "call-jarvis-1",
+    originalRequest: "Run the delegated check."
+  };
+  const jarvis = await fixture.service.handleBridgeEvent(coordinatedEvent({
+    sourceMessageId: 123,
+    caller: jarvisCaller
+  }));
+  assert.equal(jarvis.invocationOrigin, "JARVIS");
+  assert.deepEqual(jarvis.mailboxTarget, {
+    kind: "JARVIS_MAILBOX",
+    id: jarvis.topicContextId
+  });
+  assert.equal(fixture.store.readCodexCall(jarvis.codexCallId).callerPrincipalId,
+    "jarvis:hermes-topic-session");
+  assert.equal(fixture.store.readTopicContext({ streamId: 42, topic: "Build" }).jarvisSessionId,
+    "hermes-topic-session");
+
+  const secondJarvis = await fixture.service.handleBridgeEvent(coordinatedEvent({
+    sourceMessageId: 123,
+    caller: { ...jarvisCaller, codexCallId: "call-jarvis-2" }
+  }));
+  assert.equal(secondJarvis.workRequestId, jarvis.workRequestId);
+  assert.notEqual(secondJarvis.codexCallId, jarvis.codexCallId);
+  assert.notEqual(secondJarvis.objectiveId, jarvis.objectiveId);
+  assert.equal(fixture.store.readWorkStatus(jarvis.workRequestId).codexCalls.length, 2);
+
+  const agentCaller = {
+    invocationOrigin: "AGENT",
+    callerPrincipalId: "agent:hermes-child-1",
+    codexCallId: "call-agent-1",
+    agentHermesSessionId: "hermes-child-1",
+    parentHermesSessionId: "hermes-topic-session",
+    agentRole: "reviewer",
+    agentGoal: "Review the delegated change",
+    newConversation: true,
+    originalRequest: "Run the delegated check."
+  };
+  const agent = await fixture.service.handleBridgeEvent(coordinatedEvent({
+    sourceMessageId: 124,
+    caller: agentCaller
+  }));
+  const agentCall = fixture.store.readCodexCall(agent.codexCallId);
+  assert.equal(agent.invocationOrigin, "AGENT");
+  assert.equal(agent.mailboxTarget.kind, "AGENT_MAILBOX");
+  assert.equal(agent.mailboxTarget.id, agentCall.agentSessionId);
+  assert.equal(agentCall.callerPrincipalId, `agent:${agentCall.agentSessionId}`);
+  assert.equal(fixture.store.readAgentScopeByHermesSession("hermes-child-1").agentSession.role,
+    "reviewer");
+
+  const forgedAgent = coordinatedEvent({
+    sourceMessageId: 126,
+    caller: {
+      ...agentCaller,
+      codexCallId: "call-agent-forged-parent",
+      agentHermesSessionId: "hermes-child-forged",
+      parentHermesSessionId: "unknown-parent-session"
+    }
+  });
+  await assert.rejects(() => fixture.service.handleBridgeEvent(forgedAgent), {
+    code: "AGENT_PARENT_SCOPE_MISMATCH"
+  });
+  assert.equal(fixture.store.readAgentScopeByHermesSession("hermes-child-forged"), null);
+
+  const mismatched = coordinatedEvent({
+    sourceMessageId: 125,
+    caller: { ...jarvisCaller, codexCallId: "call-event-id" }
+  });
+  const seconds = Math.floor(fixture.clock.value / 1000);
+  mismatched.contextToken = signContext({
+    version: 1,
+    purpose: "codex-coordination-dispatch",
+    codexCallId: "call-token-id",
+    issuedAt: seconds - 1,
+    expiresAt: seconds + 60,
+    nonce: "coordinated-mismatch",
+    binding: mismatched.binding
+  }, fixture.key);
+  await assert.rejects(() => fixture.service.handleBridgeEvent(mismatched), {
+    code: "BRIDGE_EVENT_INVALID"
+  });
+});
+
+test("work status reconciles completed, failed, and unverified Codex calls before replying", async (t) => {
+  const cases = [
+    {
+      name: "completed",
+      backendStatus: "completed",
+      callState: "COMPLETED",
+      workState: "RUNNING",
+      nextAction: "jarvis_finalize"
+    },
+    {
+      name: "failed",
+      backendStatus: "terminal_error",
+      callState: "FAILED",
+      workState: "RUNNING",
+      nextAction: "caller_review"
+    },
+    {
+      name: "unverified",
+      backendStatus: "reconciliation_needed",
+      callState: "STATUS_UNVERIFIED",
+      workState: "STATUS_UNVERIFIED",
+      nextAction: "verify_backend"
+    }
+  ];
+
+  for (const [index, scenario] of cases.entries()) {
+    await t.test(scenario.name, async (subtest) => {
+      const fixture = serviceFixture(subtest, {
+        reconcileResult: ({ objectiveId }) => ({
+          status: scenario.backendStatus,
+          objectiveId,
+          turnId: scenario.name === "unverified" ? "turn-mismatched" : "turn-1"
+        })
+      });
+      const sourceMessageId = 700 + index;
+      const caller = {
+        invocationOrigin: "JARVIS",
+        callerPrincipalId: `jarvis:status-${scenario.name}`,
+        callerHermesSessionId: `status-${scenario.name}`,
+        codexCallId: `call-status-${scenario.name}`,
+        originalRequest: `Check ${scenario.name} status.`
+      };
+      const semantic = {
+        type: "DISPATCH",
+        instruction: `Check ${scenario.name} status.`,
+        constraints: [],
+        acceptanceCriteria: [],
+        reminders: [],
+        objective: { mode: "NEW" },
+        topicModeAction: null
+      };
+      const dispatchEvent = fixture.event({
+        kind: "SEMANTIC",
+        sourceMessageId,
+        senderId: 3,
+        body: semantic,
+        extra: { caller }
+      });
+      const seconds = Math.floor(fixture.clock.value / 1000);
+      dispatchEvent.contextToken = signContext({
+        version: 1,
+        purpose: "codex-coordination-dispatch",
+        codexCallId: caller.codexCallId,
+        issuedAt: seconds - 1,
+        expiresAt: seconds + 60,
+        nonce: `status-dispatch-${scenario.name}`,
+        binding: dispatchEvent.binding
+      }, fixture.key);
+      const dispatched = await fixture.service.handleBridgeEvent(dispatchEvent);
+
+      const status = await fixture.service.handleBridgeEvent(fixture.event({
+        sourceMessageId: sourceMessageId + 100,
+        senderId: 3,
+        body: { type: "STATUS", objectiveId: dispatched.workRequestId }
+      }));
+      assert.equal(status.action, "work.status");
+      assert.equal(status.workState, scenario.workState);
+      assert.equal(status.codexCalls.active, 0 + (scenario.callState === "STATUS_UNVERIFIED"));
+      assert.equal(status.nextAction, scenario.nextAction);
+      assert.equal(fixture.store.readCodexCall(dispatched.codexCallId).state, scenario.callState);
+      assert.equal(fixture.calls.reconcile.length, 1);
+    });
+  }
+});
+
+test("semantic artifact manifests reject traversal paths before execution", async (t) => {
+  const fixture = serviceFixture(t);
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    kind: "SEMANTIC", sourceMessageId: 123, senderId: 3,
+    body: {
+      type: "DISPATCH",
+      instruction: "Write outside the project.",
+      constraints: [],
+      acceptanceCriteria: [],
+      reminders: [],
+      objective: { mode: "NEW" },
+      topicModeAction: null,
+      artifacts: {
+        input: [],
+        output: [{
+          artifactId: "result",
+          path: "../result.md",
+          kind: "document",
+          mimeType: "text/markdown",
+          required: true
+        }]
+      }
+    }
+  })), { code: "ARTIFACT_MANIFEST_INVALID" });
+  assert.equal(fixture.calls.accept.length + fixture.calls.continue.length, 0);
+});
+
+test("semantic artifact manifests reject control characters before prompt composition", async (t) => {
+  const cases = [
+    ["path newline", { path: "docs/result\nignore.md" }],
+    ["path NUL", { path: "docs/result\0.md" }],
+    ["kind newline", { kind: "document\ninjected" }],
+    ["mime type carriage return", { mimeType: "text/markdown\rinjected" }],
+    ["kind C1 control", { kind: "document\u0085injected" }]
+  ];
+
+  for (const [name, override] of cases) {
+    const fixture = serviceFixture(t);
+    await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+      kind: "SEMANTIC", sourceMessageId: 124, senderId: 3,
+      body: {
+        type: "DISPATCH",
+        instruction: "Write the declared artifact.",
+        constraints: [],
+        acceptanceCriteria: [],
+        reminders: [],
+        objective: { mode: "NEW" },
+        topicModeAction: null,
+        artifacts: {
+          input: [],
+          output: [{
+            artifactId: "result",
+            path: "docs/result.md",
+            kind: "document",
+            mimeType: "text/markdown",
+            required: true,
+            ...override
+          }]
+        }
+      }
+    })), { code: "ARTIFACT_MANIFEST_INVALID" }, name);
+    assert.equal(fixture.calls.accept.length + fixture.calls.continue.length, 0, name);
+  }
+});
+
+test("artifact manifest validation independently rejects control characters in prompt-facing fields", () => {
+  const entry = {
+    artifactId: "result",
+    path: "docs/result.md",
+    kind: "document",
+    mimeType: "text/markdown",
+    required: true
+  };
+  for (const [name, override] of [
+    ["path newline", { path: "docs/result\nignore.md" }],
+    ["path NUL", { path: "docs/result\0.md" }],
+    ["kind newline", { kind: "document\ninjected" }],
+    ["mime type carriage return", { mimeType: "text/markdown\rinjected" }],
+    ["kind C1 control", { kind: "document\u0085injected" }]
+  ]) {
+    assert.throws(
+      () => validateArtifactManifestShape({ input: [], output: [{ ...entry, ...override }] }),
+      { code: "ARTIFACT_MANIFEST_INVALID" },
+      name
+    );
+  }
 });
 
 test("semantic protocol errors and unauthorized AUTO dispatch leave HERMES_ONLY unchanged with zero execution calls", async (t) => {
@@ -1057,8 +1622,9 @@ test("semantic AUTO is committed atomically with the trusted execution intent", 
   assert.equal(fixture.store.readTopicState({ streamId: 42, topic: "Other" }).mode, "HERMES_ONLY");
 });
 
-test("dispatch continues the bound objective, isolates NEW, and rejects invalid explicit continuations", async (t) => {
+test("dispatch continues the topic objective, isolates NEW, and rejects cross-topic continuations", async (t) => {
   const fixture = serviceFixture(t);
+  let relinkMessageId = 700;
   const seed = (objectiveId, sourceId, topic = "Build", projectId = "alpha", streamId = 42, actorUserId = 3) => {
     fixture.store.registerExecutionIntent({
       sourceType: "seed", sourceId, objectiveId, projectId, backend: "app-server", text: "seed",
@@ -1066,6 +1632,17 @@ test("dispatch continues the bound objective, isolates NEW, and rejects invalid 
       topicBinding: { streamId, topic, actorUserId }
     });
     fixture.store.bindBackendObjective({ objectiveId, backend: "app-server", threadId: `thread-${objectiveId}` });
+    relinkMessageId += 1;
+    fixture.store.relinkLegacyObjectiveTopic({
+      objectiveId,
+      streamId,
+      topic,
+      projectId,
+      requesterUserId: actorUserId,
+      originalZulipMessageId: relinkMessageId,
+      sourceType: "test-objective-topic-relink",
+      sourceId: `relink-${sourceId}`
+    });
   };
   seed("objective-current", "current");
   seed("objective-older", "older", "Other");
@@ -1083,12 +1660,10 @@ test("dispatch continues the bound objective, isolates NEW, and rejects invalid 
   assert.notEqual(fresh.objectiveId, "objective-current");
   assert.equal(fixture.calls.accept.at(-1).objectiveId, fresh.objectiveId);
 
-  const older = await fixture.service.handleBridgeEvent(fixture.event({
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 172, senderId: 3,
     body: { type: "OBJECTIVE_CONTINUE", objectiveId: "objective-older", instruction: "Resume older." }
-  }));
-  assert.equal(older.objectiveId, "objective-older");
-  assert.equal(fixture.calls.continue.at(-1).objectiveId, "objective-older");
+  })), { code: "OBJECTIVE_TOPIC_MISMATCH" });
 
   const callCount = fixture.calls.accept.length + fixture.calls.continue.length;
   await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
@@ -1102,6 +1677,32 @@ test("dispatch continues the bound objective, isolates NEW, and rejects invalid 
   assert.equal(fixture.calls.accept.length + fixture.calls.continue.length, callCount);
 });
 
+test("legacy objective continuation fails closed until an authorized topic relink", async (t) => {
+  const fixture = serviceFixture(t);
+  fixture.store.registerExecutionIntent({
+    sourceType: "seed",
+    sourceId: "legacy-unscoped",
+    objectiveId: "objective-legacy-unscoped",
+    projectId: "alpha",
+    backend: "app-server",
+    text: "seed",
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 1 },
+    topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
+  });
+  fixture.store.bindBackendObjective({
+    objectiveId: "objective-legacy-unscoped",
+    backend: "app-server",
+    threadId: "thread-legacy-unscoped"
+  });
+
+  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 175,
+    senderId: 3,
+    body: { type: "RUN", instruction: "Do not infer a legacy scope." }
+  })), { code: "OBJECTIVE_TOPIC_MIGRATION_REQUIRED" });
+  assert.equal(fixture.calls.accept.length + fixture.calls.continue.length, 0);
+});
+
 test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain available in HERMES_ONLY", async (t) => {
   const fixture = serviceFixture(t);
   fixture.store.registerExecutionIntent({
@@ -1112,6 +1713,16 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
   });
   fixture.store.bindBackendObjective({
     objectiveId: "objective-commands", backend: "app-server", threadId: "thread-commands"
+  });
+  fixture.store.relinkLegacyObjectiveTopic({
+    objectiveId: "objective-commands",
+    streamId: 42,
+    topic: "Build",
+    projectId: "alpha",
+    requesterUserId: 3,
+    originalZulipMessageId: 650,
+    sourceType: "test-objective-topic-relink",
+    sourceId: "relink-objective-commands"
   });
   const prepared = fixture.store.prepareTurnSubmission({
     sourceType: "seed", sourceId: "commands", objectiveId: "objective-commands", text: "running",
@@ -1239,11 +1850,19 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
 
   const status = await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 181, senderId: 2,
-    body: { type: "STATUS", objectiveId: "objective-commands" }
+    body: {
+      type: "STATUS",
+      objectiveId: "objective-commands",
+      supplementalText: "查询当前进度，尤其是是否正在等待输入"
+    }
   }));
   assert.deepEqual(status, {
     schemaVersion: 1, status: "ok", action: "objective.status", projectId: "alpha",
-    objectiveId: "objective-commands", executionStatus: "running", backend: "app-server", threadId: "thread-commands"
+    objectiveId: "objective-commands", executionStatus: "running", backend: "app-server",
+    threadId: "thread-commands", statusVerified: true, verificationStatus: "running"
+  });
+  assert.deepEqual(fixture.calls.reconcile.at(-1), {
+    objectiveId: "objective-commands", sourceId: "zulip-status-181"
   });
 
   await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
@@ -1278,34 +1897,53 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
   })), (error) => error.code === "INTERACTION_DECISION_INVALID" && error.message.includes("acceptForSession"));
   assert.equal(fixture.calls.answer.length, 0);
 
-  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+  const highRiskAccepted = await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 301, senderId: 3,
     body: { type: "APPROVE", replyToken: highRiskApproval.interactionId, choice: "accept" }
-  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
-  assert.equal(fixture.calls.answer.length, 0);
-  await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
+  }));
+  assert.equal(highRiskAccepted.status, "answered");
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
+  const execpolicyAccepted = await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 303, senderId: 3,
     body: { type: "APPROVE", replyToken: execpolicyApproval.interactionId, choice: "accept" }
-  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
-  assert.equal(fixture.calls.answer.length, 0);
+  }));
+  assert.equal(execpolicyAccepted.status, "answered");
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
 
   await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 304, senderId: 3,
     body: { type: "APPROVE", replyToken: objectNetworkApproval.interactionId, choice: "applyNetworkPolicyAmendment" }
-  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
-  assert.equal(fixture.calls.answer.length, 0);
+  })), { code: "INTERACTION_ACTION_EXPLICIT_REQUIRED" });
+  const networkAction = objectNetworkApproval.actions.find((action) => action.actionClass === "network_policy_change");
+  assert.ok(networkAction);
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 305, senderId: 3,
+    body: { type: "INTERACT", replyToken: objectNetworkApproval.interactionId, actionId: networkAction.actionId }
+  }));
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, networkAction.answer);
 
+  const callsBeforeMismatches = fixture.calls.answer.length;
   await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 193, senderId: 3,
     body: { type: "ANSWER", replyToken: approval.interactionId, text: "accept" }
   })), { code: "INTERACTION_COMMAND_MISMATCH" });
-  assert.equal(fixture.calls.answer.length, 0);
+  assert.equal(fixture.calls.answer.length, callsBeforeMismatches);
 
   await assert.rejects(() => fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 194, senderId: 3,
     body: { type: "APPROVE", replyToken: question.interactionId, choice: "accept" }
   })), { code: "INTERACTION_COMMAND_MISMATCH" });
-  assert.equal(fixture.calls.answer.length, 0);
+  assert.equal(fixture.calls.answer.length, callsBeforeMismatches);
+
+  const stagingAction = question.actions.find((action) => action.sourceKey === "staging");
+  assert.ok(stagingAction);
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 307, senderId: 3,
+    body: { type: "INTERACT", replyToken: question.interactionId, actionId: stagingAction.actionId }
+  }));
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, {
+    answers: { q1: { answers: ["staging"] } }
+  });
 
   const approved = await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 185, senderId: 3,
@@ -1322,8 +1960,16 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
       replyToken: approval.interactionId,
       choice: "acceptWithExecpolicyAmendment"
     }
-  })), { code: "INTERACTION_APPROVAL_RESTRICTED" });
+  })), { code: "INTERACTION_ACTION_EXPLICIT_REQUIRED" });
   assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
+  const policyAction = approval.actions.find((action) => action.actionClass === "policy_change");
+  assert.ok(policyAction);
+  await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 306,
+    senderId: 3,
+    body: { type: "INTERACT", replyToken: approval.interactionId, actionId: policyAction.actionId }
+  }));
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, policyAction.answer);
 
   await fixture.service.handleBridgeEvent(fixture.event({
     sourceMessageId: 187, senderId: 3,
@@ -1397,7 +2043,7 @@ test("STATUS, CANCEL, APPROVE, and ANSWER enforce durable authority and remain a
   }));
   assert.equal(partial.status, "partial");
   assert.deepEqual(partial.missingQuestionIds, ["q2"]);
-  assert.equal(fixture.calls.answer.length, 3);
+  assert.equal(fixture.calls.answer.length, callsBeforeInvalidQuestionIds);
   assert.deepEqual(fixture.store.readInteraction(multipleQuestions.interactionId).partialAnswers, {
     q1: { answers: ["staging"] }
   });
@@ -1445,6 +2091,97 @@ test("APPROVE exposes a missing interaction as a user-facing state error", async
       return true;
     }
   );
+});
+
+test("natural approval replies select only one eligible action and never guess across pending interactions", async (t) => {
+  const fixture = serviceFixture(t);
+  fixture.store.registerExecutionIntent({
+    sourceType: "seed", sourceId: "natural", objectiveId: "objective-natural", projectId: "alpha",
+    backend: "app-server", text: "seed",
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 1 },
+    topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
+  });
+  fixture.store.bindBackendObjective({
+    objectiveId: "objective-natural", backend: "app-server", threadId: "thread-natural"
+  });
+  const prepared = fixture.store.prepareTurnSubmission({
+    sourceType: "seed", sourceId: "natural", objectiveId: "objective-natural", text: "running",
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 1 },
+    leaseOwner: "service-test"
+  });
+  fixture.store.acknowledgeTurnSubmission({ submissionId: prepared.submission.submissionId, turnId: "turn-natural" });
+  const createApproval = (wireRequestId) => fixture.store.createInteraction({
+    connectionId: "connection-natural", wireRequestId,
+    method: "item/commandExecution/requestApproval",
+    objectiveId: "objective-natural", threadId: "thread-natural", turnId: "turn-natural",
+    itemId: `item-natural-${wireRequestId}`, approvalId: null,
+    request: { command: "npm test", availableDecisions: ["accept", "cancel"] },
+    allowedResponderIds: [3],
+    targetSnapshot: { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 1 },
+    renderer: ({ interaction }) => ({
+      semanticKey: `interaction:${interaction.interactionId}:prompt`,
+      payload: { content: "Respond.", kind: "interaction_request" }
+    })
+  }).interaction;
+
+  const none = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 401, senderId: 3,
+    body: { type: "NATURAL_INTERACTION_REPLY", normalizedAlias: "ok" }
+  }));
+  assert.deepEqual(none, {
+    schemaVersion: 1, action: "interaction.natural_reply", status: "not_applicable"
+  });
+
+  const first = createApproval(1);
+  const selected = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 402, senderId: 3,
+    body: { type: "NATURAL_INTERACTION_REPLY", normalizedAlias: "可以" }
+  }));
+  assert.equal(selected.status, "answered");
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "accept" });
+  assert.equal(fixture.calls.answer.at(-1).audit.resolutionSource, "natural_alias");
+  assert.equal(fixture.calls.answer.at(-1).interactionId, first.interactionId);
+  assert.deepEqual(
+    {
+      state: fixture.store.readInteraction(first.interactionId).state,
+      answer: fixture.store.readInteraction(first.interactionId).answer,
+      responseDeliveryState: fixture.store.readInteraction(first.interactionId).responseDeliveryState
+    },
+    { state: "answered", answer: { decision: "accept" }, responseDeliveryState: "pending" }
+  );
+  assert.deepEqual(fixture.store.readInteractionSettlementAudit(first.interactionId), {
+    interactionId: first.interactionId,
+    actionId: fixture.store.readInteraction(first.interactionId).actions.find(
+      (action) => action.sourceKey === "accept"
+    ).actionId,
+    actionClass: "one_time_allow",
+    resolutionSource: "natural_alias",
+    sourceType: "zulip-interaction-reply",
+    sourceMessageId: "402",
+    detailSha256: fixture.store.readInteractionDetail(first.interactionId).contentSha256,
+    responderId: 3,
+    settledAt: fixture.clock.value
+  });
+
+  const second = createApproval(2);
+
+  const denied = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 404, senderId: 3,
+    body: { type: "NATURAL_INTERACTION_REPLY", normalizedAlias: "取消" }
+  }));
+  assert.equal(denied.status, "answered");
+  assert.deepEqual(fixture.calls.answer.at(-1).answer, { decision: "cancel" });
+  assert.equal(fixture.store.readInteraction(second.interactionId).state, "answered");
+
+  createApproval(3);
+  createApproval(4);
+  const ambiguous = await fixture.service.handleBridgeEvent(fixture.event({
+    sourceMessageId: 403, senderId: 3,
+    body: { type: "NATURAL_INTERACTION_REPLY", normalizedAlias: "ok" }
+  }));
+  assert.equal(ambiguous.action, "interaction.natural_reply");
+  assert.equal(ambiguous.status, "ambiguous");
+  assert.equal(ambiguous.candidateInteractionIds.length, 2);
 });
 
 test("THREAD_BIND requires the numeric route objective project and maintainer authority in HERMES_ONLY", async (t) => {
@@ -1866,6 +2603,6 @@ test("legacy stream-name routes and Runner task IDs have no HCO authority", (t) 
   assert.equal(fixture.store.readObjectiveProject("runner-task-legacy"), null);
   assert.equal(fixture.store.readObjectiveExecution("runner-task-legacy"), null);
   assert.deepEqual(fixture.calls, {
-    accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: []
+    accept: [], continue: [], bind: [], cancel: [], answer: [], interaction: [], completion: [], reconcile: []
   });
 });

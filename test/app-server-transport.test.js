@@ -156,6 +156,22 @@ async function callAndRespond(harness, call, expected, result = { ok: true }) {
   assert.deepEqual(await pending, result);
 }
 
+function sampleModel(overrides = {}) {
+  return {
+    id: "gpt-test",
+    model: "gpt-test",
+    displayName: "GPT Test",
+    hidden: false,
+    supportedReasoningEfforts: ["low", "medium", "high"],
+    defaultReasoningEffort: "medium",
+    inputModalities: ["text"],
+    serviceTiers: ["default"],
+    defaultServiceTier: "default",
+    isDefault: false,
+    ...overrides
+  };
+}
+
 test("reassembles fragmented frames before dispatch", async () => {
   const { messages, readable } = createHarness();
   readable.write('{"value"');
@@ -344,12 +360,16 @@ test("correlates out-of-order responses by typed ID while forwarding notificatio
   ]);
 
   readable.write('{"id":"1","result":"wrong type"}\n');
-  readable.write('{"id":2,"result":"second result"}\n{"method":"future/event","params":{"ok":true}}\n');
+  readable.write('{"id":2,"result":"second result"}\n{"method":"future/event","params":{"ok":true},"emittedAtMs":1785978000000}\n');
   readable.write('{"id":1,"result":"first result"}\n');
   assert.equal(await second, "second result");
   assert.equal(await first, "first result");
   await immediate();
-  assert.deepEqual(notifications, [{ method: "future/event", params: { ok: true } }]);
+  assert.deepEqual(notifications, [{
+    method: "future/event",
+    params: { ok: true },
+    emittedAtMs: 1785978000000
+  }]);
   assert.equal(diagnostics.some((item) => item.code === "APP_SERVER_RPC_UNKNOWN_RESPONSE"), true);
 });
 
@@ -379,8 +399,9 @@ test("routes RPC error responses and diagnoses malformed or ambiguous messages",
   readable.write('{"id":999,"result":true}\n');
   readable.write('{"id":3,"method":"ambiguous","result":true}\n');
   readable.write('{"id":false,"result":true}\n');
+  readable.write('{"method":"bad/notification","emittedAtMs":"unsafe"}\n');
   await immediate();
-  assert.equal(diagnostics.filter((item) => item.code === "APP_SERVER_RPC_PROTOCOL_INVALID").length >= 3, true);
+  assert.equal(diagnostics.filter((item) => item.code === "APP_SERVER_RPC_PROTOCOL_INVALID").length >= 4, true);
 });
 
 test("preserves lossless int64 semantics for remote errors and callback params", async () => {
@@ -778,6 +799,7 @@ test("maps supported thread and turn methods exactly after initialization", asyn
   await callAndRespond(harness, () => harness.client.startThread({
     cwd: "/tmp/project",
     model: "gpt-test",
+    modelReasoningEffort: "high",
     approvalPolicy: "never",
     sandbox: "workspace-write",
     baseInstructions: "base",
@@ -788,6 +810,7 @@ test("maps supported thread and turn methods exactly after initialization", asyn
     params: {
       cwd: "/tmp/project",
       model: "gpt-test",
+      config: { model_reasoning_effort: "high" },
       approvalPolicy: "never",
       sandbox: "workspace-write",
       baseInstructions: "base",
@@ -825,6 +848,118 @@ test("maps supported thread and turn methods exactly after initialization", asyn
   });
 });
 
+test("maps model list requests and freezes validated model catalog responses", async () => {
+  const harness = createClientHarness();
+  await initializeHarness(harness);
+
+  const first = harness.client.listModels({ includeHidden: true, limit: 100 });
+  await immediate();
+  assert.deepEqual(harness.sent.at(-1), {
+    id: 2,
+    method: "model/list",
+    params: { includeHidden: true, limit: 100 }
+  });
+  const firstPayload = { data: [sampleModel()], nextCursor: "cursor-2" };
+  harness.child.stdout.write(`${JSON.stringify({ id: 2, result: firstPayload })}\n`);
+  const firstResult = await first;
+  assert.deepEqual(firstResult, firstPayload);
+  assert.equal(Object.isFrozen(firstResult), true);
+  assert.equal(Object.isFrozen(firstResult.data), true);
+  assert.equal(Object.isFrozen(firstResult.data[0]), true);
+  assert.equal(Object.isFrozen(firstResult.data[0].supportedReasoningEfforts), true);
+
+  const second = harness.client.listModels({ cursor: "cursor-2" });
+  await immediate();
+  assert.deepEqual(harness.sent.at(-1), {
+    id: 3,
+    method: "model/list",
+    params: { cursor: "cursor-2" }
+  });
+  const secondPayload = { data: [sampleModel({ id: "gpt-next", model: "gpt-next" })], nextCursor: null };
+  harness.child.stdout.write(`${JSON.stringify({ id: 3, result: secondPayload })}\n`);
+  assert.deepEqual(await second, secondPayload);
+});
+
+test("normalizes Codex 0.145 model catalog object metadata", async () => {
+  const harness = createClientHarness();
+  await initializeHarness(harness);
+
+  const pending = harness.client.listModels({ includeHidden: true });
+  await immediate();
+  const request = harness.sent.at(-1);
+  harness.child.stdout.write(`${JSON.stringify({
+    id: request.id,
+    result: {
+      data: [sampleModel({
+        supportedReasoningEfforts: [
+          { reasoningEffort: "low", description: "Fast" },
+          { reasoningEffort: "high", description: "Deep" }
+        ],
+        serviceTiers: [
+          { id: "priority", name: "Fast", description: "Increased usage" }
+        ],
+        defaultServiceTier: null
+      })],
+      nextCursor: null
+    }
+  })}\n`);
+
+  const result = await pending;
+  assert.deepEqual(result.data[0].supportedReasoningEfforts, ["low", "high"]);
+  assert.deepEqual(result.data[0].serviceTiers, ["priority"]);
+  assert.equal(Object.isFrozen(result.data[0].supportedReasoningEfforts), true);
+  assert.equal(Object.isFrozen(result.data[0].serviceTiers), true);
+});
+
+test("rejects invalid model list options without sending a request", async (t) => {
+  const cases = [
+    { includeHidden: "true" },
+    { limit: 0 },
+    { limit: 501 },
+    { limit: 1.5 },
+    { cursor: "" },
+    { cursor: "x".repeat(4097) },
+    { unexpected: true },
+    []
+  ];
+
+  for (const value of cases) {
+    await t.test(JSON.stringify(value).slice(0, 80), async () => {
+      const harness = createClientHarness();
+      await initializeHarness(harness);
+      const sentBefore = harness.sent.length;
+      await assert.rejects(() => harness.client.listModels(value),
+        (error) => error.code === "APP_SERVER_CLIENT_ARGUMENT_INVALID");
+      assert.equal(harness.sent.length, sentBefore);
+    });
+  }
+});
+
+test("rejects invalid model list responses as owned App Server response errors", async (t) => {
+  const cases = [
+    { data: "bad", nextCursor: null },
+    { data: [], nextCursor: 7 },
+    { data: [sampleModel({ id: "" })], nextCursor: null },
+    { data: [sampleModel({ supportedReasoningEfforts: [""] })], nextCursor: null },
+    { data: [sampleModel({ supportedReasoningEfforts: [{ description: "missing effort" }] })], nextCursor: null },
+    { data: [sampleModel({ serviceTiers: [{ name: "missing id" }] })], nextCursor: null },
+    { data: [sampleModel({ defaultReasoningEffort: 1 })], nextCursor: null }
+  ];
+
+  for (const payload of cases) {
+    await t.test(JSON.stringify(payload).slice(0, 80), async () => {
+      const harness = createClientHarness();
+      await initializeHarness(harness);
+      const pending = harness.client.listModels();
+      await immediate();
+      const request = harness.sent.at(-1);
+      assert.equal(request.method, "model/list");
+      harness.child.stdout.write(`${JSON.stringify({ id: request.id, result: payload })}\n`);
+      await assert.rejects(pending, (error) => error.code === "APP_SERVER_CLIENT_RESPONSE_INVALID");
+    });
+  }
+});
+
 test("maps long instruction and text content below the transport byte limit", async () => {
   const harness = createClientHarness();
   await initializeHarness(harness);
@@ -847,6 +982,15 @@ test("maps long instruction and text content below the transport byte limit", as
   assert.equal(Buffer.byteLength(JSON.stringify(turnRequest), "utf8") < DEFAULT_MAX_FRAME_BYTES, true);
   harness.child.stdout.write(`${JSON.stringify({ id: turnRequest.id, result: { turnId: "turn-long" } })}\n`);
   await turn;
+});
+
+test("rejects an empty model reasoning effort without sending a lifecycle request", async () => {
+  const harness = createClientHarness();
+  await initializeHarness(harness);
+  const sentBefore = harness.sent.length;
+  await assert.rejects(() => harness.client.startThread({ modelReasoningEffort: "" }),
+    (error) => error.code === "APP_SERVER_CLIENT_ARGUMENT_INVALID");
+  assert.equal(harness.sent.length, sentBefore);
 });
 
 test("rejects invalid lifecycle inputs and failed initialize is closed without retry", async () => {

@@ -23,15 +23,48 @@ function fixturePaths(prefix = "hco-bridge-") {
 }
 
 function countingStore(overrides = {}) {
-  const calls = { ackOutbox: 0, claimOutbox: 0, ingest: 0, nackOutbox: 0 };
+  const calls = {
+    abandonCoordinationMailboxRecovery: 0,
+    ackCoordinationMailbox: 0,
+    ackOutbox: 0,
+    claimCoordinationMailbox: 0,
+    claimOutbox: 0,
+    ingest: 0,
+    listCoordinationAgentRestartRecovery: 0,
+    listCoordinationMailboxRecovery: 0,
+    nackOutbox: 0,
+    nackCoordinationMailbox: 0,
+    renewCoordinationMailbox: 0,
+    orphanCoordinationAgentRestart: 0,
+    reportHermesAgentStop: 0
+  };
   const store = {};
   for (const method of Object.keys(calls)) {
     store[method] = (...args) => {
       calls[method] += 1;
-      return overrides[method]?.(...args) ?? (method === "claimOutbox" ? [] : { ok: true });
+      return overrides[method]?.(...args) ??
+        (["claimCoordinationMailbox", "claimOutbox"].includes(method) ? [] : { ok: true });
     };
   }
   return { calls, store };
+}
+
+function emptyCalls() {
+  return {
+    abandonCoordinationMailboxRecovery: 0,
+    ackCoordinationMailbox: 0,
+    ackOutbox: 0,
+    claimCoordinationMailbox: 0,
+    claimOutbox: 0,
+    ingest: 0,
+    listCoordinationAgentRestartRecovery: 0,
+    listCoordinationMailboxRecovery: 0,
+    nackOutbox: 0,
+    nackCoordinationMailbox: 0,
+    renewCoordinationMailbox: 0,
+    orphanCoordinationAgentRestart: 0,
+    reportHermesAgentStop: 0
+  };
 }
 
 function deferred() {
@@ -47,7 +80,8 @@ async function startTcp(t, store, options = {}) {
     tokenPath: paths.tokenPath,
     hcoVersion: "0.1.0-test",
     ...(options.healthProvider ? { healthProvider: options.healthProvider } : {}),
-    ...(options.eventHandler ? { eventHandler: options.eventHandler } : {})
+    ...(options.eventHandler ? { eventHandler: options.eventHandler } : {}),
+    ...(options.modelProvider ? { modelProvider: options.modelProvider } : {})
   });
   const running = await bridge.start({ host: options.host ?? "127.0.0.1", port: 0 });
   t.after(() => running.close());
@@ -75,7 +109,7 @@ test("health is authenticated, bounded, and does not touch durable state", async
     status: 200,
     body: { status: "ok", appServer: { available: true } }
   });
-  assert.deepEqual(calls, { ackOutbox: 0, claimOutbox: 0, ingest: 0, nackOutbox: 0 });
+  assert.deepEqual(calls, emptyCalls());
 });
 
 test("health provider failures return a stable error without leaking details", async (t) => {
@@ -90,6 +124,71 @@ test("health provider failures return a stable error without leaking details", a
     error: { code: "BRIDGE_INTERNAL", message: "Bridge request failed." }
   });
   assert.equal(JSON.stringify(result).includes("private-health-secret"), false);
+});
+
+test("models endpoint is authenticated, read-only, bounded, and delegates query options", async (t) => {
+  const { calls, store } = countingStore();
+  const seen = [];
+  const catalog = Object.freeze({
+    schemaVersion: 1,
+    status: "ok",
+    action: "models.list",
+    sourceStatus: "ok",
+    cached: false,
+    stale: false,
+    fetchedAt: 1_700_000_000_000,
+    expiresAt: 1_700_000_300_000,
+    models: [Object.freeze({
+      id: "gpt-test",
+      model: "gpt-test",
+      displayName: "GPT Test",
+      hidden: false,
+      supportedReasoningEfforts: ["low", "high"],
+      defaultReasoningEffort: "low"
+    })],
+    nextCursor: null
+  });
+  const { url } = await startTcp(t, store, {
+    modelProvider(options) {
+      seen.push(options);
+      return catalog;
+    }
+  });
+
+  const unauthorized = await fetch(`${url}/v1/models`);
+  assert.equal(unauthorized.status, 401);
+
+  assert.deepEqual(await jsonRequest(url, "/v1/models?includeHidden=true&limit=50&cursor=opaque", {
+    method: "GET"
+  }), {
+    status: 200,
+    body: { result: catalog }
+  });
+  assert.deepEqual(seen, [{ includeHidden: true, limit: 50, cursor: "opaque" }]);
+  assert.deepEqual(calls, emptyCalls());
+
+  const invalid = await jsonRequest(url, "/v1/models?limit=0", { method: "GET" });
+  assert.equal(invalid.status, 400);
+  assert.equal(invalid.body.error.code, "BRIDGE_PATH_INVALID");
+  assert.deepEqual(seen, [{ includeHidden: true, limit: 50, cursor: "opaque" }]);
+});
+
+test("models endpoint returns a stable unavailable response without leaking provider details", async (t) => {
+  const { store } = countingStore();
+  const { url } = await startTcp(t, store, {
+    modelProvider() {
+      const error = new Error("private model provider outage");
+      error.code = "MODEL_CATALOG_UNAVAILABLE";
+      throw error;
+    }
+  });
+
+  const result = await jsonRequest(url, "/v1/models", { method: "GET" });
+  assert.equal(result.status, 503);
+  assert.deepEqual(result.body, {
+    error: { code: "MODEL_CATALOG_UNAVAILABLE", message: "Codex model catalog is unavailable." }
+  });
+  assert.equal(JSON.stringify(result).includes("private model provider outage"), false);
 });
 
 test("plain ACL_FORBIDDEN errors are not trusted or exposed", async (t) => {
@@ -137,6 +236,47 @@ test("trusted objective project mismatch is user-visible while plain errors rema
   assert.equal(untrusted.status, 500);
   assert.equal(untrusted.body.error.code, "BRIDGE_INTERNAL");
   assert.equal(JSON.stringify(untrusted).includes("private-project-secret"), false);
+});
+
+test("trusted work request topic mismatch is exposed as a conflict", async (t) => {
+  const { store } = countingStore();
+  const { url } = await startTcp(t, store, {
+    eventHandler() {
+      throw stateError("WORK_REQUEST_TOPIC_MISMATCH", "Work request belongs to another topic context.");
+    }
+  });
+
+  const result = await jsonRequest(url, "/v1/events", { body: { ...META, event: {} } });
+  assert.equal(result.status, 409);
+  assert.deepEqual(result.body, {
+    error: {
+      code: "WORK_REQUEST_TOPIC_MISMATCH",
+      message: "Work request belongs to another topic context."
+    }
+  });
+});
+
+test("project-local exchange failures remain stable and user-visible", async (t) => {
+  for (const scenario of [
+    {
+      code: "PROJECT_LOCAL_EXCHANGE_UNAVAILABLE",
+      message: "Project-local exchange directory cannot be created.",
+      status: 409
+    },
+    {
+      code: "PROJECT_LOCAL_INPUT_INVALID",
+      message: "Project-local input must be valid UTF-8.",
+      status: 400
+    }
+  ]) {
+    const { store } = countingStore();
+    const { url } = await startTcp(t, store, {
+      eventHandler() { throw stateError(scenario.code, scenario.message); }
+    });
+    const result = await jsonRequest(url, "/v1/events", { body: { ...META, event: {} } });
+    assert.equal(result.status, scenario.status);
+    assert.deepEqual(result.body, { error: { code: scenario.code, message: scenario.message } });
+  }
 });
 
 async function jsonRequest(url, route, { body, headers = {}, method = "POST" } = {}) {
@@ -204,9 +344,27 @@ test("authenticates every route and compatibility is negotiated without store ca
   assert.equal(result.status, 200);
   assert.deepEqual(result.body, {
     compatibility: { protocolVersion: 1, peerPluginVersion: "test-plugin", capabilities: [] },
-    hco: { version: "0.1.0-test" }
+    serverCapabilities: [
+      "interaction_exchange_v2",
+      "zulip_zform_v1",
+      "natural_interaction_reply_v1",
+      "coordination_mailbox_v1",
+      "coordination_recovery_v1",
+      "agent_restart_recovery_v1",
+      "agent_reports_v1",
+      "project_local_exchange_v1"
+    ],
+    hco: {
+      version: "0.1.0-test",
+      projectLocalExchange: {
+        profile: "project_local/v1",
+        supported: true,
+        maximumBytesPerExchange: 67_108_864,
+        maximumFilesPerExchange: 8
+      }
+    }
   });
-  assert.deepEqual(calls, { ackOutbox: 0, claimOutbox: 0, ingest: 0, nackOutbox: 0 });
+  assert.deepEqual(calls, emptyCalls());
 });
 
 test("unsupported POST protocol versions are rejected before metadata, payload, or store use", async (t) => {
@@ -219,7 +377,7 @@ test("unsupported POST protocol versions are rejected before metadata, payload, 
   assert.deepEqual(response.body, {
     error: { code: "BRIDGE_VERSION_UNSUPPORTED", message: "Bridge protocol major version is unsupported." }
   });
-  assert.deepEqual(calls, { ackOutbox: 0, claimOutbox: 0, ingest: 0, nackOutbox: 0 });
+  assert.deepEqual(calls, emptyCalls());
 });
 
 test("maps endpoint payloads exactly and rejects unexpected fields and typed store input", async (t) => {
@@ -228,7 +386,61 @@ test("maps endpoint payloads exactly and rejects unexpected fields and typed sto
     ingest(value) { seen.push(["ingest", value]); return { duplicate: false }; },
     claimOutbox(value) { seen.push(["claim", value]); return [{ deliveryId: "d-1" }]; },
     ackOutbox(value) { seen.push(["ack", value]); return { state: "delivered" }; },
-    nackOutbox(value) { seen.push(["nack", value]); return { state: "pending" }; }
+    nackOutbox(value) { seen.push(["nack", value]); return { state: "pending" }; },
+    claimCoordinationMailbox(value) {
+      seen.push(["mailbox-claim", value]);
+      return [{ mailboxItemId: "mail-1", leaseToken: "mail-lease" }];
+    },
+    ackCoordinationMailbox(value) {
+      seen.push(["mailbox-ack", value]);
+      return { duplicate: false, mailboxItem: {}, workRequest: {} };
+    },
+    renewCoordinationMailbox(value) {
+      seen.push(["mailbox-renew", value]);
+      return { mailboxItem: { mailboxItemId: value.mailboxItemId } };
+    },
+    nackCoordinationMailbox(value) {
+      seen.push(["mailbox-nack", value]);
+      return {
+        mailboxItem: { mailboxItemId: value.mailboxItemId, state: "PENDING" },
+        workRequest: {},
+        retryable: true
+      };
+    },
+    listCoordinationMailboxRecovery(value) {
+      seen.push(["mailbox-recovery", value]);
+      return [{ mailboxItem: { mailboxItemId: "recover-1" } }];
+    },
+    abandonCoordinationMailboxRecovery(value) {
+      seen.push(["mailbox-abandon", value]);
+      return { duplicate: false, mailboxItem: { state: "DEAD" }, workRequest: { state: "DEGRADED_PENDING_OPERATOR" } };
+    },
+    listCoordinationAgentRestartRecovery(value) {
+      seen.push(["agent-recovery", value]);
+      return [{ agentSessionId: "agent-1" }];
+    },
+    orphanCoordinationAgentRestart(value) {
+      seen.push(["agent-orphan", value]);
+      return {
+        duplicate: false,
+        agentSession: { state: "FAILED_ORPHANED" },
+        workRequest: { state: "RUNNING" },
+        mailboxItem: { itemType: "ORPHAN_RECOVERY_NOTICE", state: "PENDING" }
+      };
+    },
+    reportHermesAgentStop(value) {
+      seen.push(["agent-report", value]);
+      return {
+        duplicate: false,
+        disposition: "REPORTED",
+        reportId: "report-1",
+        agentSessionId: "agent-1",
+        agentActivationId: "activation-1",
+        activeCodexCalls: 0,
+        mailboxItemId: "mail-report-1",
+        mailboxTarget: { kind: "JARVIS", id: "topic-1" }
+      };
+    }
   });
   const { url } = await startTcp(t, store);
 
@@ -243,16 +455,202 @@ test("maps endpoint payloads exactly and rejects unexpected fields and typed sto
   assert.deepEqual((await jsonRequest(url, "/v1/outbox/d%202/nack", {
     body: { ...META, leaseToken: "lease-2", error: "temporary", retryable: true }
   })).body, { result: { state: "pending" } });
+  assert.deepEqual((await jsonRequest(url, "/v1/mailbox/claim", {
+    body: {
+      ...META,
+      targetKind: "JARVIS",
+      targetId: "topic-1",
+      codexCallId: "call-1",
+      mailboxItemId: null,
+      workerId: "waiter-1",
+      limit: 1,
+      leaseMs: 60_000
+    }
+  })).body, { result: { items: [{ mailboxItemId: "mail-1", leaseToken: "mail-lease" }] } });
+  assert.deepEqual((await jsonRequest(url, "/v1/mailbox/mail%2F1/ack", {
+    body: { ...META, leaseToken: "mail-lease", finalDelivery: true }
+  })).body, { result: { duplicate: false, mailboxItem: {}, workRequest: {} } });
+  assert.deepEqual((await jsonRequest(url, "/v1/mailbox/mail%2F1/renew", {
+    body: { ...META, leaseToken: "mail-lease", leaseMs: 60_000 }
+  })).body, { result: { mailboxItem: { mailboxItemId: "mail/1" } } });
+  assert.deepEqual((await jsonRequest(url, "/v1/mailbox/mail%2F1/nack", {
+    body: { ...META, leaseToken: "mail-lease", error: "resume failed", retryable: true }
+  })).body, {
+    result: {
+      mailboxItem: { mailboxItemId: "mail/1", state: "PENDING" },
+      workRequest: {},
+      retryable: true
+    }
+  });
+  assert.deepEqual((await jsonRequest(url, "/v1/mailbox/recovery", {
+    body: { ...META, workerId: "recovery-1", limit: 10 }
+  })).body, { result: { items: [{ mailboxItem: { mailboxItemId: "recover-1" } }] } });
+  assert.deepEqual((await jsonRequest(url, "/v1/mailbox/mail%2F1/abandon", {
+    body: {
+      ...META,
+      expectedState: "LEASED",
+      expectedAttemptCount: 1,
+      reason: "recovery_outcome_unverified"
+    }
+  })).body, {
+    result: {
+      duplicate: false,
+      mailboxItem: { state: "DEAD" },
+      workRequest: { state: "DEGRADED_PENDING_OPERATOR" }
+    }
+  });
+  assert.deepEqual((await jsonRequest(url, "/v1/agents/recovery", {
+    body: { ...META, startedBefore: 1_700_000_001_000, limit: 10 }
+  })).body, { result: { items: [{ agentSessionId: "agent-1" }] } });
+  assert.deepEqual((await jsonRequest(url, "/v1/agents/agent%2F1/orphan", {
+    body: {
+      ...META,
+      agentActivationId: "activation-1",
+      expectedState: "RUNNING",
+      startedBefore: 1_700_000_001_000,
+      reason: "hermes_restart_outcome_unverified"
+    }
+  })).body, {
+    result: {
+      duplicate: false,
+      agentSession: { state: "FAILED_ORPHANED" },
+      workRequest: { state: "RUNNING" },
+      mailboxItem: { itemType: "ORPHAN_RECOVERY_NOTICE", state: "PENDING" }
+    }
+  });
+  assert.deepEqual((await jsonRequest(url, "/v1/agents/report", {
+    body: {
+      ...META,
+      sourceId: "hermes-stop-1",
+      childHermesSessionId: "child-session-1",
+      parentHermesSessionId: "parent-session-1",
+      childStatus: "completed",
+      summary: "verified",
+      durationMs: 1250
+    }
+  })).body, {
+    result: {
+      duplicate: false,
+      disposition: "REPORTED",
+      reportId: "report-1",
+      agentSessionId: "agent-1",
+      agentActivationId: "activation-1",
+      activeCodexCalls: 0,
+      mailboxItemId: "mail-report-1",
+      mailboxTarget: { kind: "JARVIS", id: "topic-1" }
+    }
+  });
   assert.deepEqual(seen, [
     ["ingest", { exact: true }],
     ["claim", { workerId: "worker", limit: 2, leaseMs: 1000 }],
     ["ack", { deliveryId: "d/1", leaseToken: "lease", zulipMessageId: 12 }],
-    ["nack", { deliveryId: "d 2", leaseToken: "lease-2", error: "temporary", retryable: true }]
+    ["nack", { deliveryId: "d 2", leaseToken: "lease-2", error: "temporary", retryable: true }],
+    ["mailbox-claim", {
+      targetKind: "JARVIS",
+      targetId: "topic-1",
+      codexCallId: "call-1",
+      mailboxItemId: null,
+      workerId: "waiter-1",
+      limit: 1,
+      leaseMs: 60_000
+    }],
+    ["mailbox-ack", {
+      mailboxItemId: "mail/1",
+      leaseToken: "mail-lease",
+      finalDelivery: true
+    }],
+    ["mailbox-renew", {
+      mailboxItemId: "mail/1",
+      leaseToken: "mail-lease",
+      leaseMs: 60_000
+    }],
+    ["mailbox-nack", {
+      mailboxItemId: "mail/1",
+      leaseToken: "mail-lease",
+      error: "resume failed",
+      retryable: true
+    }],
+    ["mailbox-recovery", { workerId: "recovery-1", limit: 10 }],
+    ["mailbox-abandon", {
+      mailboxItemId: "mail/1",
+      expectedState: "LEASED",
+      expectedAttemptCount: 1,
+      reason: "recovery_outcome_unverified"
+    }],
+    ["agent-recovery", { startedBefore: 1_700_000_001_000, limit: 10 }],
+    ["agent-orphan", {
+      agentSessionId: "agent/1",
+      agentActivationId: "activation-1",
+      expectedState: "RUNNING",
+      startedBefore: 1_700_000_001_000,
+      reason: "hermes_restart_outcome_unverified"
+    }],
+    ["agent-report", {
+      sourceId: "hermes-stop-1",
+      childHermesSessionId: "child-session-1",
+      parentHermesSessionId: "parent-session-1",
+      childStatus: "completed",
+      summary: "verified",
+      durationMs: 1250
+    }]
   ]);
 
   const unexpected = await jsonRequest(url, "/v1/events", { body: { ...META, event: {}, surprise: true } });
   assert.equal(unexpected.status, 400);
   assert.equal(unexpected.body.error.code, "BRIDGE_FIELDS_INVALID");
+});
+
+test("agent restart recovery maps owned validation and concurrency errors", async (t) => {
+  for (const scenario of [
+    { code: "AGENT_RECOVERY_INVALID", status: 400, endpoint: "/v1/agents/recovery" },
+    { code: "AGENT_RECOVERY_CONFLICT", status: 409, endpoint: "/v1/agents/agent-1/orphan" }
+  ]) {
+    const { store } = countingStore({
+      listCoordinationAgentRestartRecovery() {
+        throw stateError(scenario.code, "Owned Agent recovery failure.");
+      },
+      orphanCoordinationAgentRestart() {
+        throw stateError(scenario.code, "Owned Agent recovery failure.");
+      }
+    });
+    const { url } = await startTcp(t, store);
+    const body = scenario.endpoint.endsWith("/recovery")
+      ? { ...META, startedBefore: START_MS + 1, limit: 10 }
+      : {
+          ...META,
+          agentActivationId: "activation-1",
+          expectedState: "RUNNING",
+          startedBefore: START_MS + 1,
+          reason: "hermes_restart_outcome_unverified"
+        };
+    const response = await jsonRequest(url, scenario.endpoint, { body });
+    assert.equal(response.status, scenario.status);
+    assert.deepEqual(response.body, {
+      error: { code: scenario.code, message: "Owned Agent recovery failure." }
+    });
+  }
+});
+
+test("legacy topic scope failures are exposed as owned conflicts", async (t) => {
+  for (const code of [
+    "OBJECTIVE_TOPIC_MISMATCH",
+    "OBJECTIVE_TOPIC_MIGRATION_REQUIRED",
+    "OBJECTIVE_TOPIC_RELINK_UNPROVEN"
+  ]) {
+    const { store } = countingStore();
+    const { url } = await startTcp(t, store, {
+      eventHandler() {
+        throw stateError(code, "Objective topic scope requires explicit recovery.");
+      }
+    });
+    const response = await jsonRequest(url, "/v1/events", {
+      body: { ...META, event: { kind: "scope-test" } }
+    });
+    assert.equal(response.status, 409);
+    assert.deepEqual(response.body, {
+      error: { code, message: "Objective topic scope requires explicit recovery." }
+    });
+  }
 });
 
 test("awaits an injected async event handler while outbox methods remain on the store", async (t) => {
@@ -261,7 +659,14 @@ test("awaits an injected async event handler while outbox methods remain on the 
   const store = {
     claimOutbox() { return []; },
     ackOutbox() { return { state: "delivered" }; },
-    nackOutbox() { return { state: "pending" }; }
+    nackOutbox() { return { state: "pending" }; },
+    claimCoordinationMailbox() { return []; },
+    ackCoordinationMailbox() { return { duplicate: false }; },
+    renewCoordinationMailbox() { return { mailboxItem: {} }; },
+    nackCoordinationMailbox() { return { mailboxItem: {}, workRequest: {}, retryable: true }; },
+    listCoordinationMailboxRecovery() { return []; },
+    abandonCoordinationMailboxRecovery() { return { duplicate: false, mailboxItem: {}, workRequest: {} }; },
+    reportHermesAgentStop() { return { disposition: "UNTRACKED" }; }
   };
   const bridge = createBridge({
     store,

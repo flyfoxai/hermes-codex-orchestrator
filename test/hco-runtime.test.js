@@ -71,10 +71,12 @@ function harness(overrides = {}) {
   const config = overrides.config ?? runtimeConfig();
   const store = {
     close() { calls.push("store:close"); },
+    listRecoverableCodexCalls() { calls.push("store:list-recoverable-calls"); return []; },
     ...(overrides.store ?? {})
   };
   const client = {
     async initialize() { calls.push("client:initialize"); return { userAgent: "fake" }; },
+    async listModels(options) { calls.push(["client:models", options]); return { data: [], nextCursor: null }; },
     close() { calls.push("client:close"); },
     ...(overrides.client ?? {})
   };
@@ -99,6 +101,7 @@ function harness(overrides = {}) {
     async handleBridgeEvent(event) { calls.push(["service:event", event]); return { accepted: true }; },
     async handleAppServerRequest(input) { serviceRequests.push(input); },
     async handleAppServerNotification(input) { serviceNotifications.push(input); },
+    async listModels(options) { calls.push(["service:models", options]); return { schemaVersion: 1, models: [] }; },
     async start() { calls.push("service:start"); },
     close() { calls.push("service:close"); return Promise.resolve(); },
     ...(overrides.service ?? {})
@@ -221,13 +224,53 @@ test("starts an injectable frozen runtime after one config and two secret loads"
   ]);
   assert.ok(fixture.calls.indexOf("service:start") < fixture.calls.findIndex((call) => Array.isArray(call) && call[0] === "bridge:start"));
   assert.ok(fixture.calls.findIndex((call) => Array.isArray(call) && call[0] === "bridge:start") < fixture.calls.indexOf("client:initialize"));
+  assert.ok(fixture.calls.indexOf("client:initialize") < fixture.calls.indexOf("store:list-recoverable-calls"));
   assert.equal(fixture.serviceOptions.contextKey.equals(Buffer.alloc(32, 7)), true);
   assert.equal(fixture.clientOptions.executablePath, "/runtime/bin/codex");
   assert.equal(fixture.bridgeOptions.store, fixture.store);
   assert.equal(fixture.bridgeOptions.authenticator.authenticate("Bearer runtime-bridge-token"), true);
+  assert.deepEqual(await fixture.serviceOptions.modelCatalog.listModels({ includeHidden: true }), {
+    data: [],
+    nextCursor: null
+  });
+  assert.deepEqual(await fixture.bridgeOptions.modelProvider({ limit: 1 }), { schemaVersion: 1, models: [] });
   assert.deepEqual(await fixture.bridgeOptions.eventHandler({ event: 1 }), { accepted: true });
   assert.deepEqual(fixture.calls.at(-1), ["service:event", { event: 1 }]);
 
+  await runtime.close();
+});
+
+test("reconciles active Codex calls after App Server initialization without submitting work", async () => {
+  const recovered = {
+    codexCallId: "call-restart-1",
+    objectiveId: "objective-restart-1",
+    turnId: "turn-restart-1",
+    state: "RUNNING"
+  };
+  const recorded = [];
+  const fixture = harness({
+    store: {
+      listRecoverableCodexCalls() { return [recovered]; },
+      readCodexCall() { return recovered; },
+      readCallForTurn() { return recovered; },
+      recordCodexCallSubmission(input) {
+        recorded.push(input);
+        recovered.state = input.status === "accepted" ? "RUNNING" : "STATUS_UNVERIFIED";
+      }
+    },
+    controller: {
+      async reconcileObjective(input) {
+        assert.equal(input.objectiveId, recovered.objectiveId);
+        assert.match(input.sourceId, /^connection-recovery:connection-1:/u);
+        return { status: "running", objectiveId: recovered.objectiveId, turnId: recovered.turnId };
+      }
+    }
+  });
+
+  const runtime = await createHcoRuntime(fixture.dependencies);
+  assert.equal(recorded.length, 1);
+  assert.equal(recorded[0].status, "accepted");
+  assert.equal(fixture.backendCalls.some(([method]) => method === "startObjective" || method === "startTurn"), false);
   await runtime.close();
 });
 

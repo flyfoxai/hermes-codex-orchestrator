@@ -1,4 +1,5 @@
 import { executionBackendError, validateExecutionBackend } from "./backend.js";
+import { UNSUPPORTED_FILE_EXCHANGE_CAPABILITY } from "../file-exchange/contracts.js";
 
 const PREWRITE_CODES = new Set([
   "APP_SERVER_CLIENT_ARGUMENT_INVALID",
@@ -88,7 +89,8 @@ export function createAppServerBackend({ client } = {}) {
       return Object.freeze({
         backend: "app-server",
         durableThreadContinuity: true,
-        reverseInteractions: true
+        reverseInteractions: true,
+        fileExchange: UNSUPPORTED_FILE_EXCHANGE_CAPABILITY
       });
     }
   }));

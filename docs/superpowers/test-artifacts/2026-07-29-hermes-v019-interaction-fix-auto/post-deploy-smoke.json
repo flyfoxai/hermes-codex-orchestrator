@@ -1,0 +1,71 @@
+{
+  "checks": [
+    {
+      "code": "MANIFEST_COMMITTED",
+      "detail": "deployment manifest is committed",
+      "status": "PASS"
+    },
+    {
+      "code": "MANIFEST_MODE",
+      "detail": "deployment manifest mode is 0600",
+      "status": "PASS"
+    },
+    {
+      "code": "STABLE_SYMLINK",
+      "detail": "stable plugin path is a symlink",
+      "status": "PASS"
+    },
+    {
+      "code": "STABLE_TARGET",
+      "detail": "stable symlink targets the committed release",
+      "status": "PASS"
+    },
+    {
+      "code": "STABLE_MANIFEST",
+      "detail": "stable symlink target matches deployment manifest",
+      "status": "PASS"
+    },
+    {
+      "code": "RELEASE_MANIFEST",
+      "detail": "release content matches deployment manifest",
+      "status": "PASS"
+    },
+    {
+      "code": "SOURCE_RELEASE_MATCH",
+      "detail": "source and release manifests match",
+      "status": "PASS"
+    },
+    {
+      "code": "ATTESTATION_MATCH",
+      "detail": "live attestation matches deployment manifest",
+      "status": "PASS"
+    },
+    {
+      "code": "GATEWAY_PID",
+      "detail": "attested gateway PID is alive",
+      "status": "PASS"
+    },
+    {
+      "code": "SERVICE_COMMIT",
+      "detail": "deployment committed all service states as running; only gateway PID is checked live",
+      "status": "PASS"
+    },
+    {
+      "code": "ROUTE_SEMANTIC",
+      "detail": "live route generation and semantic hash match deployment manifest",
+      "status": "PASS"
+    },
+    {
+      "code": "ROUTE_INTEGRITY",
+      "detail": "route snapshot integrity and freshness are valid",
+      "status": "PASS"
+    }
+  ],
+  "generatedAtMs": 1785298525520,
+  "mode": "DRY_RUN",
+  "routePreconditions": {},
+  "schemaVersion": 1,
+  "sideEffects": "none except explicitly requested report files",
+  "status": "PASS",
+  "trace": null
+}

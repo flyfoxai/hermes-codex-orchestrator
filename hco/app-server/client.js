@@ -22,15 +22,19 @@ const DIAGNOSTIC_MESSAGES = Object.freeze({
 });
 
 const MAX_METADATA_LENGTH = 4096;
+const MAX_MODEL_LIST_LIMIT = 500;
+const MAX_MODEL_LIST_LENGTH = 1000;
 const MAX_STDERR_BYTES = 16 * 1024;
 const MAX_STDERR_EVENTS = 32;
 const DEFAULT_INITIALIZE_TIMEOUT_MS = 30_000;
+const MODEL_LIST_OPTION_KEYS = new Set(["cursor", "limit", "includeHidden"]);
 const THREAD_OPTION_KEYS = new Set([
   "approvalPolicy",
   "baseInstructions",
   "cwd",
   "developerInstructions",
   "model",
+  "modelReasoningEffort",
   "sandbox"
 ]);
 
@@ -56,6 +60,31 @@ function validBoundedString(value, { allowEmpty = false } = {}) {
 
 function validContentString(value, { allowEmpty = false } = {}) {
   return typeof value === "string" && (allowEmpty || value.length > 0);
+}
+
+function validStringArray(value, maximumEntries = 128) {
+  return Array.isArray(value) && Object.keys(value).length === value.length &&
+    value.length <= maximumEntries && value.every((entry) => validBoundedString(entry));
+}
+
+function normalizeCatalogStringArray(value, objectKey, maximumEntries = 128) {
+  if (!Array.isArray(value) || Object.keys(value).length !== value.length ||
+      value.length > maximumEntries) {
+    invalidResponse();
+  }
+  return value.map((entry) => {
+    if (validBoundedString(entry)) return entry;
+    if (!isPlainObject(entry) || !validBoundedString(entry[objectKey])) invalidResponse();
+    return entry[objectKey];
+  });
+}
+
+function deepFreeze(value) {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const child of Object.values(value)) deepFreeze(child);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function validateClientInfo(clientInfo) {
@@ -86,6 +115,77 @@ function validateExactObject(value, allowedKeys) {
   }
 }
 
+function invalidResponse() {
+  throw ownedError("APP_SERVER_CLIENT_RESPONSE_INVALID");
+}
+
+function validateModelListOptions(options) {
+  validateExactObject(options, MODEL_LIST_OPTION_KEYS);
+  const params = {};
+  if (Object.hasOwn(options, "includeHidden")) {
+    if (typeof options.includeHidden !== "boolean") throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
+    params.includeHidden = options.includeHidden;
+  }
+  if (Object.hasOwn(options, "limit")) {
+    if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > MAX_MODEL_LIST_LIMIT) {
+      throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
+    }
+    params.limit = options.limit;
+  }
+  if (Object.hasOwn(options, "cursor")) {
+    if (!validBoundedString(options.cursor)) throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
+    params.cursor = options.cursor;
+  }
+  return params;
+}
+
+function validateModel(model) {
+  if (!isPlainObject(model) ||
+      !validBoundedString(model.id) ||
+      !validBoundedString(model.model) ||
+      !validBoundedString(model.displayName) ||
+      typeof model.hidden !== "boolean" ||
+      !Object.hasOwn(model, "defaultReasoningEffort") ||
+      (model.defaultReasoningEffort !== null && !validBoundedString(model.defaultReasoningEffort))) {
+    invalidResponse();
+  }
+  const normalized = {
+    ...model,
+    supportedReasoningEfforts: normalizeCatalogStringArray(
+      model.supportedReasoningEfforts,
+      "reasoningEffort"
+    )
+  };
+  if (Object.hasOwn(model, "inputModalities")) {
+    if (!validStringArray(model.inputModalities, 128)) invalidResponse();
+    normalized.inputModalities = [...model.inputModalities];
+  }
+  if (Object.hasOwn(model, "serviceTiers")) {
+    normalized.serviceTiers = normalizeCatalogStringArray(model.serviceTiers, "id");
+  }
+  if (Object.hasOwn(model, "defaultServiceTier") &&
+      model.defaultServiceTier !== null && !validBoundedString(model.defaultServiceTier)) {
+    invalidResponse();
+  }
+  if (Object.hasOwn(model, "isDefault") && typeof model.isDefault !== "boolean") invalidResponse();
+  return normalized;
+}
+
+function validateModelListResponse(result) {
+  if (!isPlainObject(result) ||
+      !Array.isArray(result.data) ||
+      Object.keys(result.data).length !== result.data.length ||
+      result.data.length > MAX_MODEL_LIST_LENGTH ||
+      !Object.hasOwn(result, "nextCursor") ||
+      (result.nextCursor !== null && !validBoundedString(result.nextCursor))) {
+    invalidResponse();
+  }
+  return deepFreeze({
+    data: result.data.map(validateModel),
+    nextCursor: result.nextCursor
+  });
+}
+
 function validateThreadId(value) {
   if (!validBoundedString(value)) throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
 }
@@ -98,6 +198,9 @@ function validateThreadOptions(options, { requireThreadId = false } = {}) {
     throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
   }
   if (Object.hasOwn(options, "model") && !validBoundedString(options.model)) {
+    throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
+  }
+  if (Object.hasOwn(options, "modelReasoningEffort") && !validBoundedString(options.modelReasoningEffort)) {
     throw ownedError("APP_SERVER_CLIENT_ARGUMENT_INVALID");
   }
   for (const key of ["baseInstructions", "developerInstructions"]) {
@@ -119,6 +222,9 @@ function copyThreadOptions(options) {
   const result = {};
   for (const key of ["cwd", "model", "approvalPolicy", "sandbox", "baseInstructions", "developerInstructions"]) {
     if (Object.hasOwn(options, key)) result[key] = options[key];
+  }
+  if (Object.hasOwn(options, "modelReasoningEffort")) {
+    result.config = { model_reasoning_effort: options.modelReasoningEffort };
   }
   return result;
 }
@@ -224,6 +330,13 @@ export class CodexAppServerClient {
       clearTimeout(deadline);
     });
     return this.#initializePromise;
+  }
+
+  listModels(options = {}) {
+    return this.#business(() => {
+      const params = validateModelListOptions(options);
+      return this.#requestBusiness("model/list", params).then(validateModelListResponse);
+    });
   }
 
   startThread(options = {}) {

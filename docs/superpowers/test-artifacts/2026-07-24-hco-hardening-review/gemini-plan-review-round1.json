@@ -1,0 +1,74 @@
+{
+  "session_id": "5fed6b20-701e-40c0-9eec-9ca69485fbaa",
+  "response": "",
+  "stats": {
+    "models": {
+      "gemini-3.1-pro-preview": {
+        "api": {
+          "totalRequests": 2,
+          "totalErrors": 0,
+          "totalLatencyMs": 30867
+        },
+        "tokens": {
+          "input": 31619,
+          "prompt": 31619,
+          "candidates": 65,
+          "total": 31789,
+          "cached": 0,
+          "thoughts": 105,
+          "tool": 0
+        },
+        "roles": {
+          "main": {
+            "totalRequests": 2,
+            "totalErrors": 0,
+            "totalLatencyMs": 30867,
+            "tokens": {
+              "input": 31619,
+              "prompt": 31619,
+              "candidates": 65,
+              "total": 31789,
+              "cached": 0,
+              "thoughts": 105,
+              "tool": 0
+            }
+          }
+        }
+      }
+    },
+    "tools": {
+      "totalCalls": 1,
+      "totalSuccess": 1,
+      "totalFail": 0,
+      "totalDurationMs": 5,
+      "totalDecisions": {
+        "accept": 1,
+        "reject": 0,
+        "modify": 0,
+        "auto_accept": 0
+      },
+      "byName": {
+        "read_file": {
+          "count": 1,
+          "success": 1,
+          "fail": 0,
+          "durationMs": 5,
+          "decisions": {
+            "accept": 1,
+            "reject": 0,
+            "modify": 0,
+            "auto_accept": 0
+          }
+        }
+      }
+    },
+    "files": {
+      "totalLinesAdded": 0,
+      "totalLinesRemoved": 0
+    }
+  },
+  "error": {
+    "type": "INVALID_STREAM",
+    "message": "Invalid stream: The model returned an empty response or malformed tool call."
+  }
+}

@@ -4,7 +4,7 @@
 > Server target. Historical Runner `taskId` values remain audit references but
 > never provide App Server continuity.
 
-**Status:** accepted; implementation in progress
+**Status:** accepted; amended 2026-08-04 for topic-owned logical Codex sessions; implementation in progress
 **Date:** 2026-07-16
 **Related:** `docs/adr/0001-zulip-trusted-execution-scope.md`
 **Evidence:** `docs/reviews/HERMES_CODEX_CONTEXT_MANAGEMENT_SYNTHESIS.md`
@@ -23,12 +23,13 @@ HCO needs a business and task control plane around those capabilities; it does
 not need a second coding-agent reasoning loop or a duplicate Codex transcript
 store.
 
-ADR 0001's proposed `conversationKey -> codexSessionId` mapping is useful for
-delivery identity but is too coarse as the only continuity policy. One Zulip
-topic can contain unrelated objectives, while one objective can also need
-separate exploratory branches. If accepted, this ADR refines that section:
-conversation identity indexes tasks, but objective/task identity owns Codex
-threads.
+ADR 0001's proposed `conversationKey -> codexSessionId` mapping becomes the
+stable topic-level continuity policy. One Zulip topic can still contain
+unrelated objectives, while one objective can need separate exploratory
+branches. The topic therefore owns one logical Codex context session and its
+primary thread; objective/task identities own concrete work and any managed
+branch thread inside that topic session. No objective may borrow a thread from
+another topic.
 
 ## Decision
 
@@ -200,29 +201,34 @@ Thread persistence does not guarantee that a separately running Codex App
 will display the thread in its normal conversation list. CLI/TUI, App, exec,
 and app-server threads have distinct source kinds. HCO treats App visibility
 as an optional presentation integration, not as evidence that a task exists or
-is resumable. The durable `objectiveId -> threadId -> turnId` registry and app-server
-events remain authoritative.
+is resumable. The durable
+`topicContextId -> codexContextSessionId -> objectiveId -> threadId -> turnId`
+registry and app-server events remain authoritative.
 
 ### Conversation routing
 
 Creating an empty Zulip topic does not create a Codex thread. The first
-executable request creates a stable HCO `conversationKey`, an objective, and a
-thread. The mapping is:
+executable request creates a stable HCO `topicContextId`, its logical
+`codexContextSessionId`, an objective, and a primary thread. The mapping is:
 
 ```text
 numeric streamId -> projectId
-topic/message -> deliveryTargetId/topicAliasId
-objective -> threadId
+projectId -> canonical project cwd
+streamId + stable topic identity -> topicContextId -> codexContextSessionId
+topic alias/message -> deliveryTargetId/topicAliasId
+objective -> primary or managed branch threadId inside that topic session
 execution -> turnId
 turn items -> delivery records
 ```
 
-Stream/topic values are aliases and delivery coordinates, not permanent
-primary keys. A verified topic rename or same-project move updates the alias
-and target after permission checks. If the transport cannot reliably expose
-the change, HCO requires explicit relinking. A cross-project move defaults to
-a new conversation/thread. Cross-topic quotations are evidence only; they do
-not merge threads or authorization scopes.
+Stream display names and topic text are aliases and delivery coordinates, not
+permanent primary keys. Numeric stream ID and `topicContextId` are the stable
+identities. A verified topic rename or same-project move updates the alias and
+target after permission checks while preserving the topic context. If the
+transport cannot reliably expose the change, HCO requires explicit relinking.
+A cross-project move defaults to a new topic context/session. Cross-topic
+quotations are evidence only; they do not merge sessions, threads, or
+authorization scopes.
 
 Each objective has at most one active turn. Later messages are queued FIFO by
 default. Steer, interrupt, approval, and user-input actions must name the exact

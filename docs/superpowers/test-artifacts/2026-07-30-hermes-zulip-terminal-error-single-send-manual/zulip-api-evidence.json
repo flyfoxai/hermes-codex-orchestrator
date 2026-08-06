@@ -1,0 +1,73 @@
+{
+  "captured_at": "2026-07-30T16:54:00+08:00",
+  "stream_id": 5,
+  "stream_name": "量化交易stockProfits",
+  "topic": "hermes-v019-terminal-error-single-send-20260730-164133",
+  "request_sent_via_web_ui_count": 1,
+  "initial_prompt": {
+    "id": 719,
+    "timestamp": 1785401133,
+    "utc": "2026-07-30T08:45:33Z",
+    "sender_full_name": "Jarvis PM",
+    "rendered_html": "<p><span aria-label=\"question\" class=\"emoji emoji-2753\" role=\"img\" title=\"question\">:question:</span> 请选择一个测试选项：</p>\n<p>1. 选项 A<br>\n  2. 选项 B<br>\n  3. 取消</p>\n<p>Use the buttons below, or type any other answer.</p>"
+  },
+  "stable_topic_query": {
+    "result": "success",
+    "message_count": 5,
+    "messages": [
+      {
+        "id": 718,
+        "timestamp": 1785401121,
+        "utc": "2026-07-30T08:45:21Z",
+        "sender_full_name": "boss",
+        "rendered_html": "<p><span class=\"user-mention\" data-user-id=\"9\">@Jarvis PM</span> 我需要收集一个测试选择。请让我在“选项 A”“选项 B”“取消”三个选项中选择；这只是交互测试，不执行项目操作。</p>"
+      },
+      {
+        "id": 720,
+        "timestamp": 1785401594,
+        "utc": "2026-07-30T08:53:14Z",
+        "sender_full_name": "boss",
+        "rendered_html": "<p><span class=\"user-mention\" data-user-id=\"9\">@Jarvis PM</span> 选项 A</p>\n<p>[hermes-clarify:9071d0e5d1:1]</p>"
+      },
+      {
+        "id": 721,
+        "timestamp": 1785401595,
+        "utc": "2026-07-30T08:53:15Z",
+        "sender_full_name": "boss",
+        "rendered_html": "<p><span class=\"user-mention\" data-user-id=\"9\">@Jarvis PM</span> 选项 B</p>\n<p>[hermes-clarify:9071d0e5d1:2]</p>"
+      },
+      {
+        "id": 722,
+        "timestamp": 1785401595,
+        "utc": "2026-07-30T08:53:15Z",
+        "sender_full_name": "Jarvis PM",
+        "rendered_html": "<p>这个选择已由另一客户端或标签页在 2026-07-30 16:53:14 CST 先行提交（首次选择：选项 A）。首次选择继续有效，本次重复选择已忽略。</p>"
+      },
+      {
+        "id": 723,
+        "timestamp": 1785401600,
+        "utc": "2026-07-30T08:53:20Z",
+        "sender_full_name": "Jarvis PM",
+        "rendered_html": "<p>已收到你的测试选择：<strong>选项 A</strong>。</p>"
+      }
+    ]
+  },
+  "deleted_prompt_probe": {
+    "message_id": 719,
+    "http_status": 400,
+    "body": {
+      "result": "error",
+      "msg": "Invalid message(s)",
+      "code": "BAD_REQUEST"
+    }
+  },
+  "assertions": {
+    "request_has_real_jarvis_user_mention": true,
+    "same_clarify_id_for_both_clicks": true,
+    "different_action_indexes": true,
+    "stale_notice_count": 1,
+    "normal_confirmation_count": 1,
+    "failure_warning_count": 0,
+    "prompt_deleted": true
+  }
+}

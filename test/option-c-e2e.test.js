@@ -340,13 +340,32 @@ test("pending App Server approval survives restart and only its authorized bound
     }
   });
 
-  const prompts = runtime.store.claimOutbox({ workerId: "approval-prompt", limit: 10, leaseMs: 1_000 });
-  const prompt = prompts.find((entry) => entry.payload.kind === "interaction_request");
+  const details = [];
+  let prompt;
+  for (let index = 0; index < 10 && !prompt; index += 1) {
+    const [delivery] = runtime.store.claimOutbox({ workerId: "approval-prompt", limit: 10, leaseMs: 1_000 });
+    assert.ok(delivery);
+    if (delivery.payload.kind === "interaction_request") {
+      prompt = delivery;
+      break;
+    }
+    details.push(delivery.payload.content);
+    runtime.store.ackOutbox({
+      deliveryId: delivery.deliveryId,
+      leaseToken: delivery.leaseToken,
+      zulipMessageId: 8_000 + index
+    });
+  }
   assert.ok(prompt);
   assert.match(prompt.payload.content, new RegExp(pending.interactionId));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} accept`));
   assert.match(prompt.payload.content, new RegExp(`/codex approve ${pending.interactionId} cancel`));
-  assert.match(prompt.payload.content, /npm test/);
+  assert.match(details.join("\n"), /npm test/);
+  runtime.store.ackOutbox({
+    deliveryId: prompt.deliveryId,
+    leaseToken: prompt.leaseToken,
+    zulipMessageId: 8_100
+  });
 
   await assert.rejects(() => runtime.service.handleBridgeEvent(fixture.event({
     topic: "Approval",
@@ -367,6 +386,36 @@ test("pending App Server approval survives restart and only its authorized bound
     command: { type: "APPROVE", replyToken: pending.interactionId, choice: "accept" }
   }));
   assert.equal(answered.status, "answered");
+  const [promptDelete] = runtime.store.claimOutbox({
+    workerId: "approval-prompt-delete", limit: 10, leaseMs: 1_000
+  });
+  assert.equal(promptDelete.payload.kind, "interaction_prompt_delete");
+  assert.equal(promptDelete.payload.zulipMessageId, 8_100);
+  assert.equal(promptDelete.targetSnapshot.topic, "Approval");
+  runtime.store.nackOutbox({
+    deliveryId: promptDelete.deliveryId,
+    leaseToken: promptDelete.leaseToken,
+    error: "ZULIP_PERMANENT:delete forbidden",
+    retryable: false
+  });
+  await runtime.service.handleAppServerRequest({
+    connectionId: "app-server-connection-1",
+    message: {
+      id: 8,
+      method: "item/commandExecution/requestApproval",
+      params: {
+        threadId: started.threadId,
+        turnId: started.turnId,
+        itemId: "command-item-2",
+        approvalId: "approval-2",
+        command: "npm run lint"
+      }
+    }
+  });
+  const [deliveryAfterFailedDelete] = runtime.store.claimOutbox({
+    workerId: "after-failed-delete", limit: 10, leaseMs: 1_000
+  });
+  assert.match(deliveryAfterFailedDelete.payload.content, /npm run lint/);
   assert.deepEqual(fixture.calls.app.filter(([method]) => method === "respondToInteraction"), [[
     "respondToInteraction",
     { interactionId: pending.interactionId, wireRequestId: 7, result: { decision: "accept" } }

@@ -3,6 +3,19 @@ import { closeSync, constants, fchmodSync, lstatSync, openSync } from "node:fs";
 
 import Database from "better-sqlite3";
 
+import {
+  appendArtifactSummary,
+  manifestFromRows,
+  normalizeArtifactManifest,
+  validateArtifactManifestShape,
+  verifyInputArtifactRows,
+  verifyInputArtifacts,
+  verifyOutputArtifactRows
+} from "../artifacts.js";
+import { interactionActionSpecs } from "../interactions.js";
+import { updateProjectLocalExchangeStatus } from "../project-local-exchange.js";
+import { createManagedFileExchangeState } from "../file-exchange/state.js";
+import { createCoordinationStore } from "./coordination-store.js";
 import { applyMigrations, isMigrationStoreError, MIGRATIONS } from "./migrations.js";
 import {
   assertExecutionTransition,
@@ -18,6 +31,8 @@ const REPLAY_SKEW_MS = 30_000;
 const MAX_CLAIM_LIMIT = 100;
 const MAX_LEASE_MS = 24 * 60 * 60 * 1_000;
 const INTERACTION_TTL_MS = 24 * 60 * 60 * 1_000;
+const INTERACTION_RESPONSE_LEASE_MS = 2 * 60 * 1_000;
+const MAX_INTERACTION_JSON_BYTES = 64 * 1024 * 1024;
 const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = (2n ** 63n) - 1n;
 const INTERACTION_METHODS = new Set([
@@ -169,6 +184,26 @@ function mapTurnOutputRow(row) {
   };
 }
 
+function mapArtifactRow(row) {
+  return {
+    submissionId: row.submission_id,
+    objectiveId: row.objective_id,
+    baseDir: row.base_dir,
+    artifactId: row.artifact_id,
+    direction: row.direction,
+    path: row.path,
+    absolutePath: row.absolute_path,
+    kind: row.kind,
+    mimeType: row.mime_type,
+    required: row.required === 1,
+    maxBytes: row.max_bytes,
+    expectedSha256: row.expected_sha256,
+    observedSha256: row.observed_sha256,
+    observedBytes: row.observed_bytes,
+    state: row.state
+  };
+}
+
 function mapAuditFactRow(row) {
   return {
     factId: row.fact_id,
@@ -212,6 +247,34 @@ function mapInteractionRow(row) {
   };
 }
 
+function mapInteractionActionRow(row) {
+  return {
+    interactionId: row.interaction_id,
+    actionId: row.action_id,
+    sourceKey: row.source_key,
+    actionClass: row.action_class,
+    label: row.label,
+    style: row.style,
+    answer: JSON.parse(row.answer_json),
+    naturalAliasEligible: row.natural_alias_eligible === 1,
+    ordinal: row.ordinal,
+    createdAt: row.created_at_ms
+  };
+}
+
+function readInteractionActions(db, interactionId) {
+  return db.prepare(`
+    SELECT * FROM interaction_actions WHERE interaction_id = ? ORDER BY ordinal
+  `).all(interactionId).map(mapInteractionActionRow);
+}
+
+function mapInteractionWithActions(db, row) {
+  const interaction = mapInteractionRow(row);
+  if (!interaction) return null;
+  interaction.actions = readInteractionActions(db, interaction.interactionId);
+  return interaction;
+}
+
 function interactionCorrelationKey(options) {
   return createHash("sha256").update(canonicalJson({
     approvalId: options.approvalId ?? null,
@@ -223,11 +286,36 @@ function interactionCorrelationKey(options) {
   }), "utf8").digest("hex");
 }
 
-function validateInteractionPrompt(prompt) {
-  if (!isPlainObject(prompt) || !requireText(prompt.semanticKey) || !isPlainObject(prompt.payload)) {
+function validateInteractionRender(rendered) {
+  if (isPlainObject(rendered) && requireText(rendered.semanticKey) && isPlainObject(rendered.payload)) {
+    return {
+      detail: { mode: "notice", contentSha256: createHash("sha256").update("", "utf8").digest("hex"), contentBytes: 0 },
+      deliveries: [{ ...rendered, role: "action_prompt", chunkIndex: null }]
+    };
+  }
+  if (!isPlainObject(rendered) || !isPlainObject(rendered.detail) || !Array.isArray(rendered.deliveries) ||
+      rendered.deliveries.length === 0 || !["inline", "chunks", "document", "notice"].includes(rendered.detail.mode) ||
+      typeof rendered.detail.contentSha256 !== "string" || !/^[0-9a-f]{64}$/u.test(rendered.detail.contentSha256) ||
+      !Number.isSafeInteger(rendered.detail.contentBytes) || rendered.detail.contentBytes < 0) {
     throw stateError("INTERACTION_RENDER_INVALID", "Interaction renderer output is invalid.");
   }
-  return prompt;
+  const semanticKeys = new Set();
+  let actionPrompts = 0;
+  let detailChunks = 0;
+  for (const delivery of rendered.deliveries) {
+    if (!isPlainObject(delivery) || !requireText(delivery.semanticKey) || !isPlainObject(delivery.payload) ||
+        semanticKeys.has(delivery.semanticKey) || !["detail", "action_prompt", "notice"].includes(delivery.role) ||
+        (delivery.role === "detail" ? !Number.isSafeInteger(delivery.chunkIndex) || delivery.chunkIndex < 0 : delivery.chunkIndex !== null)) {
+      throw stateError("INTERACTION_RENDER_INVALID", "Interaction renderer output is invalid.");
+    }
+    semanticKeys.add(delivery.semanticKey);
+    if (delivery.role === "detail") detailChunks += 1;
+    if (delivery.role === "action_prompt") actionPrompts += 1;
+  }
+  if (actionPrompts > 1 || (actionPrompts === 1 && detailChunks === 0)) {
+    throw stateError("INTERACTION_RENDER_INVALID", "Interaction renderer output is invalid.");
+  }
+  return rendered;
 }
 
 function validateRenderedChunks(chunks) {
@@ -276,15 +364,22 @@ function executionPayloadHash(options) {
     targetSnapshot: options.targetSnapshot,
     text: options.text
   };
+  if (options.artifactMode !== undefined) payload.artifactMode = options.artifactMode;
   if (options.projectId !== undefined || options.topicBinding !== undefined) {
     payload.projectId = options.projectId;
     payload.topicBinding = options.topicBinding;
     if (options.topicModeAction !== undefined) payload.topicModeAction = options.topicModeAction;
   }
+  if (options.artifacts !== undefined || options.artifactBaseDir !== undefined) {
+    payload.artifacts = options.artifacts;
+    payload.artifactBaseDir = options.artifactBaseDir;
+  }
   return createHash("sha256").update(canonicalJson(payload), "utf8").digest("hex");
 }
 
 function assertControllerIntent(options) {
+  const hasArtifacts = options !== null && typeof options === "object" && options.artifacts !== undefined;
+  const hasArtifactBaseDir = options !== null && typeof options === "object" && options.artifactBaseDir !== undefined;
   if (
     options === null || typeof options !== "object" ||
     !requireText(options.sourceType) || !requireText(options.sourceId) ||
@@ -293,6 +388,9 @@ function assertControllerIntent(options) {
     options.targetSnapshot === null || typeof options.targetSnapshot !== "object" || Array.isArray(options.targetSnapshot)
   ) {
     throw stateError("EXECUTION_INTENT_INVALID", "Execution intent is invalid.");
+  }
+  if (options.artifactMode !== undefined && !["legacy", "project_local", "managed"].includes(options.artifactMode)) {
+    throw stateError("EXECUTION_INTENT_INVALID", "Execution artifact mode is invalid.");
   }
   const controlled = options.projectId !== undefined || options.topicBinding !== undefined;
   if (controlled && (!requireText(options.projectId) || Buffer.byteLength(options.projectId, "utf8") > 64 ||
@@ -306,6 +404,19 @@ function assertControllerIntent(options) {
   }
   if (!controlled && options.topicModeAction !== undefined) {
     throw stateError("EXECUTION_INTENT_INVALID", "Execution intent is invalid.");
+  }
+  if (hasArtifacts !== hasArtifactBaseDir) {
+    throw stateError("ARTIFACT_MANIFEST_INVALID", "Artifact manifest and base directory must be provided together.");
+  }
+  if (options.artifactMode === "managed" && hasArtifacts) {
+    throw stateError("FILE_EXCHANGE_UNSUPPORTED", "Managed execution cannot use legacy project artifacts.");
+  }
+  if (options.artifactMode === "project_local" && !hasArtifacts) {
+    throw stateError("ARTIFACT_MANIFEST_INVALID", "Project-local execution requires an HCO artifact manifest.");
+  }
+  if (hasArtifacts) {
+    validateArtifactManifestShape(options.artifacts);
+    verifyInputArtifacts(normalizeArtifactManifest(options.artifacts, { baseDir: options.artifactBaseDir }));
   }
 }
 
@@ -499,6 +610,10 @@ function createTransactions(db, nowProvider, idFactory) {
         WHERE earlier.objective_id = outbox.objective_id
           AND earlier.objective_sequence < outbox.objective_sequence
           AND earlier.state <> 'delivered'
+          AND NOT (
+            earlier.state = 'failed'
+            AND COALESCE(json_extract(earlier.payload_json, '$.kind'), '') = 'interaction_prompt_delete'
+          )
       )
       ORDER BY outbox.created_at_ms, outbox.objective_id, outbox.objective_sequence
       LIMIT ?
@@ -559,6 +674,51 @@ function createTransactions(db, nowProvider, idFactory) {
       SET completed_at_ms = ?, outcome = 'acknowledged', error = NULL, zulip_message_id = ?
       WHERE delivery_id = ? AND lease_token = ? AND outcome IS NULL
     `).run(now, zulipMessageId, deliveryId, leaseToken);
+    const link = db.prepare(`
+      SELECT interaction_id, role FROM interaction_delivery_links WHERE delivery_id = ?
+    `).get(deliveryId);
+    if (link?.role === "detail") {
+      const remaining = db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM interaction_delivery_links AS link
+        JOIN zulip_outbox AS outbox USING (delivery_id)
+        WHERE link.interaction_id = ? AND link.role = 'detail' AND outbox.state <> 'delivered'
+      `).get(link.interaction_id).count;
+      if (remaining === 0) {
+        db.prepare(`
+          UPDATE interaction_details
+          SET detail_state = 'delivered', delivered_at_ms = ?
+          WHERE interaction_id = ? AND detail_state = 'detail_pending'
+        `).run(now, link.interaction_id);
+      }
+    }
+    const remainingObjectiveDeliveries = db.prepare(`
+      SELECT count(*) AS count FROM zulip_outbox
+      WHERE objective_id = ? AND state <> 'delivered'
+    `).get(row.objective_id).count;
+    if (remainingObjectiveDeliveries === 0) {
+      const directCalls = db.prepare(`
+        SELECT * FROM codex_calls
+        WHERE objective_id = ? AND report_target_kind = 'ZULIP' AND state = 'COMPLETED'
+      `).all(row.objective_id);
+      for (const call of directCalls) {
+        const pendingInteraction = db.prepare(`
+          SELECT 1
+          FROM interaction_coordination AS coordination
+          JOIN pending_interactions AS interaction USING (interaction_id)
+          WHERE coordination.codex_call_id = ?
+            AND (interaction.state = 'pending' OR interaction.response_delivery_state <> 'delivered')
+          LIMIT 1
+        `).get(call.codex_call_id);
+        if (!pendingInteraction) {
+          db.prepare(`
+            UPDATE work_requests
+            SET state = 'COMPLETED', status_reason = NULL, updated_at_ms = ?, terminal_at_ms = ?
+            WHERE work_request_id = ? AND state NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+          `).run(now, now, call.work_request_id);
+        }
+      }
+    }
     return { deliveryId, state: "delivered", duplicate: false, zulipMessageId };
   });
 
@@ -582,6 +742,17 @@ function createTransactions(db, nowProvider, idFactory) {
       SET completed_at_ms = ?, outcome = ?, error = ?
       WHERE delivery_id = ? AND lease_token = ? AND outcome IS NULL
     `).run(now, retryable ? "retryable_failure" : "permanent_failure", error, deliveryId, leaseToken);
+    if (!retryable) {
+      const link = db.prepare(`
+        SELECT interaction_id, role FROM interaction_delivery_links WHERE delivery_id = ?
+      `).get(deliveryId);
+      if (link?.role === "detail") {
+        db.prepare(`
+          UPDATE interaction_details SET detail_state = 'delivery_failed'
+          WHERE interaction_id = ? AND detail_state = 'detail_pending'
+        `).run(link.interaction_id);
+      }
+    }
     return { deliveryId, state: nextState, retryable };
   });
 
@@ -1139,7 +1310,19 @@ function createTransactions(db, nowProvider, idFactory) {
     };
   });
 
-  const prepareTurnSubmission = db.transaction(({ sourceType, sourceId, objectiveId, text, targetSnapshot, leaseOwner }) => {
+  const prepareTurnSubmission = db.transaction(({
+    sourceType,
+    sourceId,
+    objectiveId,
+    text,
+    targetSnapshot,
+    leaseOwner,
+    artifacts,
+    artifactBaseDir
+  }) => {
+    const artifactManifest = artifacts === undefined
+      ? null
+      : verifyInputArtifacts(normalizeArtifactManifest(artifacts, { baseDir: artifactBaseDir }));
     const now = assertNow(nowProvider);
     const execution = db.prepare("SELECT * FROM objective_execution WHERE objective_id = ?").get(objectiveId);
     if (!execution) throw stateError("OBJECTIVE_NOT_FOUND", "Objective does not exist.");
@@ -1167,6 +1350,36 @@ function createTransactions(db, nowProvider, idFactory) {
       submissionId, objectiveId, clientUserMessageId, text, canonicalJson(targetSnapshot),
       leaseOwner, leaseToken, now, now
     );
+    if (artifactManifest) {
+      const insertArtifact = db.prepare(`
+        INSERT INTO artifact_contracts (
+          submission_id, objective_id, base_dir, artifact_id, direction, path, absolute_path,
+          kind, mime_type, required, max_bytes, expected_sha256, observed_sha256,
+          observed_bytes, state, created_at_ms, updated_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+      for (const artifact of [...artifactManifest.input, ...artifactManifest.output]) {
+        insertArtifact.run(
+          submissionId,
+          objectiveId,
+          artifactManifest.baseDir,
+          artifact.artifactId,
+          artifact.direction,
+          artifact.path,
+          artifact.absolutePath,
+          artifact.kind,
+          artifact.mimeType,
+          artifact.required ? 1 : 0,
+          artifact.maxBytes,
+          artifact.expectedSha256,
+          artifact.observedSha256,
+          artifact.observedBytes,
+          artifact.state,
+          now,
+          now
+        );
+      }
+    }
     db.prepare(`
       UPDATE inbound_intents SET submission_id = ? WHERE source_type = ? AND source_id = ?
     `).run(submissionId, sourceType, sourceId);
@@ -1231,14 +1444,17 @@ function createTransactions(db, nowProvider, idFactory) {
     if (submission.submission_state !== "submission_unknown") {
       throw stateError("TURN_SUBMISSION_ROLLBACK_INVALID", "Cannot rollback: submission is not in unknown state.");
     }
-    // Roll back to pending state
+    const execution = db.prepare("SELECT execution_status FROM objective_execution WHERE objective_id = ?")
+      .get(submission.objective_id);
+    assertSubmissionTransition(submission.submission_state, "intent", { mode: "reconciliation" });
+    assertExecutionTransition(execution?.execution_status, "submitting", { mode: "reconciliation" });
     db.prepare(`
       UPDATE turn_submissions
-      SET submission_state = 'pending', reconciliation_required = 0, updated_at_ms = ?
+      SET submission_state = 'intent', reconciliation_required = 0, updated_at_ms = ?
       WHERE submission_id = ?
     `).run(now, submissionId);
     db.prepare(`
-      UPDATE objective_execution SET execution_status = 'running', updated_at_ms = ? WHERE objective_id = ?
+      UPDATE objective_execution SET execution_status = 'submitting', updated_at_ms = ? WHERE objective_id = ?
     `).run(now, submission.objective_id);
     return mapSubmissionRow(db.prepare("SELECT * FROM turn_submissions WHERE submission_id = ?").get(submissionId));
   });
@@ -1476,10 +1692,100 @@ function createTransactions(db, nowProvider, idFactory) {
     `).get(objectiveId, turnId);
     if (!submission) throw stateError("TURN_SUBMISSION_NOT_FOUND", "Turn submission does not exist.");
 
+    const artifactRows = db.prepare(`
+      SELECT * FROM artifact_contracts WHERE submission_id = ? ORDER BY direction, artifact_id
+    `).all(submission.submission_id).map(mapArtifactRow);
+    const verifiedInputs = verifyInputArtifactRows(
+      artifactRows.filter((artifact) => artifact.direction === "input")
+    );
+    const verifiedOutputs = verifyOutputArtifactRows(
+      artifactRows.filter((artifact) => artifact.direction === "output")
+    );
+
     const mode = sourceType === "reconciliation" ? "reconciliation" : "normal";
     const execution = db.prepare("SELECT execution_status FROM objective_execution WHERE objective_id = ?").get(objectiveId);
+    const updateArtifact = db.prepare(`
+      UPDATE artifact_contracts
+      SET observed_sha256 = ?, observed_bytes = ?, state = ?, updated_at_ms = ?
+      WHERE submission_id = ? AND direction = 'output' AND artifact_id = ?
+    `);
+    for (const artifact of verifiedOutputs.rows) {
+      updateArtifact.run(
+        artifact.observedSha256,
+        artifact.observedBytes,
+        artifact.state,
+        now,
+        submission.submission_id,
+        artifact.artifactId
+      );
+    }
+    const artifactFailures = [...verifiedInputs.failures, ...verifiedOutputs.failures];
+    if (artifactFailures.length > 0) {
+      const failureCode = artifactFailures[0].failureCode ?? (
+        artifactFailures[0].path.startsWith(".hco/exchanges/v1/") &&
+        artifactFailures[0].direction === "output" && artifactFailures[0].state === "missing"
+          ? "PROJECT_LOCAL_OUTPUT_MISSING"
+          : "ARTIFACT_VALIDATION_FAILED"
+      );
+      updateProjectLocalExchangeStatus(artifactRows, { state: "ERROR", errorCode: failureCode, now: () => now });
+      assertSubmissionTransition(submission.submission_state, "reconciliation_needed", { mode: "reconciliation" });
+      assertExecutionTransition(execution?.execution_status, "reconciliation_needed", { mode: "reconciliation" });
+      db.prepare(`
+        UPDATE turn_submissions
+        SET submission_state = 'reconciliation_needed', reconciliation_required = 1, updated_at_ms = ?
+        WHERE submission_id = ?
+      `).run(now, submission.submission_id);
+      db.prepare(`
+        UPDATE objective_execution SET execution_status = 'reconciliation_needed', updated_at_ms = ?
+        WHERE objective_id = ?
+      `).run(now, objectiveId);
+
+      const auditSourceType = "artifact-validation";
+      const auditSourceId = submission.submission_id;
+      const existingAudit = db.prepare(`
+        SELECT 1 FROM turn_audit_facts WHERE source_type = ? AND source_id = ?
+      `).get(auditSourceType, auditSourceId);
+      if (!existingAudit) {
+        db.prepare(`
+          INSERT INTO turn_audit_facts (
+            fact_id, source_type, source_id, objective_id, submission_id, fact_json, recorded_at_ms
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          assertId(idFactory, "turn-audit-fact"),
+          auditSourceType,
+          auditSourceId,
+          objectiveId,
+          submission.submission_id,
+          canonicalJson({
+            kind: verifiedInputs.ok ? "artifact_output_validation_failed" : "artifact_input_validation_failed",
+            turnId,
+            failures: artifactFailures.map((artifact) => ({
+              artifactId: artifact.artifactId,
+              direction: artifact.direction,
+              path: artifact.path,
+              state: artifact.state,
+              ...(artifact.failureCode ? { failureCode: artifact.failureCode } : {})
+            }))
+          }),
+          now
+        );
+      }
+      return {
+        duplicate: false,
+        status: "reconciliation_needed",
+        errorCode: failureCode,
+        output: null,
+        outbox: []
+      };
+    }
+
     assertSubmissionTransition(submission.submission_state, "completed", { mode });
     assertExecutionTransition(execution?.execution_status, "completed", { mode });
+
+    const completedManifestRows = db.prepare(`
+      SELECT * FROM artifact_contracts WHERE submission_id = ? ORDER BY direction, artifact_id
+    `).all(submission.submission_id).map(mapArtifactRow);
+    const artifactManifest = manifestFromRows(completedManifestRows);
 
     db.prepare(`
       INSERT INTO turn_outputs (
@@ -1487,7 +1793,39 @@ function createTransactions(db, nowProvider, idFactory) {
       ) VALUES (?, ?, ?, ?, ?, ?)
     `).run(submission.submission_id, objectiveId, turnId, rawText, JSON.stringify(itemIds), now);
 
-    const chunks = validateRenderedChunks(renderer({ objectiveId, text: rawText }));
+    const renderedText = appendArtifactSummary(rawText, artifactManifest);
+    const submissionIntent = db.prepare(`
+      SELECT source_type, source_id FROM inbound_intents WHERE submission_id = ?
+    `).get(submission.submission_id);
+    let coordinationCall = submissionIntent?.source_type === "coordination-call"
+      ? db.prepare(`
+          SELECT * FROM codex_calls WHERE codex_call_id = ? AND objective_id = ?
+        `).get(submissionIntent.source_id, objectiveId)
+      : null;
+    if (coordinationCall?.turn_id && coordinationCall.turn_id !== turnId) {
+      throw stateError("CODEX_CALL_TURN_MISMATCH", "Codex call is already bound to another turn.");
+    }
+    coordinationCall ??= db.prepare(`
+      SELECT * FROM codex_calls WHERE objective_id = ? AND turn_id = ?
+    `).get(objectiveId, turnId);
+    if (!coordinationCall) {
+      const candidates = db.prepare(`
+        SELECT * FROM codex_calls
+        WHERE objective_id = ? AND turn_id IS NULL
+          AND state IN ('CREATED', 'SUBMITTING', 'RUNNING', 'WAITING_INTERACTION', 'STATUS_UNVERIFIED')
+        ORDER BY created_at_ms, codex_call_id LIMIT 2
+      `).all(objectiveId);
+      coordinationCall = candidates.length === 1 ? candidates[0] : null;
+    }
+    if (coordinationCall?.turn_id === null) {
+      db.prepare("UPDATE codex_calls SET turn_id = ?, updated_at_ms = ? WHERE codex_call_id = ?")
+        .run(turnId, now, coordinationCall.codex_call_id);
+      coordinationCall = { ...coordinationCall, turn_id: turnId, updated_at_ms: now };
+    }
+    const mailboxRouted = coordinationCall && coordinationCall.report_target_kind !== "ZULIP";
+    const chunks = mailboxRouted
+      ? []
+      : validateRenderedChunks(renderer({ objectiveId, text: renderedText }));
     const eventRecordId = assertId(idFactory, "event");
     db.prepare(`
       INSERT INTO event_journal (
@@ -1508,6 +1846,74 @@ function createTransactions(db, nowProvider, idFactory) {
       submission.submission_id, canonicalJson({ itemIds, status: "completed", turnId }), now
     );
 
+    if (coordinationCall) {
+      db.prepare(`
+        UPDATE codex_calls
+        SET state = 'COMPLETED', receipt_json = ?, updated_at_ms = ?, terminal_at_ms = ?
+        WHERE codex_call_id = ? AND state NOT IN ('CANCELLED', 'FAILED')
+      `).run(
+        canonicalJson({
+          schemaVersion: 1,
+          status: "completed",
+          objectiveId,
+          turnId,
+          itemIds,
+          text: rawText,
+          artifacts: artifactManifest
+        }),
+        now,
+        now,
+        coordinationCall.codex_call_id
+      );
+      db.prepare(`
+        UPDATE codex_conversations
+        SET state = 'READY', updated_at_ms = ?
+        WHERE codex_conversation_id = ?
+      `).run(now, coordinationCall.codex_conversation_id);
+      db.prepare(`
+        UPDATE work_requests
+        SET state = 'RUNNING', status_reason = 'codex_receipt_pending_review', updated_at_ms = ?
+        WHERE work_request_id = ? AND state NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+      `).run(now, coordinationCall.work_request_id);
+      if (mailboxRouted) {
+        const targetKind = coordinationCall.report_target_kind === "AGENT_MAILBOX" ? "AGENT" : "JARVIS";
+        db.prepare(`
+          INSERT INTO coordination_mailbox (
+            mailbox_item_id, target_kind, target_id, work_request_id, codex_call_id,
+            item_type, semantic_key, payload_json, state, attempt_count, lease_owner,
+            lease_token, lease_expires_at_ms, created_at_ms, updated_at_ms, acknowledged_at_ms
+          ) VALUES (?, ?, ?, ?, ?, 'CODEX_RECEIPT', ?, ?, 'PENDING', 0,
+            NULL, NULL, NULL, ?, ?, NULL)
+          ON CONFLICT(semantic_key) DO NOTHING
+        `).run(
+          assertId(idFactory, "mailbox-item"),
+          targetKind,
+          coordinationCall.report_target_id,
+          coordinationCall.work_request_id,
+          coordinationCall.codex_call_id,
+          `codex-receipt:${coordinationCall.codex_call_id}:${turnId}`,
+          canonicalJson({
+            schemaVersion: 1,
+            kind: "CodexReceipt",
+            codexCallId: coordinationCall.codex_call_id,
+            codexConversationId: coordinationCall.codex_conversation_id,
+            workRequestId: coordinationCall.work_request_id,
+            topicContextId: coordinationCall.topic_context_id,
+            projectId: coordinationCall.project_id,
+            contextRevision: coordinationCall.context_revision,
+            status: "completed",
+            objectiveId,
+            turnId,
+            itemIds,
+            text: rawText,
+            artifacts: artifactManifest
+          }),
+          now,
+          now
+        );
+      }
+    }
+
     const objective = db.prepare(`
       SELECT next_outbox_sequence FROM objectives WHERE objective_id = ?
     `).get(objectiveId);
@@ -1521,7 +1927,11 @@ function createTransactions(db, nowProvider, idFactory) {
           target_snapshot_json, state, attempt_count, created_at_ms, updated_at_ms, event_record_id
         ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
       `).run(
-        deliveryId, objectiveId, chunk.semanticKey, sequence, canonicalJson(chunk),
+        deliveryId,
+        objectiveId,
+        chunk.semanticKey,
+        sequence,
+        canonicalJson(artifactManifest ? { ...chunk, artifacts: artifactManifest } : chunk),
         submission.target_snapshot_json, now, now, eventRecordId
       );
       outbox.push({ deliveryId, semanticKey: chunk.semanticKey, objectiveSequence: sequence });
@@ -1542,6 +1952,7 @@ function createTransactions(db, nowProvider, idFactory) {
       SET state = 'completed', state_rank = 2, next_outbox_sequence = ?, updated_at_ms = ?
       WHERE objective_id = ?
     `).run(sequence, now, objectiveId);
+    updateProjectLocalExchangeStatus(completedManifestRows, { state: "AVAILABLE", now: () => now });
     return {
       duplicate: false,
       status: "completed",
@@ -1691,7 +2102,7 @@ function createTransactions(db, nowProvider, idFactory) {
     const now = assertNow(nowProvider);
     const wireId = encodeWireRequestId(options.wireRequestId);
     const correlationKey = interactionCorrelationKey(options);
-    const requestJson = canonicalJson(options.request);
+    const requestJson = canonicalJson(options.request, { maximumBytes: MAX_INTERACTION_JSON_BYTES });
     const responderIdsJson = JSON.stringify(options.allowedResponderIds);
     const targetSnapshotJson = canonicalJson(options.targetSnapshot);
     const existing = db.prepare("SELECT * FROM pending_interactions WHERE correlation_key = ?").get(correlationKey);
@@ -1702,7 +2113,7 @@ function createTransactions(db, nowProvider, idFactory) {
           existing.target_snapshot_json !== targetSnapshotJson) {
         throw stateError("INTERACTION_IDENTITY_CONFLICT", "Interaction identity conflicts with durable state.");
       }
-      return { duplicate: true, interaction: mapInteractionRow(existing), outbox: [] };
+      return { duplicate: true, interaction: mapInteractionWithActions(db, existing), outbox: [] };
     }
     const wireMatch = db.prepare(`
       SELECT interaction_id FROM pending_interactions
@@ -1736,10 +2147,83 @@ function createTransactions(db, nowProvider, idFactory) {
       targetSnapshotJson, expiresAt, now, now
     );
 
-    const interaction = mapInteractionRow(
+    const actionSpecs = interactionActionSpecs(options.method, options.request);
+    const insertAction = db.prepare(`
+      INSERT INTO interaction_actions (
+        interaction_id, action_id, source_key, action_class, label, style,
+        answer_json, natural_alias_eligible, ordinal, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    for (const [ordinal, spec] of actionSpecs.entries()) {
+      insertAction.run(
+        interactionId,
+        assertId(idFactory, "interaction-action"),
+        spec.sourceKey,
+        spec.actionClass,
+        spec.label,
+        spec.style,
+        canonicalJson(spec.answer, { maximumBytes: MAX_INTERACTION_JSON_BYTES }),
+        spec.naturalAliasEligible ? 1 : 0,
+        ordinal,
+        now
+      );
+    }
+    const interaction = mapInteractionWithActions(
+      db,
       db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId)
     );
-    const prompt = validateInteractionPrompt(options.renderer({ interaction }));
+    let coordinationCall = db.prepare(`
+      SELECT * FROM codex_calls WHERE objective_id = ? AND turn_id = ?
+    `).get(options.objectiveId, options.turnId);
+    if (!coordinationCall) {
+      coordinationCall = db.prepare(`
+        SELECT * FROM codex_calls
+        WHERE objective_id = ? AND turn_id IS NULL
+          AND state IN ('CREATED', 'SUBMITTING', 'RUNNING', 'STATUS_UNVERIFIED')
+        ORDER BY created_at_ms, codex_call_id LIMIT 1
+      `).get(options.objectiveId);
+      if (coordinationCall) {
+        db.prepare("UPDATE codex_calls SET turn_id = ?, updated_at_ms = ? WHERE codex_call_id = ?")
+          .run(options.turnId, now, coordinationCall.codex_call_id);
+        coordinationCall = { ...coordinationCall, turn_id: options.turnId, updated_at_ms: now };
+      }
+    }
+    if (coordinationCall) {
+      db.prepare(`
+        INSERT INTO interaction_coordination (
+          interaction_id, work_request_id, topic_context_id, project_id,
+          invocation_origin, caller_principal_id, agent_session_id,
+          codex_conversation_id, codex_call_id, approver_set_id,
+          authorization_context_id, policy_decision, interaction_target_kind,
+          interaction_target_id, reply_token_sha256, context_revision, created_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'HUMAN_REQUIRED', ?, ?, ?, ?, ?)
+      `).run(
+        interactionId,
+        coordinationCall.work_request_id,
+        coordinationCall.topic_context_id,
+        coordinationCall.project_id,
+        coordinationCall.invocation_origin,
+        coordinationCall.caller_principal_id,
+        coordinationCall.agent_session_id,
+        coordinationCall.codex_conversation_id,
+        coordinationCall.codex_call_id,
+        coordinationCall.authorization_context_id,
+        coordinationCall.interaction_target_kind,
+        coordinationCall.interaction_target_id,
+        createHash("sha256").update(interactionId, "utf8").digest("hex"),
+        coordinationCall.context_revision,
+        now
+      );
+      db.prepare(`
+        UPDATE codex_calls SET state = 'WAITING_INTERACTION', updated_at_ms = ?
+        WHERE codex_call_id = ? AND state NOT IN ('COMPLETED', 'CANCELLED', 'FAILED')
+      `).run(now, coordinationCall.codex_call_id);
+      db.prepare(`
+        UPDATE work_requests SET state = 'WAITING_HUMAN', status_reason = 'codex_interaction', updated_at_ms = ?
+        WHERE work_request_id = ? AND state NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+      `).run(now, coordinationCall.work_request_id);
+    }
+    const rendered = validateInteractionRender(options.renderer({ interaction }));
     const eventRecordId = assertId(idFactory, "event");
     db.prepare(`
       INSERT INTO event_journal (
@@ -1753,28 +2237,59 @@ function createTransactions(db, nowProvider, idFactory) {
     );
     const objective = db.prepare("SELECT next_outbox_sequence FROM objectives WHERE objective_id = ?")
       .get(options.objectiveId);
-    const deliveryId = assertId(idFactory, "delivery");
-    db.prepare(`
+    const insertOutbox = db.prepare(`
       INSERT INTO zulip_outbox (
         delivery_id, objective_id, semantic_key, objective_sequence, payload_json,
         target_snapshot_json, state, attempt_count, created_at_ms, updated_at_ms, event_record_id
       ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
-    `).run(
-      deliveryId, options.objectiveId, prompt.semanticKey, objective.next_outbox_sequence,
-      canonicalJson(prompt.payload), targetSnapshotJson, now, now, eventRecordId
-    );
+    `);
+    const insertLink = db.prepare(`
+      INSERT INTO interaction_delivery_links (
+        delivery_id, interaction_id, role, chunk_index, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?)
+    `);
+    const outbox = [];
+    let actionPromptDeliveryId = null;
+    for (const [offset, delivery] of rendered.deliveries.entries()) {
+      const deliveryId = assertId(idFactory, "delivery");
+      const sequence = objective.next_outbox_sequence + offset;
+      insertOutbox.run(
+        deliveryId, options.objectiveId, delivery.semanticKey, sequence,
+        canonicalJson(delivery.payload, { maximumBytes: MAX_INTERACTION_JSON_BYTES }), targetSnapshotJson, now, now, eventRecordId
+      );
+      insertLink.run(deliveryId, interactionId, delivery.role, delivery.chunkIndex, now);
+      if (delivery.role === "action_prompt") actionPromptDeliveryId = deliveryId;
+      outbox.push({ deliveryId, semanticKey: delivery.semanticKey, objectiveSequence: sequence });
+    }
     db.prepare(`
-      UPDATE objectives SET next_outbox_sequence = next_outbox_sequence + 1, updated_at_ms = ?
+      UPDATE objectives SET next_outbox_sequence = next_outbox_sequence + ?, updated_at_ms = ?
       WHERE objective_id = ?
-    `).run(now, options.objectiveId);
+    `).run(rendered.deliveries.length, now, options.objectiveId);
+    const detailChunks = rendered.deliveries.filter((delivery) => delivery.role === "detail").length;
+    const detailState = detailChunks > 0 ? "detail_pending" : "not_required";
+    db.prepare(`
+      INSERT INTO interaction_details (
+        interaction_id, mode, content_sha256, content_bytes, chunk_count, document_id,
+        detail_state, delivered_at_ms, action_prompt_delivery_id, created_at_ms
+      ) VALUES (?, ?, ?, ?, ?, NULL, ?, NULL, ?, ?)
+    `).run(
+      interactionId,
+      rendered.detail.mode,
+      rendered.detail.contentSha256,
+      rendered.detail.contentBytes,
+      detailChunks,
+      detailState,
+      actionPromptDeliveryId,
+      now
+    );
     return {
       duplicate: false,
       interaction,
-      outbox: [{ deliveryId, semanticKey: prompt.semanticKey, objectiveSequence: objective.next_outbox_sequence }]
+      outbox
     };
   });
 
-  const commitInteractionAnswer = db.transaction(({ interactionId, responderId, targetSnapshot, answer }) => {
+  const commitInteractionAnswer = db.transaction(({ interactionId, responderId, targetSnapshot, answer, audit = null }) => {
     const row = db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId);
     if (!row) return { accepted: false, reason: "not_found", interaction: null };
     if (row.state === "orphaned") return { accepted: false, reason: "orphaned", interaction: mapInteractionRow(row) };
@@ -1787,7 +2302,7 @@ function createTransactions(db, nowProvider, idFactory) {
     if (row.target_snapshot_json !== canonicalJson(targetSnapshot)) {
       return { accepted: false, reason: "target_mismatch", interaction: mapInteractionRow(row) };
     }
-    const answerJson = canonicalJson(answer);
+    const answerJson = canonicalJson(answer, { maximumBytes: MAX_INTERACTION_JSON_BYTES });
     if (row.state === "answered") {
       return answerJson === row.answer_json
         ? { accepted: true, duplicate: true, interaction: mapInteractionRow(row) }
@@ -1817,6 +2332,64 @@ function createTransactions(db, nowProvider, idFactory) {
         interaction_id, answer_json, answered_by_id, answered_at_ms
       ) VALUES (?, ?, ?, ?)
     `).run(interactionId, answerJson, String(responderId), now);
+    if (audit !== null) {
+      const detail = db.prepare(`
+        SELECT content_sha256 FROM interaction_details WHERE interaction_id = ?
+      `).get(interactionId);
+      db.prepare(`
+        INSERT INTO interaction_settlement_audit (
+          interaction_id, action_id, action_class, resolution_source, source_type,
+          source_message_id, detail_sha256, responder_id, settled_at_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        interactionId,
+        audit.actionId ?? null,
+        audit.actionClass ?? null,
+        audit.resolutionSource,
+        audit.sourceType,
+        audit.sourceMessageId,
+        detail?.content_sha256 ?? createHash("sha256").update("", "utf8").digest("hex"),
+        responderId,
+        now
+      );
+    }
+    const prompt = db.prepare(`
+      SELECT outbox.acknowledged_zulip_message_id, outbox.event_record_id
+      FROM interaction_delivery_links AS link
+      JOIN zulip_outbox AS outbox USING (delivery_id)
+      WHERE link.interaction_id = ? AND link.role = 'action_prompt'
+    `).get(interactionId);
+    if (prompt?.acknowledged_zulip_message_id) {
+      const semanticKey = `interaction:${interactionId}:prompt:delete`;
+      const objective = db.prepare(`
+        SELECT next_outbox_sequence FROM objectives WHERE objective_id = ?
+      `).get(row.objective_id);
+      const deliveryId = assertId(idFactory, "delivery");
+      db.prepare(`
+        INSERT INTO zulip_outbox (
+          delivery_id, objective_id, semantic_key, objective_sequence, payload_json,
+          target_snapshot_json, state, attempt_count, created_at_ms, updated_at_ms, event_record_id
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+      `).run(
+        deliveryId,
+        row.objective_id,
+        semanticKey,
+        objective.next_outbox_sequence,
+        canonicalJson({
+          schemaVersion: 2,
+          kind: "interaction_prompt_delete",
+          zulipMessageId: prompt.acknowledged_zulip_message_id
+        }),
+        row.target_snapshot_json,
+        now,
+        now,
+        prompt.event_record_id
+      );
+      db.prepare(`
+        UPDATE objectives SET next_outbox_sequence = next_outbox_sequence + 1, updated_at_ms = ?
+        WHERE objective_id = ?
+      `).run(now, row.objective_id);
+    }
     return {
       accepted: true,
       duplicate: false,
@@ -1843,7 +2416,130 @@ function createTransactions(db, nowProvider, idFactory) {
     return mapInteractionRow(db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId));
   });
 
-  const recordInteractionResponseDelivery = db.transaction(({ interactionId, state }) => {
+  function recordInteractionStatusUnverified(row, reason, currentTime) {
+    const coordination = db.prepare(`
+      SELECT coordination.*, call.report_target_kind, call.report_target_id,
+        call.state AS call_state
+      FROM interaction_coordination AS coordination
+      JOIN codex_calls AS call USING (codex_call_id)
+      WHERE coordination.interaction_id = ?
+    `).get(row.interaction_id);
+    if (!coordination) return { notified: false, targetKind: null };
+
+    db.prepare(`
+      UPDATE codex_calls SET state = 'STATUS_UNVERIFIED', updated_at_ms = ?
+      WHERE codex_call_id = ? AND state NOT IN ('COMPLETED', 'CANCELLED', 'FAILED')
+    `).run(currentTime, coordination.codex_call_id);
+    db.prepare(`
+      UPDATE work_requests
+      SET state = 'STATUS_UNVERIFIED', status_reason = ?, updated_at_ms = ?
+      WHERE work_request_id = ? AND state NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+    `).run(reason, currentTime, coordination.work_request_id);
+
+    const semanticKey = `interaction-status:${row.interaction_id}`;
+    const payload = {
+      schemaVersion: 1,
+      kind: "InteractionStatusNotice",
+      workRequestId: coordination.work_request_id,
+      codexCallId: coordination.codex_call_id,
+      interactionId: row.interaction_id,
+      status: "STATUS_UNVERIFIED",
+      reason,
+      answerState: row.state === "answered" ? "settled_outcome_unverified" : "not_settled",
+      nextAction: "caller_reconcile"
+    };
+    const payloadJson = canonicalJson(payload);
+    let targetKind = null;
+    let targetId = coordination.report_target_id;
+    let notificationState = "QUEUED";
+
+    if (coordination.report_target_kind === "ZULIP") {
+      const event = db.prepare(`
+        SELECT outbox.event_record_id
+        FROM interaction_delivery_links AS link
+        JOIN zulip_outbox AS outbox USING (delivery_id)
+        WHERE link.interaction_id = ?
+        ORDER BY CASE link.role WHEN 'action_prompt' THEN 0 ELSE 1 END, outbox.objective_sequence
+        LIMIT 1
+      `).get(row.interaction_id);
+      const objective = db.prepare(`
+        SELECT next_outbox_sequence FROM objectives WHERE objective_id = ?
+      `).get(row.objective_id);
+      if (event && objective) {
+        const existing = db.prepare("SELECT delivery_id FROM zulip_outbox WHERE semantic_key = ?")
+          .get(semanticKey);
+        if (!existing) {
+          db.prepare(`
+            INSERT INTO zulip_outbox (
+              delivery_id, objective_id, semantic_key, objective_sequence, payload_json,
+              target_snapshot_json, state, attempt_count, created_at_ms, updated_at_ms,
+              event_record_id
+            ) VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+          `).run(
+            assertId(idFactory, "delivery"), row.objective_id, semanticKey,
+            objective.next_outbox_sequence,
+            canonicalJson({
+              schemaVersion: 1,
+              kind: "interaction_status_notice",
+              content: "Codex could not verify the approval handoff outcome. The answer was not resent; caller reconciliation is required."
+            }),
+            row.target_snapshot_json,
+            currentTime,
+            currentTime,
+            event.event_record_id
+          );
+          db.prepare(`
+            UPDATE objectives SET next_outbox_sequence = next_outbox_sequence + 1, updated_at_ms = ?
+            WHERE objective_id = ?
+          `).run(currentTime, row.objective_id);
+        }
+        targetKind = "ZULIP";
+      }
+    } else if (["JARVIS_MAILBOX", "AGENT_MAILBOX"].includes(coordination.report_target_kind)) {
+      targetKind = coordination.report_target_kind === "AGENT_MAILBOX" ? "AGENT" : "JARVIS";
+      db.prepare(`
+        INSERT INTO coordination_mailbox (
+          mailbox_item_id, target_kind, target_id, work_request_id, codex_call_id,
+          item_type, semantic_key, payload_json, state, attempt_count, lease_owner,
+          lease_token, lease_expires_at_ms, created_at_ms, updated_at_ms,
+          acknowledged_at_ms, last_error
+        ) VALUES (?, ?, ?, ?, ?, 'STATUS_NOTICE', ?, ?, 'PENDING', 0,
+          NULL, NULL, NULL, ?, ?, NULL, NULL)
+        ON CONFLICT(semantic_key) DO NOTHING
+      `).run(
+        assertId(idFactory, "mailbox-item"), targetKind, targetId,
+        coordination.work_request_id, coordination.codex_call_id,
+        semanticKey, payloadJson, currentTime, currentTime
+      );
+    }
+
+    if (targetKind === null) {
+      targetKind = "OPERATOR";
+      targetId = coordination.project_id;
+      notificationState = "FAILED";
+      db.prepare(`
+        UPDATE work_requests
+        SET state = 'DEGRADED_PENDING_OPERATOR', status_reason = 'interaction_status_notice_unroutable',
+          updated_at_ms = ?
+        WHERE work_request_id = ? AND state NOT IN ('COMPLETED', 'PARTIAL', 'FAILED', 'CANCELLED')
+      `).run(currentTime, coordination.work_request_id);
+    }
+    db.prepare(`
+      INSERT INTO notification_ledger (
+        notification_id, work_request_id, semantic_key, target_kind, target_id,
+        event_class, payload_sha256, state, created_at_ms, updated_at_ms
+      ) VALUES (?, ?, ?, ?, ?, 'INTERACTION_STATUS_UNVERIFIED', ?, ?, ?, ?)
+      ON CONFLICT(semantic_key) DO NOTHING
+    `).run(
+      assertId(idFactory, "notification"), coordination.work_request_id,
+      `notification:${semanticKey}`, targetKind, targetId,
+      createHash("sha256").update(payloadJson, "utf8").digest("hex"),
+      notificationState, currentTime, currentTime
+    );
+    return { notified: notificationState === "QUEUED", targetKind };
+  }
+
+  const recordInteractionResponseDelivery = db.transaction(({ interactionId, leaseToken, state }) => {
     const row = db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId);
     if (!row || row.state !== "answered") {
       throw stateError("INTERACTION_RESPONSE_STATE_INVALID", "Interaction response delivery state is invalid.");
@@ -1857,17 +2553,103 @@ function createTransactions(db, nowProvider, idFactory) {
     if (!allowed[row.response_delivery_state]?.has(state)) {
       throw stateError("INTERACTION_RESPONSE_STATE_INVALID", "Interaction response delivery state is invalid.");
     }
+    const lease = db.prepare(`
+      SELECT lease_token FROM resource_leases
+      WHERE resource_type = 'interaction_response' AND resource_id = ?
+    `).get(interactionId);
+    if (!lease || lease.lease_token !== leaseToken) {
+      throw stateError("INTERACTION_RESPONSE_LEASE_STALE", "Interaction response lease token is stale.");
+    }
     const now = assertNow(nowProvider);
     db.prepare(`
       UPDATE pending_interactions
       SET response_delivery_state = ?, response_delivery_updated_at_ms = ?, updated_at_ms = ?
       WHERE interaction_id = ?
     `).run(state, now, now, interactionId);
+    db.prepare(`
+      DELETE FROM resource_leases WHERE resource_type = 'interaction_response' AND resource_id = ?
+    `).run(interactionId);
+    if (state === "uncertain") {
+      recordInteractionStatusUnverified(row, "interaction_response_outcome_unverified", now);
+    }
+    if (state === "delivered") {
+      const coordination = db.prepare(`
+        SELECT * FROM interaction_coordination WHERE interaction_id = ?
+      `).get(interactionId);
+      if (coordination) {
+        db.prepare(`
+          UPDATE codex_calls SET state = 'RUNNING', updated_at_ms = ?
+          WHERE codex_call_id = ? AND state = 'WAITING_INTERACTION'
+        `).run(now, coordination.codex_call_id);
+        db.prepare(`
+          UPDATE work_requests SET state = 'WAITING_CODEX', status_reason = NULL, updated_at_ms = ?
+          WHERE work_request_id = ? AND state = 'WAITING_HUMAN'
+        `).run(now, coordination.work_request_id);
+      }
+    }
     return mapInteractionRow(db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId));
   });
 
+  const claimInteractionResponse = db.transaction(({ interactionId, leaseOwner }) => {
+    const now = assertNow(nowProvider);
+    const row = db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId);
+    if (!row || row.state !== "answered") {
+      throw stateError("INTERACTION_RESPONSE_STATE_INVALID", "Interaction response delivery state is invalid.");
+    }
+    if (row.response_delivery_state === "delivered" || row.response_delivery_state === "uncertain") {
+      return { acquired: false, state: row.response_delivery_state, interaction: mapInteractionRow(row) };
+    }
+    const existing = db.prepare(`
+      SELECT * FROM resource_leases WHERE resource_type = 'interaction_response' AND resource_id = ?
+    `).get(interactionId);
+    if (existing) {
+      if (existing.expires_at_ms <= now) {
+        db.prepare(`
+          UPDATE pending_interactions
+          SET response_delivery_state = 'uncertain', response_delivery_updated_at_ms = ?, updated_at_ms = ?
+          WHERE interaction_id = ?
+        `).run(now, now, interactionId);
+        db.prepare(`
+          DELETE FROM resource_leases WHERE resource_type = 'interaction_response' AND resource_id = ?
+        `).run(interactionId);
+        recordInteractionStatusUnverified(row, "interaction_response_lease_expired", now);
+        return {
+          acquired: false,
+          state: "uncertain",
+          interaction: mapInteractionRow(db.prepare("SELECT * FROM pending_interactions WHERE interaction_id = ?").get(interactionId))
+        };
+      }
+      return { acquired: false, state: "in_progress", interaction: mapInteractionRow(row) };
+    }
+    const leaseToken = assertId(idFactory, "interaction-response-lease");
+    db.prepare(`
+      INSERT INTO resource_leases (
+        resource_type, resource_id, lease_owner, lease_token, acquired_at_ms, expires_at_ms
+      ) VALUES ('interaction_response', ?, ?, ?, ?, ?)
+    `).run(interactionId, leaseOwner, leaseToken, now, now + INTERACTION_RESPONSE_LEASE_MS);
+    return { acquired: true, state: row.response_delivery_state, leaseToken, interaction: mapInteractionRow(row) };
+  });
+
+  const deleteOrphanedInteractionResponseLeases = db.prepare(`
+    DELETE FROM resource_leases
+    WHERE resource_type = 'interaction_response'
+      AND resource_id IN (
+        SELECT interaction_id
+        FROM pending_interactions
+        WHERE connection_id = ? AND state = 'orphaned'
+      )
+  `);
+
   const orphanInteractions = db.transaction(({ connectionId }) => {
     const now = assertNow(nowProvider);
+    const candidates = db.prepare(`
+      SELECT * FROM pending_interactions
+      WHERE connection_id = ?
+        AND (
+          state = 'pending'
+          OR (state = 'answered' AND response_delivery_state IN ('pending', 'retryable', 'uncertain'))
+        )
+    `).all(connectionId);
     const result = db.prepare(`
       UPDATE pending_interactions
       SET state = 'orphaned', answer_json = NULL, partial_answers_json = NULL, answered_by_id = NULL,
@@ -1878,11 +2660,158 @@ function createTransactions(db, nowProvider, idFactory) {
           OR (state = 'answered' AND response_delivery_state IN ('pending', 'retryable', 'uncertain'))
         )
     `).run(now, connectionId);
+    deleteOrphanedInteractionResponseLeases.run(connectionId);
+    for (const candidate of candidates) {
+      recordInteractionStatusUnverified(candidate, "interaction_orphaned", now);
+    }
     return { connectionId, orphaned: result.changes };
+  });
+
+  const resolveNaturalInteraction = db.transaction(({ binding, intent, normalizedAlias }) => {
+    const sourceType = "zulip-interaction-reply";
+    const sourceId = String(binding.sourceMessageId);
+    const existing = db.prepare(`
+      SELECT event_name, payload_json FROM event_journal WHERE source_type = ? AND source_id = ?
+    `).get(sourceType, sourceId);
+    if (existing) {
+      if (existing.event_name !== "interaction.natural_reply_resolved") {
+        throw stateError("INTERACTION_REPLY_SOURCE_CONFLICT", "Interaction reply source was already consumed.");
+      }
+      const payload = JSON.parse(existing.payload_json);
+      if (payload.intent !== intent || payload.normalizedAlias !== normalizedAlias ||
+          canonicalJson(payload.binding) !== canonicalJson(binding)) {
+        throw stateError("INTERACTION_REPLY_SOURCE_CONFLICT", "Interaction reply source conflicts with durable state.");
+      }
+      return { ...payload.outcome, duplicate: true };
+    }
+
+    const now = assertNow(nowProvider);
+    const candidates = [];
+    {
+      const allowedClasses = intent === "allow"
+        ? new Set(["one_time_allow", "file_change_allow"])
+        : new Set(["deny"]);
+      const rows = db.prepare(`
+        SELECT interaction.*, action.action_id, action.action_class, action.answer_json
+          , action.source_key, action.ordinal
+        FROM pending_interactions AS interaction
+        JOIN interaction_actions AS action USING (interaction_id)
+        JOIN interaction_details AS detail USING (interaction_id)
+        WHERE interaction.state = 'pending' AND interaction.expires_at_ms > ?
+          AND action.natural_alias_eligible = 1
+          AND (detail.chunk_count = 0 OR detail.detail_state = 'delivered')
+        ORDER BY interaction.created_at_ms, interaction.interaction_id, action.ordinal
+      `).all(now);
+      const matching = [];
+      for (const row of rows) {
+        const target = JSON.parse(row.target_snapshot_json);
+        const responders = JSON.parse(row.allowed_responder_ids_json);
+        if (allowedClasses.has(row.action_class) && target.platform === "zulip" &&
+            target.streamId === binding.streamId && target.topic === binding.topic &&
+            responders.includes(binding.senderId)) {
+          matching.push({
+            interactionId: row.interaction_id,
+            actionId: row.action_id,
+            actionClass: row.action_class,
+            sourceKey: row.source_key,
+            answer: JSON.parse(row.answer_json),
+            objectiveId: row.objective_id,
+            targetSnapshot: target
+          });
+        }
+      }
+      if (intent === "allow") {
+        candidates.push(...matching);
+      } else {
+        const cancelAlias = normalizedAlias === "取消" || normalizedAlias === "cancel";
+        const byInteraction = new Map();
+        for (const candidate of matching) {
+          const list = byInteraction.get(candidate.interactionId) ?? [];
+          list.push(candidate);
+          byInteraction.set(candidate.interactionId, list);
+        }
+        for (const actions of byInteraction.values()) {
+          const preferredKeys = cancelAlias ? ["cancel", "decline", "deny"] : ["decline", "deny", "cancel"];
+          const selected = preferredKeys
+            .map((key) => actions.find((action) => action.sourceKey.toLowerCase() === key))
+            .find(Boolean) ?? (actions.length === 1 ? actions[0] : null);
+          if (selected) candidates.push(selected);
+        }
+      }
+    }
+    let outcome;
+    if (candidates.length === 0) {
+      outcome = { status: "not_applicable" };
+    } else if (candidates.length > 1) {
+      outcome = {
+        status: "ambiguous",
+        candidateInteractionIds: [...new Set(candidates.map(({ interactionId }) => interactionId))]
+      };
+    } else {
+      outcome = { status: "selected", ...candidates[0] };
+      const answerJson = canonicalJson(outcome.answer, { maximumBytes: MAX_INTERACTION_JSON_BYTES });
+      const settled = db.prepare(`
+        UPDATE pending_interactions
+        SET state = 'answered', answer_json = ?, answered_by_id = ?, answered_at_ms = ?,
+            partial_answers_json = NULL, response_delivery_state = 'pending',
+            response_delivery_updated_at_ms = ?, updated_at_ms = ?
+        WHERE interaction_id = ? AND state = 'pending'
+      `).run(answerJson, String(binding.senderId), now, now, now, outcome.interactionId);
+      if (settled.changes !== 1) {
+        throw stateError("INTERACTION_ANSWER_CONFLICT", "Interaction is no longer pending.");
+      }
+      db.prepare(`
+        INSERT INTO interaction_answer_settlements (
+          interaction_id, answer_json, answered_by_id, answered_at_ms
+        ) VALUES (?, ?, ?, ?)
+      `).run(outcome.interactionId, answerJson, String(binding.senderId), now);
+      const detail = db.prepare(`
+        SELECT content_sha256 FROM interaction_details WHERE interaction_id = ?
+      `).get(outcome.interactionId);
+      db.prepare(`
+        INSERT INTO interaction_settlement_audit (
+          interaction_id, action_id, action_class, resolution_source, source_type,
+          source_message_id, detail_sha256, responder_id, settled_at_ms
+        ) VALUES (?, ?, ?, 'natural_alias', ?, ?, ?, ?, ?)
+      `).run(
+        outcome.interactionId,
+        outcome.actionId,
+        outcome.actionClass,
+        sourceType,
+        sourceId,
+        detail.content_sha256,
+        binding.senderId,
+        now
+      );
+    }
+    const eventRecordId = assertId(idFactory, "event");
+    db.prepare(`
+      INSERT INTO event_journal (
+        event_record_id, source_type, source_id, received_at_ms, event_schema_version,
+        event_name, event_mode, payload_json, integrity_json, objective_id
+      ) VALUES (?, ?, ?, ?, 1, 'interaction.natural_reply_resolved', 'normal', ?, ?, ?)
+    `).run(
+      eventRecordId,
+      sourceType,
+      sourceId,
+      now,
+      canonicalJson({ binding, intent, normalizedAlias, outcome }),
+      canonicalJson({}),
+      outcome.objectiveId ?? null
+    );
+    return { ...outcome, duplicate: false };
   });
 
   const markConnectionLost = db.transaction(({ connectionId }) => {
     const now = assertNow(nowProvider);
+    const interactionCandidates = db.prepare(`
+      SELECT * FROM pending_interactions
+      WHERE connection_id = ?
+        AND (
+          state = 'pending'
+          OR (state = 'answered' AND response_delivery_state IN ('pending', 'retryable', 'uncertain'))
+        )
+    `).all(connectionId);
     const activeExecutions = db.prepare(`
       SELECT objective_id, execution_status FROM objective_execution
       WHERE backend = 'app-server'
@@ -1929,6 +2858,10 @@ function createTransactions(db, nowProvider, idFactory) {
           OR (state = 'answered' AND response_delivery_state IN ('pending', 'retryable', 'uncertain'))
         )
     `).run(now, connectionId).changes;
+    deleteOrphanedInteractionResponseLeases.run(connectionId);
+    for (const candidate of interactionCandidates) {
+      recordInteractionStatusUnverified(candidate, "app_server_connection_lost", now);
+    }
     return { affectedObjectives: activeExecutions.length, orphanedInteractions: orphaned };
   });
 
@@ -1939,6 +2872,7 @@ function createTransactions(db, nowProvider, idFactory) {
     bindBackendObjective,
     bumpControlGeneration,
     claimOutbox,
+    claimInteractionResponse,
     completeTurn,
     commitInteractionAnswer,
     confirmCancellation,
@@ -1956,6 +2890,7 @@ function createTransactions(db, nowProvider, idFactory) {
     prepareTurnSubmission,
     recordInteractionResponseDelivery,
     recordTurnAuditFact,
+    resolveNaturalInteraction,
     reconcileTerminalTurn,
     reconcileTurnSubmission,
     requestCancellation,
@@ -1968,8 +2903,15 @@ function createTransactions(db, nowProvider, idFactory) {
   };
 }
 
-export function openStore({ databasePath, now = Date.now, idFactory = (kind) => `${kind}-${randomUUID()}`, migrations = MIGRATIONS } = {}) {
-  if (!requireText(databasePath) || typeof now !== "function" || typeof idFactory !== "function") {
+export function openStore({
+  databasePath,
+  now = Date.now,
+  idFactory = (kind) => `${kind}-${randomUUID()}`,
+  fileAttemptIdFactory,
+  migrations = MIGRATIONS
+} = {}) {
+  if (!requireText(databasePath) || typeof now !== "function" || typeof idFactory !== "function" ||
+      (fileAttemptIdFactory !== undefined && typeof fileAttemptIdFactory !== "function")) {
     throw stateError("STORE_OPTIONS_INVALID", "Store options are invalid.");
   }
 
@@ -1995,8 +2937,12 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
   }
 
   const transactions = createTransactions(db, now, idFactory);
+  const coordination = createCoordinationStore(db, { now, idFactory });
+  const fileExchange = createManagedFileExchangeState(db, { now, idFactory, fileAttemptIdFactory });
   let closed = false;
   return Object.freeze({
+    ...coordination,
+    ...fileExchange,
     ingest(fact) {
       const validated = validateFact(fact);
       return transactions.ingest.immediate(validated);
@@ -2240,6 +3186,13 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
       }
       return transactions.markSubmissionUnknown.immediate(options);
     },
+    rollbackSubmissionUnknown(options) {
+      if (!isPlainObject(options) || Object.keys(options).sort().join(",") !== "submissionId" ||
+          !requireText(options.submissionId)) {
+        throw stateError("TURN_SUBMISSION_ROLLBACK_INVALID", "Turn submission rollback is invalid.");
+      }
+      return transactions.rollbackSubmissionUnknown.immediate(options);
+    },
     markTurnReconciliationNeeded(options) {
       if (options === null || typeof options !== "object" ||
           !requireText(options.objectiveId) || !requireText(options.turnId)) {
@@ -2335,7 +3288,13 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
     commitInteractionAnswer(options) {
       if (options === null || typeof options !== "object" || !requireText(options.interactionId) ||
           !Number.isSafeInteger(options.responderId) || options.responderId <= 0 ||
-          !isPlainObject(options.targetSnapshot) || !isPlainObject(options.answer)) {
+          !isPlainObject(options.targetSnapshot) || !isPlainObject(options.answer) ||
+          (options.audit !== undefined && options.audit !== null &&
+            (!isPlainObject(options.audit) ||
+             !["legacy_command", "explicit_action", "natural_alias", "answer_command", "app_server_ui"].includes(options.audit.resolutionSource) ||
+             !requireText(options.audit.sourceType) || !requireText(options.audit.sourceMessageId) ||
+             (options.audit.actionId !== null && options.audit.actionId !== undefined && !requireText(options.audit.actionId)) ||
+             (options.audit.actionClass !== null && options.audit.actionClass !== undefined && !requireText(options.audit.actionClass))))) {
         throw stateError("INTERACTION_ANSWER_INVALID", "Interaction answer is invalid.");
       }
       return transactions.commitInteractionAnswer.immediate(options);
@@ -2349,10 +3308,27 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
     },
     recordInteractionResponseDelivery(options) {
       if (options === null || typeof options !== "object" || !requireText(options.interactionId) ||
-          !["retryable", "uncertain", "delivered"].includes(options.state)) {
+          !requireText(options.leaseToken) || !["retryable", "uncertain", "delivered"].includes(options.state)) {
         throw stateError("INTERACTION_RESPONSE_STATE_INVALID", "Interaction response delivery state is invalid.");
       }
       return transactions.recordInteractionResponseDelivery.immediate(options);
+    },
+    claimInteractionResponse(options) {
+      if (!isPlainObject(options) || !requireText(options.interactionId) || !requireText(options.leaseOwner)) {
+        throw stateError("INTERACTION_RESPONSE_STATE_INVALID", "Interaction response delivery claim is invalid.");
+      }
+      return transactions.claimInteractionResponse.immediate(options);
+    },
+    resolveNaturalInteraction(options) {
+      if (!isPlainObject(options) || !isPlainObject(options.binding) ||
+          !Number.isSafeInteger(options.binding.streamId) || options.binding.streamId <= 0 ||
+          typeof options.binding.topic !== "string" || !options.binding.topic ||
+          !Number.isSafeInteger(options.binding.sourceMessageId) || options.binding.sourceMessageId <= 0 ||
+          !Number.isSafeInteger(options.binding.senderId) || options.binding.senderId <= 0 ||
+          !["allow", "deny"].includes(options.intent) || !requireText(options.normalizedAlias)) {
+        throw stateError("INTERACTION_NATURAL_REPLY_INVALID", "Natural interaction reply is invalid.");
+      }
+      return transactions.resolveNaturalInteraction.immediate(options);
     },
     orphanInteractions(options) {
       if (options === null || typeof options !== "object" || !requireText(options.connectionId)) {
@@ -2362,7 +3338,7 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
     },
     readInteraction(interactionId) {
       if (!requireText(interactionId)) throw stateError("INTERACTION_READ_INVALID", "Interaction read is invalid.");
-      return mapInteractionRow(
+      return mapInteractionWithActions(db,
         db.prepare(`
           SELECT interaction.*,
             settlement.answer_json AS settlement_answer_json,
@@ -2373,6 +3349,39 @@ export function openStore({ databasePath, now = Date.now, idFactory = (kind) => 
           WHERE interaction.interaction_id = ?
         `).get(interactionId)
       );
+    },
+    readInteractionDetail(interactionId) {
+      if (!requireText(interactionId)) throw stateError("INTERACTION_READ_INVALID", "Interaction read is invalid.");
+      const row = db.prepare("SELECT * FROM interaction_details WHERE interaction_id = ?").get(interactionId);
+      if (!row) return null;
+      return {
+        interactionId: row.interaction_id,
+        mode: row.mode,
+        contentSha256: row.content_sha256,
+        contentBytes: row.content_bytes,
+        chunkCount: row.chunk_count,
+        state: row.detail_state,
+        deliveredAt: row.delivered_at_ms,
+        actionPromptDeliveryId: row.action_prompt_delivery_id
+      };
+    },
+    readInteractionSettlementAudit(interactionId) {
+      if (!requireText(interactionId)) throw stateError("INTERACTION_READ_INVALID", "Interaction read is invalid.");
+      const row = db.prepare(`
+        SELECT * FROM interaction_settlement_audit WHERE interaction_id = ?
+      `).get(interactionId);
+      if (!row) return null;
+      return {
+        interactionId: row.interaction_id,
+        actionId: row.action_id,
+        actionClass: row.action_class,
+        resolutionSource: row.resolution_source,
+        sourceType: row.source_type,
+        sourceMessageId: row.source_message_id,
+        detailSha256: row.detail_sha256,
+        responderId: row.responder_id,
+        settledAt: row.settled_at_ms
+      };
     },
     readTurnSubmission(objectiveId, turnId) {
       if (!requireText(objectiveId) || !requireText(turnId)) {

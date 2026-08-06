@@ -1,9 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import { renderFinal } from "./delivery/renderer.js";
 import { requestMayHaveBeenWritten, validateExecutionBackend } from "./execution/backend.js";
 import { findTurnByClientId, findTurnById, isTerminalTurn, reduceTerminalOutput } from "./recovery.js";
-import { stateError } from "./state/reducer.js";
+import { isStateError, stateError } from "./state/reducer.js";
 
 const OWNED_ERRORS = new WeakSet();
 const INTERACTION_METHODS = new Set([
@@ -12,20 +12,15 @@ const INTERACTION_METHODS = new Set([
   "item/tool/requestUserInput"
 ]);
 const MAX_CONTENT_UTF8_BYTES = 60_000;
+const INTERACTION_DETAIL_CHUNK_BYTES = 44 * 1024;
+const MAX_INTERACTION_DETAIL_CHUNKS = 16;
+const MAX_INTERACTION_DETAIL_BYTES = 8 * 1024 * 1024;
 const MAX_CLI_TOKEN_UTF8_BYTES = 256;
 const MAX_COMPACT_LABEL_UTF8_BYTES = 100;
-const EXTENDED_PERMISSION_FIELDS = [
-  "networkApprovalContext",
-  "additionalPermissions",
-  "proposedNetworkPolicyAmendments",
-  "proposedExecpolicyAmendment",
-  "grantRoot"
-];
 const APPROVAL_METHODS = new Set([
   "item/commandExecution/requestApproval",
   "item/fileChange/requestApproval"
 ]);
-const SAFE_APPROVAL_KEYS = new Set(["decline", "cancel"]);
 
 function byteLength(text) {
   return Buffer.byteLength(String(text), "utf8");
@@ -81,38 +76,183 @@ function codeSpan(value) {
   return `${fence}${inner}${fence}`;
 }
 
+function splitUtf8(value, maximumBytes) {
+  const chunks = [];
+  let current = "";
+  let currentBytes = 0;
+  for (const character of String(value)) {
+    const characterBytes = byteLength(character);
+    if (current && currentBytes + characterBytes > maximumBytes) {
+      const newline = current.lastIndexOf("\n");
+      if (newline >= Math.floor(current.length / 2)) {
+        chunks.push(current.slice(0, newline + 1));
+        current = current.slice(newline + 1) + character;
+        currentBytes = byteLength(current);
+      } else {
+        chunks.push(current);
+        current = character;
+        currentBytes = characterBytes;
+      }
+    } else {
+      current += character;
+      currentBytes += characterBytes;
+    }
+  }
+  if (current || chunks.length === 0) chunks.push(current);
+  return chunks;
+}
+
+function approvalDetail(interaction) {
+  const request = isPlainObject(interaction.request) ? interaction.request : {};
+  const parts = [
+    `交互 ID: ${interaction.interactionId}`,
+    `类型: ${interaction.method}`,
+    `过期时间(ms): ${interaction.expiresAt}`
+  ];
+  if (interaction.approvalId) parts.push(`审批 ID: ${interaction.approvalId}`);
+  if (interaction.itemId) parts.push(`项目项 ID: ${interaction.itemId}`);
+  if (typeof request.reason === "string" && request.reason) parts.push(`原因:\n${request.reason}`);
+  if (typeof request.cwd === "string" && request.cwd) parts.push(`工作目录:\n${request.cwd}`);
+  if (typeof request.command === "string" && request.command) parts.push(`待审批命令:\n${request.command}`);
+  if (request.proposedExecpolicyAmendment !== undefined) {
+    parts.push(`命令策略变更建议:\n${JSON.stringify(request.proposedExecpolicyAmendment, null, 2)}`);
+  }
+  if (request.proposedNetworkPolicyAmendments !== undefined || request.networkApprovalContext !== undefined) {
+    parts.push(`网络权限上下文:\n${JSON.stringify({
+      networkApprovalContext: request.networkApprovalContext,
+      proposedNetworkPolicyAmendments: request.proposedNetworkPolicyAmendments
+    }, null, 2)}`);
+  }
+  const complexDecisions = interaction.actions
+    .filter((action) => ["policy_change", "network_policy_change"].includes(action.actionClass))
+    .map((action) => ({ label: action.label, sourceKey: action.sourceKey, answer: action.answer }));
+  if (complexDecisions.length > 0) parts.push(`策略类选项完整内容:\n${JSON.stringify(complexDecisions, null, 2)}`);
+  return parts.join("\n\n");
+}
+
+function structuredApprovalRender(interaction) {
+  const detailContent = approvalDetail(interaction);
+  const detailBytes = byteLength(detailContent);
+  if (detailBytes > MAX_INTERACTION_DETAIL_BYTES) {
+    throw controllerError("INTERACTION_DETAIL_TOO_LARGE", "Interaction detail exceeds the configured hard limit.");
+  }
+  const detailSha256 = createHash("sha256").update(detailContent, "utf8").digest("hex");
+  const chunks = splitUtf8(detailContent, INTERACTION_DETAIL_CHUNK_BYTES);
+  const shortId = truncateUtf8(interaction.interactionId, 48);
+  const documentMode = chunks.length > MAX_INTERACTION_DETAIL_CHUNKS;
+  const detailMode = documentMode ? "document" : (chunks.length === 1 ? "inline" : "chunks");
+  const deliveries = documentMode
+    ? [{
+        semanticKey: `interaction:${interaction.interactionId}:document:${detailSha256.slice(0, 12)}`,
+        role: "detail",
+        chunkIndex: 0,
+        payload: {
+          schemaVersion: 2,
+          kind: "interaction_document",
+          content: [
+            `[interaction ${shortId} detail document sha256:${detailSha256.slice(0, 16)}]`,
+            "",
+            "完整审批详情见随附 Markdown 文档。"
+          ].join("\n"),
+          document: {
+            schemaVersion: 1,
+            kind: "interaction_detail",
+            displayName: `interaction-${detailSha256.slice(0, 12)}-approval.md`,
+            mimeType: "text/markdown",
+            bytes: detailBytes,
+            sha256: detailSha256,
+            textContent: detailContent
+          }
+        }
+      }]
+    : chunks.map((chunk, index) => ({
+        semanticKey: `interaction:${interaction.interactionId}:detail:${index}:${detailSha256.slice(0, 12)}`,
+        role: "detail",
+        chunkIndex: index,
+        payload: {
+          schemaVersion: 2,
+          kind: "interaction_detail",
+          content: [
+            `[interaction ${shortId} detail ${index + 1}/${chunks.length} sha256:${detailSha256.slice(0, 16)}]`,
+            "",
+            ...fencedCodeBlock(chunk)
+          ].join("\n")
+        }
+      }));
+  const safeInteractionId = isSafeCliToken(interaction.interactionId);
+  const visibleActions = safeInteractionId
+    ? interaction.actions.filter((action) => isSafeCliToken(action.actionId))
+    : [];
+  const lines = [
+    "⚠️ **审批请求**",
+    "",
+    `交互: ${codeSpan(interaction.interactionId)}`,
+    `详情 SHA-256: ${codeSpan(detailSha256)}`,
+    `过期时间(ms): ${interaction.expiresAt}`,
+    "",
+    "**可选操作**（在本话题回复）:"
+  ];
+  for (const action of visibleActions) {
+    lines.push(`- ${escapeMarkdownInline(action.label)}: \`/codex interact ${interaction.interactionId} ${action.actionId}\``);
+    if (isSafeCliToken(action.sourceKey) &&
+        !["policy_change", "network_policy_change"].includes(action.actionClass)) {
+      lines.push(`  兼容命令: \`/codex approve ${interaction.interactionId} ${action.sourceKey}\``);
+    }
+  }
+  if (visibleActions.length === 0) lines.push("- 请通过 App Server UI 操作。");
+  const actionPayload = {
+    schemaVersion: 2,
+    kind: "interaction_request",
+    content: lines.join("\n"),
+    interaction: {
+      interactionId: interaction.interactionId,
+      interactionType: interaction.method === "item/fileChange/requestApproval"
+        ? "file_change_approval"
+        : "command_approval",
+      objectiveId: interaction.objectiveId,
+      expiresAt: interaction.expiresAt,
+      detail: {
+        mode: detailMode,
+        bytes: detailBytes,
+        sha256: detailSha256,
+        state: "delivered"
+      },
+      actions: visibleActions.map((action) => ({
+        actionId: action.actionId,
+        label: action.label,
+        style: action.style,
+        class: action.actionClass,
+        naturalAliasEligible: action.naturalAliasEligible
+      }))
+    }
+  };
+  if (visibleActions.length > 0) {
+    actionPayload.ui = {
+      type: "choices",
+      heading: "请选择本次操作",
+      actionIds: visibleActions.map((action) => action.actionId)
+    };
+  }
+  deliveries.push({
+    semanticKey: `interaction:${interaction.interactionId}:prompt:${detailSha256.slice(0, 12)}`,
+    role: "action_prompt",
+    chunkIndex: null,
+    payload: actionPayload
+  });
+  return {
+    detail: {
+      mode: detailMode,
+      contentSha256: detailSha256,
+      contentBytes: detailBytes
+    },
+    deliveries
+  };
+}
+
 function isSafeCliToken(value) {
   return typeof value === "string" && value.length > 0 &&
     byteLength(value) <= MAX_CLI_TOKEN_UTF8_BYTES &&
     !/[\s\x00-\x1F\x7F\x85`"'<>[\]{}()|;\\/]/u.test(value);
-}
-
-function approvalChoiceKey(decision) {
-  if (typeof decision === "string") return decision;
-  if (isPlainObject(decision)) {
-    const keys = Object.keys(decision);
-    if (keys.length === 1 && typeof keys[0] === "string") return keys[0];
-  }
-  return null;
-}
-
-function isObjectApprovalDecision(decision) {
-  return isPlainObject(decision) && approvalChoiceKey(decision) !== null;
-}
-
-function approvalChoices(requestObject) {
-  const decisions = Array.isArray(requestObject.availableDecisions) && requestObject.availableDecisions.length > 0
-    ? requestObject.availableDecisions
-    : ["accept", "cancel"];
-  return decisions.map((decision) => ({
-    decision,
-    key: approvalChoiceKey(decision),
-    objectDecision: isObjectApprovalDecision(decision)
-  }));
-}
-
-function hasExtendedPermissions(requestObject) {
-  return EXTENDED_PERMISSION_FIELDS.some((field) => requestObject[field] != null);
 }
 
 function hasSecretQuestion(questions) {
@@ -144,16 +284,6 @@ function compactLabel(question, index) {
   return escapeMarkdownInline(truncateUtf8(label, MAX_COMPACT_LABEL_UTF8_BYTES));
 }
 
-function safeApprovalCommands({ interactionId, requestObject, cmdTruncated = false }) {
-  if (!isSafeCliToken(interactionId)) return [];
-  const choices = approvalChoices(requestObject);
-  const restricted = hasExtendedPermissions(requestObject) || cmdTruncated || choices.some(({ objectDecision }) => objectDecision);
-  return choices
-    .filter(({ key }) => key !== null && isSafeCliToken(key))
-    .filter(({ key }) => !restricted || SAFE_APPROVAL_KEYS.has(key))
-    .map(({ key }) => `- \`/codex approve ${interactionId} ${key}\``);
-}
-
 function hardFallbackContent(interactionId, method, { hasSecret = false } = {}) {
   const parts = [
     "⚠️ **交互通知过大，已生成极简版**",
@@ -172,8 +302,7 @@ function hardFallbackContent(interactionId, method, { hasSecret = false } = {}) 
 }
 
 function toCompactContent(interactionId, method, context = {}) {
-  const { requestObject = {}, questions = [], allAddressable = false, cmdTruncated = false, hasSecret = false } = context;
-  const isApproval = APPROVAL_METHODS.has(method);
+  const { questions = [], allAddressable = false, hasSecret = false } = context;
   const safeId = isSafeCliToken(interactionId);
   const parts = [
     "⚠️ **交互通知过大，已生成精简版**",
@@ -181,15 +310,7 @@ function toCompactContent(interactionId, method, context = {}) {
     `_reply token_: ${codeSpan(interactionId)}`
   ];
 
-  if (isApproval) {
-    if (hasExtendedPermissions(requestObject) || approvalChoices(requestObject).some(({ objectDecision }) => objectDecision)) {
-      parts.push("⚠️ 此审批含扩展权限，仅可通过 App Server UI 批准。");
-    }
-    if (cmdTruncated) parts.push("⚠️ 命令已截断。完整命令请通过 App Server UI 查看后操作。");
-    const commands = safeApprovalCommands({ interactionId, requestObject, cmdTruncated });
-    if (commands.length > 0) parts.push(...commands);
-    else parts.push("此审批无法通过命令行安全操作，请使用 App Server UI。");
-  } else if (method === "item/tool/requestUserInput") {
+  if (method === "item/tool/requestUserInput") {
     if (hasSecret) parts.push("⚠️ 此交互含敏感输入；桥接仅提示敏感性，不加密持久化内容。");
     if (!allAddressable || !safeId) {
       parts.push("⚠️ 此请求无法通过命令行完整回答，请使用 App Server UI。");
@@ -227,13 +348,20 @@ function requireText(value) {
 }
 
 function validateIntent(input) {
+  const hasArtifacts = input !== null && typeof input === "object" && input.artifacts !== undefined;
+  const hasArtifactBaseDir = input !== null && typeof input === "object" && input.artifactBaseDir !== undefined;
   if (
     input === null || typeof input !== "object" ||
     !requireText(input.sourceType) || !requireText(input.sourceId) ||
     !requireText(input.objectiveId) || !["app-server", "tmux"].includes(input.backend) ||
     typeof input.text !== "string" ||
     input.targetSnapshot === null || typeof input.targetSnapshot !== "object" || Array.isArray(input.targetSnapshot) ||
-    (input.threadOptions !== undefined && (input.threadOptions === null || typeof input.threadOptions !== "object" || Array.isArray(input.threadOptions)))
+    (input.threadOptions !== undefined && (input.threadOptions === null || typeof input.threadOptions !== "object" || Array.isArray(input.threadOptions))) ||
+    (input.artifactMode !== undefined && !["legacy", "project_local", "managed"].includes(input.artifactMode)) ||
+    (input.artifactMode === "managed" && hasArtifacts) ||
+    (input.artifactMode === "project_local" && !hasArtifacts) ||
+    hasArtifacts !== hasArtifactBaseDir ||
+    (hasArtifactBaseDir && !requireText(input.artifactBaseDir))
   ) {
     throw controllerError("TURN_INTENT_INVALID", "Turn intent is invalid.");
   }
@@ -259,7 +387,6 @@ function defaultInteractionRenderer({ interaction }) {
   let questions = [];
   let allAddressable = false;
   let hasSecret = false;
-  let cmdTruncated = false;
   try {
     const textFields = ["reason", "prompt", "question", "message"];
     const responderLine = Array.isArray(allowedResponderIds) && allowedResponderIds.length > 0
@@ -267,47 +394,13 @@ function defaultInteractionRenderer({ interaction }) {
       : null;
 
     if (APPROVAL_METHODS.has(method)) {
-      const parts = ["⚠️ **审批请求**", ""];
-      const extendedPermissions = hasExtendedPermissions(requestObject);
-      const choices = approvalChoices(requestObject);
-      const objectDecision = choices.some(({ objectDecision }) => objectDecision);
-      if (typeof requestObject.reason === "string" && requestObject.reason) {
-        parts.push(`**原因**: ${escapeMarkdownInline(requestObject.reason)}`);
-      }
-      if (typeof requestObject.cwd === "string" && requestObject.cwd) {
-        parts.push(`**工作目录**: ${codeSpan(requestObject.cwd)}`);
-      }
-      if (typeof requestObject.command === "string" && requestObject.command) {
-        cmdTruncated = requestObject.command.length > 400;
-        const displayCmd = cmdTruncated
-          ? requestObject.command.slice(0, 400)
-          : requestObject.command;
-        parts.push("", "**待审批命令**:", ...fencedCodeBlock(displayCmd));
-        if (cmdTruncated) {
-          parts.push("⚠️ 命令已截断。完整命令请通过 App Server UI 查看后操作。");
-        }
-      }
-      if (approvalId) parts.push(`审批 ID: ${escapeMarkdownInline(approvalId)}`);
-      if (itemId) parts.push(`项目项 ID: ${escapeMarkdownInline(itemId)}`);
-      if (responderLine) parts.push(responderLine);
-      if (extendedPermissions || objectDecision) {
-        parts.push(
-          "",
-          "⚠️ 此审批请求包含扩展权限，无法通过命令行安全完整呈现。",
-          "",
-          "如需批准，请通过 **App Server UI** 操作。"
-        );
-      }
-      const commands = safeApprovalCommands({ interactionId, requestObject, cmdTruncated });
-      parts.push("", "**可选操作**（在本话题回复）:");
-      if (commands.length > 0) parts.push(...commands);
-      else parts.push("- 此审批无法通过命令行安全操作，请使用 App Server UI。");
-      parts.push("", `_reply token_: ${codeSpan(interactionId)}`);
-      content = parts.join("\n");
+      return structuredApprovalRender(interaction);
     } else if (method === "item/tool/requestUserInput") {
       const parts = ["💬 **输入请求**", ""];
       ({ questions, allAddressable, hasSecret } = analyzeQuestions(requestObject.questions));
-      if (questions.length > 0) {
+      if (hasSecret) {
+        parts.push("此请求包含敏感输入。问题正文和答案不会发送到 Zulip；请通过 App Server UI 完成。");
+      } else if (questions.length > 0) {
         questions.forEach((question, index) => {
           if (!isPlainObject(question)) return;
           const header = typeof question.header === "string" && question.header ? question.header : `问题 ${index + 1}`;
@@ -324,7 +417,6 @@ function defaultInteractionRenderer({ interaction }) {
               parts.push(`- ${codeSpan(option.label)}${description}`);
             }
           }
-          if (question.isSecret === true) parts.push("⚠️ 此题为敏感输入；当前桥接仅提示敏感性，不加密持久化内容。");
           const isAddressable = safeQuestionId(question.id) && question.isSecret !== true;
           if (!allAddressable && !isAddressable) {
             parts.push(`回答「${escapeMarkdownInline(header)}」: _此问题 ID 无法通过命令回答。_`);
@@ -347,7 +439,9 @@ function defaultInteractionRenderer({ interaction }) {
       }
       if (responderLine) parts.push(responderLine);
       parts.push("", `_reply token_: ${codeSpan(interactionId)}`);
-      if (questions.length > 0 && !allAddressable) {
+      if (hasSecret) {
+        parts.push("请通过 App Server UI 完成敏感输入。");
+      } else if (questions.length > 0 && !allAddressable) {
         parts.push("⚠️ 此交互包含不可寻址的 question ID，无法通过命令行回答，请使用 App Server UI 完成。");
       } else if (questions.length > 1) {
         parts.push("每题一条命令，全部回答后自动提交。");
@@ -365,7 +459,8 @@ function defaultInteractionRenderer({ interaction }) {
         "请通过 App Server UI 查看并操作。"
       ].join("\n");
     }
-  } catch {
+  } catch (error) {
+    if (isTurnControllerError(error)) throw error;
     content = hardFallbackContent(interactionId, method, { hasSecret });
   }
   if (byteLength(content) > MAX_CONTENT_UTF8_BYTES) {
@@ -373,13 +468,40 @@ function defaultInteractionRenderer({ interaction }) {
       requestObject,
       questions,
       allAddressable,
-      cmdTruncated,
       hasSecret
     });
   }
+  const payload = { content, kind: "interaction_request" };
+  const visibleActions = isSafeCliToken(interactionId)
+    ? (interaction.actions ?? []).filter((action) => isSafeCliToken(action.actionId)).slice(0, 10)
+    : [];
+  if (visibleActions.length > 0) {
+    payload.schemaVersion = 2;
+    payload.content += visibleActions.map((action) =>
+      `\n- ${escapeMarkdownInline(action.label)}: \`/codex interact ${interactionId} ${action.actionId}\``
+    ).join("");
+    payload.interaction = {
+      interactionId,
+      interactionType: "choice_input",
+      objectiveId: interaction.objectiveId,
+      expiresAt: interaction.expiresAt,
+      actions: visibleActions.map((action) => ({
+        actionId: action.actionId,
+        label: action.label,
+        style: action.style,
+        class: action.actionClass,
+        naturalAliasEligible: false
+      }))
+    };
+    payload.ui = {
+      type: "choices",
+      heading: "请选择",
+      actionIds: visibleActions.map((action) => action.actionId)
+    };
+  }
   return {
     semanticKey: `interaction:${interactionId}:prompt`,
-    payload: { content, kind: "interaction_request" }
+    payload
   };
 }
 
@@ -401,13 +523,15 @@ function validateInteractionRequest(input) {
 function validateInteractionAnswer(input) {
   if (!isPlainObject(input) || !requireText(input.interactionId) ||
       !Number.isSafeInteger(input.responderId) || input.responderId <= 0 ||
-      !isPlainObject(input.targetSnapshot) || !isPlainObject(input.answer)) {
+      !isPlainObject(input.targetSnapshot) || !isPlainObject(input.answer) ||
+      (input.audit !== undefined && input.audit !== null && !isPlainObject(input.audit))) {
     throw controllerError("INTERACTION_ANSWER_INVALID", "Interaction answer is invalid.");
   }
 }
 
 export class TurnController {
   #appServerBackend;
+  #legacyArtifactsEnabled;
   #leaseOwner;
   #interactionRenderer;
   #renderer;
@@ -418,6 +542,7 @@ export class TurnController {
     store,
     appServerBackend,
     tmuxBackend,
+    legacyArtifactsEnabled = false,
     leaseOwner = `controller-${randomUUID()}`,
     renderer = renderFinal,
     interactionRenderer = defaultInteractionRenderer
@@ -444,11 +569,13 @@ export class TurnController {
       typeof store.recordTurnAuditFact !== "function" ||
       typeof store.createInteraction !== "function" ||
       typeof store.commitInteractionAnswer !== "function" ||
+      typeof store.claimInteractionResponse !== "function" ||
       typeof store.recordInteractionResponseDelivery !== "function" ||
       typeof store.orphanInteractions !== "function" ||
       typeof store.readInteraction !== "function" ||
       typeof store.readTurnSubmission !== "function" ||
       typeof store.readObjectiveExecution !== "function" ||
+      typeof legacyArtifactsEnabled !== "boolean" ||
       !requireText(leaseOwner) || typeof renderer !== "function" || typeof interactionRenderer !== "function"
     ) {
       throw controllerError("TURN_CONTROLLER_OPTIONS_INVALID", "Turn controller options are invalid.");
@@ -456,6 +583,7 @@ export class TurnController {
     this.#store = store;
     this.#appServerBackend = validateExecutionBackend(appServerBackend);
     this.#tmuxBackend = tmuxBackend === undefined ? null : validateExecutionBackend(tmuxBackend);
+    this.#legacyArtifactsEnabled = legacyArtifactsEnabled;
     if (this.#appServerBackend.getCapabilities().backend !== "app-server" ||
         (this.#tmuxBackend && this.#tmuxBackend.getCapabilities().backend !== "tmux")) {
       throw controllerError("TURN_CONTROLLER_OPTIONS_INVALID", "Turn controller options are invalid.");
@@ -467,6 +595,18 @@ export class TurnController {
 
   async acceptIntent(input) {
     validateIntent(input);
+    if (input.artifactMode === "managed") {
+      throw controllerError(
+        "FILE_EXCHANGE_UNSUPPORTED",
+        "Execution transport does not expose the managed file exchange capability."
+      );
+    }
+    if (input.artifacts !== undefined && input.artifactMode !== "project_local" && !this.#legacyArtifactsEnabled) {
+      throw controllerError(
+        "FILE_EXCHANGE_UNSUPPORTED",
+        "This execution transport does not provide managed file exchange; legacy project artifacts are disabled."
+      );
+    }
     const registered = this.#store.registerExecutionIntent(input);
     if (registered.duplicate) {
       return Object.freeze({
@@ -519,7 +659,9 @@ export class TurnController {
       objectiveId: input.objectiveId,
       text: input.text,
       targetSnapshot: input.targetSnapshot,
-      leaseOwner: this.#leaseOwner
+      leaseOwner: this.#leaseOwner,
+      artifacts: input.artifacts,
+      artifactBaseDir: input.artifactBaseDir
     });
     if (prepared.duplicate) {
       return Object.freeze({
@@ -674,7 +816,10 @@ export class TurnController {
       targetSnapshot: input.targetSnapshot,
       threadOptions: input.threadOptions,
       projectId: input.projectId,
-      topicBinding: input.topicBinding
+      topicBinding: input.topicBinding,
+      artifactMode: input.artifactMode,
+      artifacts: input.artifacts,
+      artifactBaseDir: input.artifactBaseDir
     });
   }
 
@@ -872,10 +1017,11 @@ export class TurnController {
       renderer: this.#renderer
     });
     return Object.freeze({
-      status: "completed",
+      status: completed.status,
       objectiveId: input.objectiveId,
       turnId: input.turn.id,
-      duplicate: completed.duplicate
+      duplicate: completed.duplicate,
+      ...(completed.errorCode ? { errorCode: completed.errorCode } : {})
     });
   }
 
@@ -952,17 +1098,38 @@ export class TurnController {
       throw stateError(code, message);
     }
     const interaction = committed.interaction;
-    if (committed.duplicate && interaction.responseDeliveryState !== "retryable") {
+    const responseClaim = this.#store.claimInteractionResponse({
+      interactionId: interaction.interactionId,
+      leaseOwner: this.#leaseOwner
+    });
+    if (!responseClaim.acquired) {
       return Object.freeze({
-        status: interaction.responseDeliveryState === "delivered" ? "answered" : "response_uncertain",
+        status: responseClaim.state === "delivered"
+          ? (committed.duplicate ? "already_answered" : "answered")
+          : "response_uncertain",
         objectiveId: interaction.objectiveId,
         interactionId: interaction.interactionId,
-        duplicate: true
+        duplicate: committed.duplicate
       });
     }
     const execution = this.#store.readObjectiveExecution(interaction.objectiveId);
     const backend = execution ? this.#selectedBackend(execution.backend) : null;
-    if (!backend) throw controllerError("INTERACTION_BACKEND_UNAVAILABLE", "Interaction backend is unavailable.");
+    if (!backend) {
+      const status = this.#completeInteractionResponse({
+        interactionId: interaction.interactionId,
+        leaseToken: responseClaim.leaseToken,
+        state: "retryable"
+      });
+      if (status !== "response_retryable") {
+        return Object.freeze({
+          status,
+          objectiveId: interaction.objectiveId,
+          interactionId: interaction.interactionId,
+          duplicate: committed.duplicate
+        });
+      }
+      throw controllerError("INTERACTION_BACKEND_UNAVAILABLE", "Interaction backend is unavailable.");
+    }
     try {
       await backend.respondToInteraction({
         interactionId: interaction.interactionId,
@@ -971,20 +1138,25 @@ export class TurnController {
       });
     } catch (error) {
       const uncertain = requestMayHaveBeenWritten(error);
-      this.#store.recordInteractionResponseDelivery({
+      const status = this.#completeInteractionResponse({
         interactionId: interaction.interactionId,
+        leaseToken: responseClaim.leaseToken,
         state: uncertain ? "uncertain" : "retryable"
       });
       return Object.freeze({
-        status: uncertain ? "response_uncertain" : "response_retryable",
+        status,
         objectiveId: interaction.objectiveId,
         interactionId: interaction.interactionId,
         duplicate: committed.duplicate
       });
     }
-    this.#store.recordInteractionResponseDelivery({ interactionId: interaction.interactionId, state: "delivered" });
+    const status = this.#completeInteractionResponse({
+      interactionId: interaction.interactionId,
+      leaseToken: responseClaim.leaseToken,
+      state: "delivered"
+    });
     return Object.freeze({
-      status: "answered",
+      status,
       objectiveId: interaction.objectiveId,
       interactionId: interaction.interactionId,
       duplicate: committed.duplicate
@@ -1004,6 +1176,27 @@ export class TurnController {
     }
     const lost = this.#store.markConnectionLost(input);
     return Object.freeze({ status: "reconciliation_needed", ...lost });
+  }
+
+  #completeInteractionResponse({ interactionId, leaseToken, state }) {
+    try {
+      this.#store.recordInteractionResponseDelivery({ interactionId, leaseToken, state });
+    } catch (error) {
+      if (!isStateError(error) || ![
+        "INTERACTION_RESPONSE_STATE_INVALID",
+        "INTERACTION_RESPONSE_LEASE_STALE"
+      ].includes(error.code)) {
+        throw error;
+      }
+      const durable = this.#store.readInteraction(interactionId);
+      if (durable?.responseDeliveryState === "delivered") return "answered";
+      if (durable?.state === "orphaned" || durable?.responseDeliveryState === "uncertain") {
+        return "response_uncertain";
+      }
+      throw error;
+    }
+    if (state === "delivered") return "answered";
+    return state === "uncertain" ? "response_uncertain" : "response_retryable";
   }
 
   #selectedBackend(selection) {

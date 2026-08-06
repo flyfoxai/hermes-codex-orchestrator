@@ -163,10 +163,42 @@ Option C 是 macOS 当前用户级安装路径。它不会修改 Hermes 源码�
 
 ```sh
 chmod 600 "$HOME/.hco/hco.json" \
-  "$HOME/.hco/bridge.bearer" \
-  "$HOME/.hco/context.key" \
+  "$HOME/.hco/hco.bearer" \
+  "$HOME/.hco/hco-context.key" \
   "$HOME/.zuliprc"
 ```
+
+项目配置写在 `projects` 数组中。需要指定 Codex 模型或推理深度时，先从运行中的 HCO bridge 查询当前源支持的清单：
+
+```sh
+curl --unix-socket "$HOME/.hco/hco.sock" \
+  -H "Authorization: Bearer $(cat "$HOME/.hco/hco.bearer")" \
+  "http://localhost/v1/models?includeHidden=false&limit=100"
+```
+
+然后在对应项目上设置 `threadOptions.model` 和 `threadOptions.modelReasoningEffort`：
+
+```json
+{
+  "projectId": "hermes-codex-orchestrator",
+  "cwd": "/Users/hula/Projects/hermes-codex-orchestrator",
+  "backend": "app-server",
+  "staticStreamIds": [4],
+  "acl": {
+    "viewers": [8],
+    "contributors": [8],
+    "maintainers": [8]
+  },
+  "threadOptions": {
+    "model": "gpt-5",
+    "modelReasoningEffort": "high",
+    "approvalPolicy": "on-request",
+    "sandbox": "workspace-write"
+  }
+}
+```
+
+`model` 使用 `result.models[].id`。`modelReasoningEffort` 从同一模型的 `supportedReasoningEfforts` 里选择；不设置时由 Codex 源端默认策略决定。HCO 启动时只做本地格式校验，不在线验证模型是否仍可用；模型下线、账号权限变化或源端策略变化会在真实创建/续接 Codex thread 时体现为 App Server 错误。
 
 真实安装会在第一次部署变更前检查三层兼容性：配置中 Unix socket 上的 HCO bridge protocol、当前安装的 Hermes，以及 `codex app-server --stdio`。因此第一次安装时，也必须先用同一份 `HCO_CONFIG_PATH` 临时启动当前仓库的 HCO，使兼容性 endpoint 可用；安装提交后由 LaunchAgent 接管。
 

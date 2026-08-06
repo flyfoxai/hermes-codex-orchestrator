@@ -145,6 +145,48 @@ test("reads an exact durable App Server turn context as deeply frozen authority"
   assert.equal(store.readAppServerTurnContext({ threadId: seeded.threadId, turnId: "turn-other" }), null);
 });
 
+test("a proven pre-write failure restores the same durable submission intent", (t) => {
+  const { store } = databaseFixture(t);
+  const targetSnapshot = {
+    platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 99
+  };
+  store.registerExecutionIntent({
+    sourceType: "test",
+    sourceId: "rollback-unknown-intent",
+    objectiveId: "objective-rollback-unknown",
+    projectId: "project-context",
+    backend: "app-server",
+    text: "retry exact request",
+    targetSnapshot,
+    topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
+  });
+  store.bindBackendObjective({
+    objectiveId: "objective-rollback-unknown",
+    backend: "app-server",
+    threadId: "thread-rollback-unknown"
+  });
+  const prepared = store.prepareTurnSubmission({
+    sourceType: "test",
+    sourceId: "rollback-unknown-intent",
+    objectiveId: "objective-rollback-unknown",
+    text: "retry exact request",
+    targetSnapshot,
+    leaseOwner: "store-test"
+  });
+  store.markSubmissionUnknown({ submissionId: prepared.submission.submissionId });
+
+  const rolledBack = store.rollbackSubmissionUnknown({
+    submissionId: prepared.submission.submissionId
+  });
+
+  assert.equal(rolledBack.state, "intent");
+  assert.equal(rolledBack.reconciliationRequired, false);
+  const execution = store.readObjectiveExecution("objective-rollback-unknown");
+  assert.equal(execution.executionStatus, "submitting");
+  assert.equal(execution.activeSubmission.submissionId, prepared.submission.submissionId);
+  assert.equal(execution.activeSubmission.clientUserMessageId, prepared.submission.clientUserMessageId);
+});
+
 test("rejects malformed App Server turn context lookups with one owned error", (t) => {
   const { store } = databaseFixture(t);
   for (const options of [
@@ -200,7 +242,27 @@ test("opens an owner-only WAL database with foreign keys, busy timeout, and expl
     "topic_aliases",
     "topic_modes",
     "objective_projects",
-    "execution_topic_intents"
+    "execution_topic_intents",
+    "topic_contexts",
+    "topic_context_aliases",
+    "work_requests",
+    "agent_sessions",
+    "agent_activations",
+    "agent_parent_edges",
+    "codex_conversations",
+    "codex_calls",
+    "codex_call_ownership",
+    "objective_scopes",
+    "coordination_mailbox",
+    "agent_reports",
+    "authority_envelopes",
+    "approval_sets",
+    "approval_set_members",
+    "interaction_coordination",
+    "interaction_escalations",
+    "notification_ledger",
+    "coordination_fence_counters",
+    "coordination_write_leases"
   ]) {
     assert.equal(
       db.prepare("SELECT count(*) AS count FROM sqlite_master WHERE type = 'table' AND name = ?").get(table).count,
@@ -211,6 +273,89 @@ test("opens an owner-only WAL database with foreign keys, busy timeout, and expl
 
   assert.throws(() => db.prepare("DELETE FROM schema_migrations").run(), /append-only/i);
   assert.throws(() => db.prepare("UPDATE schema_migrations SET name = 'changed'").run(), /append-only/i);
+});
+
+test("v9 hardens action prompt uniqueness when upgrading a populated v8 database", (t) => {
+  const directory = mkdtempSync(path.join(tmpdir(), "hco-v8-migration-"));
+  const databasePath = path.join(directory, "authority.sqlite3");
+  const db = rawDatabase(databasePath);
+  for (const migration of MIGRATIONS.slice(0, -1)) {
+    migration.up(db);
+    db.prepare("INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?, ?, ?)")
+      .run(migration.version, migration.name, START_MS);
+    db.pragma(`user_version = ${migration.version}`);
+  }
+  db.prepare(`
+    INSERT INTO event_journal (
+      event_record_id, source_type, source_id, received_at_ms, event_schema_version,
+      event_name, event_mode, payload_json, integrity_json, objective_id
+    ) VALUES ('event-v8', 'test', 'source-v8', ?, 1, 'objective.created',
+      'normal', '{}', '{}', 'objective-v8')
+  `).run(START_MS);
+  db.prepare(`
+    INSERT INTO objectives (
+      objective_id, state, state_rank, next_outbox_sequence, created_at_ms,
+      updated_at_ms, created_event_record_id
+    ) VALUES ('objective-v8', 'running', 1, 3, ?, ?, 'event-v8')
+  `).run(START_MS, START_MS);
+  db.prepare(`
+    INSERT INTO objective_execution (
+      objective_id, backend, execution_status, backend_objective_started,
+      app_server_thread_id, created_at_ms, updated_at_ms
+    ) VALUES ('objective-v8', 'app-server', 'running', 1, 'thread-v8', ?, ?)
+  `).run(START_MS, START_MS);
+  db.prepare(`
+    INSERT INTO pending_interactions (
+      interaction_id, connection_id, wire_id_type, wire_id_json, method,
+      objective_id, thread_id, turn_id, correlation_key, request_json,
+      allowed_responder_ids_json, target_snapshot_json, expires_at_ms, state,
+      created_at_ms, updated_at_ms
+    ) VALUES (
+      'interaction-v8', 'connection-v8', 'number', '8',
+      'item/commandExecution/requestApproval', 'objective-v8', 'thread-v8',
+      'turn-v8', 'correlation-v8', '{}', '[101]',
+      '{"streamId":42,"topic":"Build"}', ?, 'pending', ?, ?
+    )
+  `).run(START_MS + 86_400_000, START_MS, START_MS);
+  const insertOutbox = db.prepare(`
+    INSERT INTO zulip_outbox (
+      delivery_id, objective_id, semantic_key, objective_sequence, payload_json,
+      target_snapshot_json, state, created_at_ms, updated_at_ms, event_record_id
+    ) VALUES (?, 'objective-v8', ?, ?, '{}', '{}', 'pending', ?, ?, 'event-v8')
+  `);
+  insertOutbox.run("delivery-v8", "prompt-v8", 1, START_MS, START_MS);
+  insertOutbox.run("delivery-v9", "prompt-v9", 2, START_MS, START_MS);
+  db.prepare(`
+    INSERT INTO interaction_delivery_links (
+      delivery_id, interaction_id, role, chunk_index, created_at_ms
+    ) VALUES ('delivery-v8', 'interaction-v8', 'action_prompt', NULL, ?)
+  `).run(START_MS);
+  db.close();
+
+  const store = openStore({ databasePath, now: () => START_MS + 1 });
+  store.close();
+  const migrated = rawDatabase(databasePath);
+  t.after(() => migrated.close());
+
+  assert.equal(migrated.pragma("user_version", { simple: true }), MIGRATIONS.at(-1).version);
+  assert.deepEqual(
+    migrated.prepare("SELECT version, name FROM schema_migrations ORDER BY version").all(),
+    EXPECTED_MIGRATION_HISTORY
+  );
+  const index = migrated.prepare(`
+    SELECT sql FROM sqlite_master
+    WHERE type = 'index' AND name = 'interaction_delivery_one_action_prompt'
+  `).get();
+  assert.match(index.sql, /CREATE UNIQUE INDEX interaction_delivery_one_action_prompt/i);
+  assert.match(index.sql, /WHERE role = 'action_prompt'/i);
+  assert.throws(
+    () => migrated.prepare(`
+      INSERT INTO interaction_delivery_links (
+        delivery_id, interaction_id, role, chunk_index, created_at_ms
+      ) VALUES ('delivery-v9', 'interaction-v8', 'action_prompt', NULL, ?)
+    `).run(START_MS + 1),
+    /UNIQUE constraint failed: interaction_delivery_links\.interaction_id/
+  );
 });
 
 test("migrates a populated Task 2 v1 database to durable execution state without data loss", (t) => {
@@ -1049,4 +1194,1216 @@ test("claim and nack reject malformed input with stable codes", (t) => {
     () => store.nackOutbox({ deliveryId: "delivery", leaseToken: "token", error: "", retryable: true }),
     (error) => assertCode(error, "OUTBOX_NACK_INVALID")
   );
+});
+
+function coordinationDispatch(overrides = {}) {
+  return {
+    streamId: 42,
+    topic: "Build",
+    projectId: "project-1",
+    requesterUserId: 3,
+    originalZulipMessageId: 900,
+    sourceType: "zulip-work-request",
+    sourceId: "900",
+    callSourceId: "call-source-1",
+    objectiveId: "objective-coordination",
+    invocationOrigin: "JARVIS",
+    callerPrincipalId: "jarvis:topic",
+    workBrief: {
+      schemaVersion: 1,
+      originalText: "Implement the change",
+      instruction: "Implement the change",
+      constraints: [],
+      acceptanceCriteria: ["tests pass"],
+      reminders: []
+    },
+    request: { instruction: "Implement the change" },
+    ...overrides
+  };
+}
+
+function createCoordinatedInteraction(store, overrides = {}) {
+  const dispatch = coordinationDispatch(overrides);
+  const coordination = store.prepareCoordinationDispatch(dispatch);
+  const targetSnapshot = {
+    platform: "zulip",
+    streamId: dispatch.streamId,
+    topic: dispatch.topic,
+    sourceMessageId: dispatch.originalZulipMessageId
+  };
+  store.registerExecutionIntent({
+    sourceType: "coordination-call",
+    sourceId: coordination.codexCall.codexCallId,
+    objectiveId: dispatch.objectiveId,
+    projectId: dispatch.projectId,
+    backend: "app-server",
+    text: "coordinated interaction",
+    targetSnapshot,
+    topicBinding: {
+      streamId: dispatch.streamId,
+      topic: dispatch.topic,
+      actorUserId: dispatch.requesterUserId
+    }
+  });
+  const threadId = `thread-${dispatch.objectiveId}`;
+  const turnId = `turn-${dispatch.objectiveId}`;
+  store.bindBackendObjective({ objectiveId: dispatch.objectiveId, backend: "app-server", threadId });
+  const prepared = store.prepareTurnSubmission({
+    sourceType: "coordination-call",
+    sourceId: coordination.codexCall.codexCallId,
+    objectiveId: dispatch.objectiveId,
+    text: "coordinated interaction",
+    targetSnapshot,
+    leaseOwner: "state-test"
+  });
+  store.acknowledgeTurnSubmission({ submissionId: prepared.submission.submissionId, turnId });
+  store.recordCodexCallSubmission({
+    codexCallId: coordination.codexCall.codexCallId,
+    objectiveId: dispatch.objectiveId,
+    status: "accepted",
+    threadId,
+    turnId
+  });
+  const created = store.createInteraction({
+    connectionId: `connection-${dispatch.objectiveId}`,
+    wireRequestId: `wire-${dispatch.objectiveId}`,
+    method: "item/commandExecution/requestApproval",
+    objectiveId: dispatch.objectiveId,
+    threadId,
+    turnId,
+    itemId: `item-${dispatch.objectiveId}`,
+    approvalId: `approval-${dispatch.objectiveId}`,
+    request: { command: "npm test", availableDecisions: ["accept", "cancel"] },
+    allowedResponderIds: [dispatch.requesterUserId],
+    targetSnapshot,
+    renderer: ({ interaction }) => ({
+      semanticKey: `interaction:${interaction.interactionId}:prompt`,
+      payload: { schemaVersion: 1, kind: "interaction_request", content: "Approval requested." }
+    })
+  });
+  return { coordination, created, dispatch, targetSnapshot };
+}
+
+test("uncertain coordinated interaction response notifies the exact caller without resending", (t) => {
+  const { store } = databaseFixture(t);
+  const fixture = createCoordinatedInteraction(store, {
+    sourceId: "interaction-uncertain-work",
+    callSourceId: "interaction-uncertain-call",
+    objectiveId: "objective-interaction-uncertain",
+    jarvisSessionId: "jarvis-interaction-session"
+  });
+  const interactionId = fixture.created.interaction.interactionId;
+  store.commitInteractionAnswer({
+    interactionId,
+    responderId: fixture.dispatch.requesterUserId,
+    targetSnapshot: fixture.targetSnapshot,
+    answer: { decision: "accept" }
+  });
+  const response = store.claimInteractionResponse({
+    interactionId,
+    leaseOwner: "interaction-response-test"
+  });
+  store.recordInteractionResponseDelivery({
+    interactionId,
+    leaseToken: response.leaseToken,
+    state: "uncertain"
+  });
+
+  const status = store.readWorkStatus(fixture.coordination.workRequest.workRequestId);
+  assert.equal(status.workRequest.state, "STATUS_UNVERIFIED");
+  assert.equal(status.codexCalls[0].state, "STATUS_UNVERIFIED");
+  const [notice] = store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: fixture.coordination.topicContext.topicContextId,
+    workerId: "interaction-notice-worker",
+    limit: 10,
+    leaseMs: 1_000
+  });
+  assert.equal(notice.itemType, "STATUS_NOTICE");
+  assert.equal(notice.payload.kind, "InteractionStatusNotice");
+  assert.equal(notice.payload.reason, "interaction_response_outcome_unverified");
+  assert.equal(notice.payload.answerState, "settled_outcome_unverified");
+  assert.equal(JSON.stringify(notice.payload).includes("accept"), false);
+});
+
+test("orphaned coordinated interaction closes waiting state and reports through the caller mailbox", (t) => {
+  const { store } = databaseFixture(t);
+  const fixture = createCoordinatedInteraction(store, {
+    sourceId: "interaction-orphan-work",
+    callSourceId: "interaction-orphan-call",
+    objectiveId: "objective-interaction-orphan",
+    jarvisSessionId: "jarvis-interaction-orphan-session"
+  });
+
+  assert.deepEqual(store.orphanInteractions({
+    connectionId: "connection-objective-interaction-orphan"
+  }), {
+    connectionId: "connection-objective-interaction-orphan",
+    orphaned: 1
+  });
+  const status = store.readWorkStatus(fixture.coordination.workRequest.workRequestId);
+  assert.equal(status.workRequest.state, "STATUS_UNVERIFIED");
+  assert.equal(status.codexCalls[0].state, "STATUS_UNVERIFIED");
+  assert.equal(store.readInteraction(fixture.created.interaction.interactionId).state, "orphaned");
+  const [notice] = store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: fixture.coordination.topicContext.topicContextId,
+    workerId: "interaction-orphan-worker",
+    limit: 10,
+    leaseMs: 1_000
+  });
+  assert.equal(notice.payload.reason, "interaction_orphaned");
+  assert.equal(notice.payload.answerState, "not_settled");
+});
+
+test("direct Zulip interaction uncertainty uses the durable outbox fallback", (t) => {
+  const { store } = databaseFixture(t);
+  const fixture = createCoordinatedInteraction(store, {
+    sourceId: "interaction-direct-work",
+    callSourceId: "interaction-direct-call",
+    objectiveId: "objective-interaction-direct",
+    invocationOrigin: "DIRECT_ZULIP",
+    callerPrincipalId: "zulip-user:3"
+  });
+  const [prompt] = store.claimOutbox({ workerId: "direct-prompt", limit: 10, leaseMs: 1_000 });
+  store.ackOutbox({
+    deliveryId: prompt.deliveryId,
+    leaseToken: prompt.leaseToken,
+    zulipMessageId: 991
+  });
+  const interactionId = fixture.created.interaction.interactionId;
+  store.commitInteractionAnswer({
+    interactionId,
+    responderId: fixture.dispatch.requesterUserId,
+    targetSnapshot: fixture.targetSnapshot,
+    answer: { decision: "accept" }
+  });
+  const response = store.claimInteractionResponse({ interactionId, leaseOwner: "direct-response" });
+  store.recordInteractionResponseDelivery({
+    interactionId,
+    leaseToken: response.leaseToken,
+    state: "uncertain"
+  });
+
+  const [promptDelete] = store.claimOutbox({ workerId: "direct-delete", limit: 10, leaseMs: 1_000 });
+  assert.equal(promptDelete.payload.kind, "interaction_prompt_delete");
+  store.ackOutbox({
+    deliveryId: promptDelete.deliveryId,
+    leaseToken: promptDelete.leaseToken,
+    zulipMessageId: 992
+  });
+  const [notice] = store.claimOutbox({ workerId: "direct-notice", limit: 10, leaseMs: 1_000 });
+  assert.equal(notice.payload.kind, "interaction_status_notice");
+  assert.match(notice.payload.content, /not resent/i);
+  assert.deepEqual(notice.targetSnapshot, fixture.targetSnapshot);
+  assert.equal(store.readWorkStatus(fixture.coordination.workRequest.workRequestId).workRequest.state,
+    "STATUS_UNVERIFIED");
+});
+
+test("coordination identities are idempotent and objective scope cannot cross topics", (t) => {
+  const { store } = databaseFixture(t);
+  const first = store.prepareCoordinationDispatch(coordinationDispatch());
+  const duplicate = store.prepareCoordinationDispatch(coordinationDispatch());
+
+  assert.equal(first.topicContext.topic, "Build");
+  assert.equal(first.workRequest.state, "WAITING_CODEX");
+  assert.equal(first.conversation.conversationKind, "TOPIC_PRIMARY");
+  assert.equal(first.codexCall.reportTarget.kind, "JARVIS_MAILBOX");
+  assert.equal(duplicate.codexCall.codexCallId, first.codexCall.codexCallId);
+  assert.deepEqual(store.readObjectiveScope("objective-coordination"), {
+    objectiveId: "objective-coordination",
+    projectId: "project-1",
+    topicContextId: first.topicContext.topicContextId,
+    codexConversationId: first.conversation.codexConversationId,
+    createdAt: START_MS
+  });
+
+  assert.throws(
+    () => store.prepareCoordinationDispatch(coordinationDispatch({
+      topic: "Other",
+      sourceId: "901",
+      originalZulipMessageId: 901,
+      callSourceId: "call-source-other"
+    })),
+    (error) => assertCode(error, "OBJECTIVE_TOPIC_MISMATCH")
+  );
+});
+
+test("a legacy work brief reuses one exact Boss request while independent dispatches create distinct calls", (t) => {
+  const { store } = databaseFixture(t);
+  const legacy = coordinationDispatch();
+  const first = store.prepareCoordinationDispatch(legacy);
+  const currentBrief = {
+    schemaVersion: legacy.workBrief.schemaVersion,
+    originalText: legacy.workBrief.originalText
+  };
+  const second = store.prepareCoordinationDispatch(coordinationDispatch({
+    callSourceId: "call-source-2",
+    objectiveId: "objective-coordination-2",
+    forceNewConversation: true,
+    workBrief: currentBrief,
+    request: { instruction: "Review the first result independently" }
+  }));
+
+  assert.equal(second.workRequest.workRequestId, first.workRequest.workRequestId);
+  assert.notEqual(second.codexCall.codexCallId, first.codexCall.codexCallId);
+  assert.notEqual(second.codexCall.objectiveId, first.codexCall.objectiveId);
+  assert.equal(store.readWorkStatus(first.workRequest.workRequestId).codexCalls.length, 2);
+
+  for (const [field, value] of [
+    ["requesterUserId", 4],
+    ["originalZulipMessageId", 901],
+    ["workBrief", { schemaVersion: 2, originalText: legacy.workBrief.originalText }],
+    ["workBrief", { schemaVersion: 1, originalText: "A different Boss request" }]
+  ]) {
+    assert.throws(
+      () => store.prepareCoordinationDispatch(coordinationDispatch({
+        callSourceId: `conflict-${typeof value === "object" ? JSON.stringify(value) : value}`,
+        objectiveId: `objective-conflict-${typeof value === "object" ? value.schemaVersion : value}`,
+        workBrief: currentBrief,
+        [field]: value
+      })),
+      (error) => assertCode(error, "WORK_REQUEST_SOURCE_CONFLICT")
+    );
+  }
+});
+
+test("turn completion uses the submission call identity when one objective has multiple active calls", (t) => {
+  const { store } = databaseFixture(t);
+  const first = store.prepareCoordinationDispatch(coordinationDispatch());
+  const second = store.prepareCoordinationDispatch(coordinationDispatch({
+    callSourceId: "call-source-exact-completion",
+    request: { instruction: "Second call on the same objective" }
+  }));
+  const targetSnapshot = {
+    platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 900
+  };
+  store.registerExecutionIntent({
+    sourceType: "coordination-call",
+    sourceId: second.codexCall.codexCallId,
+    objectiveId: second.codexCall.objectiveId,
+    projectId: "project-1",
+    backend: "app-server",
+    text: "Second call on the same objective",
+    targetSnapshot,
+    topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
+  });
+  store.bindBackendObjective({
+    objectiveId: second.codexCall.objectiveId,
+    backend: "app-server",
+    threadId: "thread-exact-completion"
+  });
+  const prepared = store.prepareTurnSubmission({
+    sourceType: "coordination-call",
+    sourceId: second.codexCall.codexCallId,
+    objectiveId: second.codexCall.objectiveId,
+    text: "Second call on the same objective",
+    targetSnapshot,
+    leaseOwner: "test"
+  });
+  store.acknowledgeTurnSubmission({
+    submissionId: prepared.submission.submissionId,
+    turnId: "turn-exact-completion"
+  });
+  store.completeTurn({
+    objectiveId: second.codexCall.objectiveId,
+    turnId: "turn-exact-completion",
+    rawText: "Second call completed",
+    itemIds: ["item-exact-completion"],
+    sourceType: "app-server",
+    sourceId: "completion-exact-call",
+    renderer() { throw new Error("Jarvis result must use its mailbox"); }
+  });
+
+  assert.equal(store.readCodexCall(second.codexCall.codexCallId).state, "COMPLETED");
+  assert.equal(store.readCodexCall(second.codexCall.codexCallId).turnId, "turn-exact-completion");
+  assert.equal(store.readCodexCall(first.codexCall.codexCallId).state, "CREATED");
+});
+
+test("Jarvis Codex completion is delivered once to its durable mailbox instead of Zulip", (t) => {
+  const { store } = databaseFixture(t);
+  const coordination = store.prepareCoordinationDispatch(coordinationDispatch());
+  const callId = coordination.codexCall.codexCallId;
+  const objectiveId = coordination.codexCall.objectiveId;
+  const targetSnapshot = { platform: "zulip", streamId: 42, topic: "Build", sourceMessageId: 900 };
+  store.registerExecutionIntent({
+    sourceType: "coordination-call",
+    sourceId: callId,
+    objectiveId,
+    projectId: "project-1",
+    backend: "app-server",
+    text: "Implement the change",
+    targetSnapshot,
+    topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
+  });
+  store.bindBackendObjective({ objectiveId, backend: "app-server", threadId: "thread-coordination" });
+  const prepared = store.prepareTurnSubmission({
+    sourceType: "coordination-call",
+    sourceId: callId,
+    objectiveId,
+    text: "Implement the change",
+    targetSnapshot,
+    leaseOwner: "test"
+  });
+  store.acknowledgeTurnSubmission({ submissionId: prepared.submission.submissionId, turnId: "turn-coordination" });
+  store.recordCodexCallSubmission({
+    codexCallId: callId,
+    objectiveId,
+    status: "accepted",
+    threadId: "thread-coordination",
+    turnId: "turn-coordination"
+  });
+  const completed = store.completeTurn({
+    objectiveId,
+    turnId: "turn-coordination",
+    rawText: "Verified result",
+    itemIds: ["item-1"],
+    sourceType: "app-server",
+    sourceId: "completion-coordination",
+    renderer() {
+      throw new Error("Jarvis completion must not render a Zulip delivery");
+    }
+  });
+
+  assert.equal(completed.status, "completed");
+  assert.deepEqual(completed.outbox, []);
+  assert.equal(store.claimOutbox({ workerId: "zulip", limit: 10, leaseMs: 1_000 }).length, 0);
+  assert.deepEqual(store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: coordination.topicContext.topicContextId,
+    codexCallId: "another-call",
+    workerId: "wrong-call-worker",
+    limit: 10,
+    leaseMs: 1_000
+  }), []);
+  const [mail] = store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: coordination.topicContext.topicContextId,
+    codexCallId: callId,
+    workerId: "jarvis-worker",
+    limit: 10,
+    leaseMs: 1_000
+  });
+  assert.equal(mail.itemType, "CODEX_RECEIPT");
+  assert.equal(mail.codexCallId, callId);
+  assert.equal(mail.payload.text, "Verified result");
+  assert.throws(
+    () => store.ackCoordinationMailbox({
+      mailboxItemId: mail.mailboxItemId,
+      leaseToken: mail.leaseToken,
+      finalDelivery: false
+    }),
+    (error) => assertCode(error, "MAILBOX_DELIVERY_MODE_MISMATCH")
+  );
+  const acknowledged = store.ackCoordinationMailbox({
+    mailboxItemId: mail.mailboxItemId,
+    leaseToken: mail.leaseToken,
+    finalDelivery: true
+  });
+  assert.equal(acknowledged.duplicate, false);
+  assert.equal(acknowledged.workRequest.state, "COMPLETED");
+  assert.equal(store.ackCoordinationMailbox({
+    mailboxItemId: mail.mailboxItemId,
+    leaseToken: mail.leaseToken,
+    finalDelivery: true
+  }).duplicate, true);
+  assert.deepEqual(store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: coordination.topicContext.topicContextId,
+    workerId: "jarvis-worker",
+    limit: 10,
+    leaseMs: 1_000
+  }), []);
+});
+
+test("Agent sessions report to the exact parent and require a correction packet for reactivation", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch());
+  const created = store.createAgentSession({
+    hermesSessionId: "hermes-agent-a",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "reviewer",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Review implementation",
+    budget: { turns: 4 },
+    maxReactivations: 2
+  });
+  const report = store.submitAgentReport({
+    sourceType: "agent",
+    sourceId: "agent-report-1",
+    agentSessionId: created.agentSession.agentSessionId,
+    agentActivationId: created.activation.agentActivationId,
+    status: "completed",
+    report: { summary: "Review incomplete", claims: [], verification: [], artifacts: [], unresolved: ["coverage"] }
+  });
+  assert.equal(typeof report.reportId, "string");
+  assert.throws(
+    () => store.reactivateAgent({ agentSessionId: created.agentSession.agentSessionId }),
+    (error) => assertCode(error, "AGENT_REACTIVATION_INVALID")
+  );
+  const reactivated = store.reactivateAgent({
+    agentSessionId: created.agentSession.agentSessionId,
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Coverage was insufficient",
+    correctionInstruction: "Add the missing integration test.",
+    reviewFindings: ["No restart coverage"],
+    expectedDelta: "A restart integration test and verified result",
+    priorArtifacts: ["artifact://agent-report-1"],
+    budget: { turns: 2 }
+  });
+  assert.equal(reactivated.activation.activationNumber, 2);
+  assert.equal(reactivated.agentSession.state, "RUNNING");
+});
+
+test("Hermes Agent stop reports resolve trusted session scope and are idempotent", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch());
+  const created = store.createAgentSession({
+    hermesSessionId: "hermes-agent-stop",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "reviewer",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Review implementation",
+    budget: { turns: 4 }
+  });
+  const input = {
+    sourceId: "hermes-stop-source-1",
+    childHermesSessionId: "hermes-agent-stop",
+    parentHermesSessionId: "hermes-jarvis-topic",
+    childStatus: "completed",
+    summary: "Review verified",
+    durationMs: 1250
+  };
+
+  const first = store.reportHermesAgentStop(input);
+  const duplicate = store.reportHermesAgentStop(input);
+
+  assert.equal(first.disposition, "REPORTED");
+  assert.equal(first.duplicate, false);
+  assert.equal(first.agentSessionId, created.agentSession.agentSessionId);
+  assert.equal(first.activeCodexCalls, 0);
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.reportId, first.reportId);
+  assert.equal(store.readWorkStatus(work.workRequest.workRequestId).agents[0].state, "REPORTED");
+  const [mail] = store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: work.topicContext.topicContextId,
+    workerId: "jarvis-report-reader",
+    limit: 10,
+    leaseMs: 1000
+  });
+  assert.equal(mail.itemType, "AGENT_REPORT");
+  assert.equal(mail.payload.report.summary, "Review verified");
+  assert.deepEqual(mail.payload.report.relatedCodexCallIds, []);
+});
+
+test("Hermes Agent stop waits for required Codex before accepting a terminal report", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch());
+  const created = store.createAgentSession({
+    hermesSessionId: "hermes-agent-waiting",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "worker",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Implement with Codex",
+    budget: { turns: 4 }
+  });
+  const coordination = store.prepareCoordinationDispatch(coordinationDispatch({
+    callSourceId: "agent-call-source-waiting",
+    objectiveId: "objective-agent-waiting",
+    invocationOrigin: "AGENT",
+    callerPrincipalId: `agent:${created.agentSession.agentSessionId}`,
+    agentSessionId: created.agentSession.agentSessionId,
+    agentActivationId: created.activation.agentActivationId,
+    forceNewConversation: true
+  }));
+  const input = {
+    sourceId: "hermes-stop-source-waiting",
+    childHermesSessionId: "hermes-agent-waiting",
+    parentHermesSessionId: "hermes-jarvis-topic",
+    childStatus: "failed",
+    summary: "Stopped while Codex was active",
+    durationMs: 2000
+  };
+
+  const waiting = store.reportHermesAgentStop(input);
+  assert.equal(waiting.disposition, "WAITING_CODEX");
+  assert.equal(waiting.activeCodexCalls, 1);
+  let status = store.readWorkStatus(work.workRequest.workRequestId);
+  assert.equal(status.workRequest.state, "WAITING_CODEX");
+  assert.equal(status.workRequest.statusReason, "agent_waiting_codex");
+  assert.equal(status.agents[0].state, "WAITING_CODEX");
+
+  store.recordCodexCallSubmission({
+    codexCallId: coordination.codexCall.codexCallId,
+    objectiveId: coordination.codexCall.objectiveId,
+    status: "terminal_error",
+    turnId: null,
+    threadId: null
+  });
+  const reported = store.reportHermesAgentStop(input);
+  assert.equal(reported.disposition, "REPORTED");
+  assert.equal(reported.activeCodexCalls, 0);
+  status = store.readWorkStatus(work.workRequest.workRequestId);
+  assert.equal(status.agents[0].state, "FAILED");
+});
+
+test("a coordinated Codex submission failure notifies its exact caller without terminating sibling work", (t) => {
+  const { store } = databaseFixture(t);
+  const coordination = store.prepareCoordinationDispatch(coordinationDispatch({
+    sourceId: "coordinated-failure-work",
+    callSourceId: "coordinated-failure-call",
+    objectiveId: "objective-coordinated-failure",
+    jarvisSessionId: "jarvis-failure-session"
+  }));
+
+  store.recordCodexCallSubmission({
+    codexCallId: coordination.codexCall.codexCallId,
+    objectiveId: coordination.codexCall.objectiveId,
+    status: "terminal_error",
+    turnId: null,
+    threadId: null
+  });
+
+  const status = store.readWorkStatus(coordination.workRequest.workRequestId);
+  assert.equal(status.codexCalls[0].state, "FAILED");
+  assert.equal(status.workRequest.state, "RUNNING");
+  assert.equal(status.workRequest.statusReason, "caller_review");
+  assert.equal(status.pendingMailbox, 1);
+  const [failureNotice] = store.listCoordinationMailboxRecovery({
+    workerId: "failure-notice-recovery",
+    limit: 10
+  });
+  assert.equal(failureNotice.mailboxItem.targetKind, "JARVIS");
+  assert.equal(failureNotice.mailboxItem.targetId, coordination.topicContext.topicContextId);
+  assert.equal(failureNotice.mailboxItem.itemType, "STATUS_NOTICE");
+  assert.equal(failureNotice.mailboxItem.codexCallId, coordination.codexCall.codexCallId);
+  assert.equal(failureNotice.callerHermesSessionId, "jarvis-failure-session");
+  assert.equal(failureNotice.mailboxItem.payload.status, "terminal_error");
+});
+
+test("nested Hermes Agent reports route only to the exact parent Agent", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch());
+  const parent = store.createAgentSession({
+    hermesSessionId: "hermes-parent-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "lead",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Lead review",
+    budget: { turns: 4 }
+  });
+  store.createAgentSession({
+    hermesSessionId: "hermes-child-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: parent.agentSession.agentSessionId,
+    role: "worker",
+    triggerPrincipalId: `agent:${parent.agentSession.agentSessionId}`,
+    reason: "Nested review",
+    budget: { turns: 2 }
+  });
+  const input = {
+    sourceId: "hermes-stop-nested",
+    childHermesSessionId: "hermes-child-agent",
+    parentHermesSessionId: "hermes-parent-agent",
+    childStatus: "completed",
+    summary: "Nested result",
+    durationMs: 500
+  };
+
+  const reported = store.reportHermesAgentStop(input);
+  assert.deepEqual(reported.mailboxTarget, {
+    kind: "AGENT",
+    id: parent.agentSession.agentSessionId
+  });
+  assert.deepEqual(store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: work.topicContext.topicContextId,
+    workerId: "wrong-parent",
+    limit: 10,
+    leaseMs: 1000
+  }), []);
+  const [mail] = store.claimCoordinationMailbox({
+    targetKind: "AGENT",
+    targetId: parent.agentSession.agentSessionId,
+    workerId: "exact-parent",
+    limit: 10,
+    leaseMs: 1000
+  });
+  assert.equal(mail.payload.report.summary, "Nested result");
+  assert.throws(
+    () => store.reportHermesAgentStop({ ...input, sourceId: "wrong-parent-source", parentHermesSessionId: "another-agent" }),
+    (error) => assertCode(error, "AGENT_PARENT_HERMES_MISMATCH")
+  );
+});
+
+test("untracked and unknown Hermes Agent stop states have deterministic outcomes", (t) => {
+  const { store } = databaseFixture(t);
+  assert.deepEqual(store.reportHermesAgentStop({
+    sourceId: "untracked-stop",
+    childHermesSessionId: "untracked-child",
+    parentHermesSessionId: "parent-session",
+    childStatus: "completed",
+    summary: "Native Hermes only",
+    durationMs: 1
+  }), {
+    duplicate: false,
+    disposition: "UNTRACKED",
+    reportId: null,
+    agentSessionId: null,
+    agentActivationId: null,
+    activeCodexCalls: 0,
+    mailboxItemId: null,
+    mailboxTarget: null
+  });
+
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch());
+  store.createAgentSession({
+    hermesSessionId: "unknown-status-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "worker",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Unknown status test",
+    budget: { turns: 1 }
+  });
+  const failed = store.reportHermesAgentStop({
+    sourceId: "unknown-status-stop",
+    childHermesSessionId: "unknown-status-agent",
+    parentHermesSessionId: "parent-session",
+    childStatus: "future_status",
+    summary: "Unexpected runtime state",
+    durationMs: 2
+  });
+  assert.equal(failed.disposition, "REPORTED");
+  assert.equal(store.readWorkStatus(work.workRequest.workRequestId).agents[0].state, "FAILED");
+  const [mail] = store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: work.topicContext.topicContextId,
+    workerId: "unknown-status-reader",
+    limit: 1,
+    leaseMs: 1000
+  });
+  assert.match(mail.payload.report.unresolved[0], /unsupported status future_status/);
+});
+
+test("mailbox processing failures retry finitely and then require operator recovery", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "mailbox-failure-work",
+    callSourceId: "mailbox-failure-call"
+  }));
+  store.createAgentSession({
+    hermesSessionId: "mailbox-failure-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "worker",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Mailbox failure test",
+    budget: { turns: 1 }
+  });
+  const report = store.reportHermesAgentStop({
+    sourceId: "mailbox-failure-report",
+    childHermesSessionId: "mailbox-failure-agent",
+    parentHermesSessionId: "jarvis-session",
+    childStatus: "completed",
+    summary: "Completed work",
+    durationMs: 1
+  });
+  assert.equal(report.disposition, "REPORTED");
+
+  let rejected;
+  for (let attempt = 1; attempt <= 8; attempt += 1) {
+    const [item] = store.claimCoordinationMailbox({
+      targetKind: "JARVIS",
+      targetId: work.topicContext.topicContextId,
+      mailboxItemId: report.mailboxItemId,
+      workerId: `failure-worker-${attempt}`,
+      limit: 1,
+      leaseMs: 1_000
+    });
+    assert.equal(item.attemptCount, attempt);
+    rejected = store.nackCoordinationMailbox({
+      mailboxItemId: item.mailboxItemId,
+      leaseToken: item.leaseToken,
+      error: "caller resume failed",
+      retryable: true
+    });
+    assert.equal(rejected.retryable, attempt < 8);
+    assert.equal(rejected.mailboxItem.state, attempt < 8 ? "PENDING" : "DEAD");
+  }
+  assert.equal(rejected.workRequest.state, "DEGRADED_PENDING_OPERATOR");
+  assert.equal(rejected.workRequest.statusReason, "mailbox_delivery_failed");
+  assert.equal(rejected.mailboxItem.lastError, "caller resume failed");
+  assert.deepEqual(store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: work.topicContext.topicContextId,
+    workerId: "post-dead-worker",
+    limit: 1,
+    leaseMs: 1_000
+  }), []);
+});
+
+test("restart recovery exposes exact durable scope and abandons uncertain leases", (t) => {
+  const { clock, store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "recovery-work",
+    callSourceId: "recovery-call",
+    jarvisSessionId: "jarvis-recovery-session"
+  }));
+  const agent = store.createAgentSession({
+    hermesSessionId: "agent-recovery-session",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "reviewer",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Recovery test",
+    budget: { turns: 1 }
+  });
+  const report = store.reportHermesAgentStop({
+    sourceId: "recovery-agent-report",
+    childHermesSessionId: "agent-recovery-session",
+    parentHermesSessionId: "jarvis-recovery-session",
+    childStatus: "completed",
+    summary: "Recovered report",
+    durationMs: 1
+  });
+  assert.equal(report.disposition, "REPORTED");
+
+  const [pending] = store.listCoordinationMailboxRecovery({
+    workerId: "recovery-scanner",
+    limit: 10
+  });
+  assert.equal(pending.mailboxItem.mailboxItemId, report.mailboxItemId);
+  assert.equal(pending.mailboxItem.state, "PENDING");
+  assert.equal(pending.mailboxItem.attemptCount, 0);
+  assert.equal(pending.projectId, "project-1");
+  assert.equal(pending.topicContextId, work.topicContext.topicContextId);
+  assert.equal(pending.streamId, 42);
+  assert.equal(pending.topic, "Build");
+  assert.equal(pending.callerHermesSessionId, "jarvis-recovery-session");
+  assert.equal(pending.parentHermesSessionId, null);
+  assert.equal(pending.agentRole, null);
+  assert.equal(pending.workBrief.originalText, "Implement the change");
+  assert.equal(agent.agentSession.hermesSessionId, "agent-recovery-session");
+
+  const [leased] = store.claimCoordinationMailbox({
+    targetKind: "JARVIS",
+    targetId: work.topicContext.topicContextId,
+    mailboxItemId: report.mailboxItemId,
+    workerId: "crashed-worker",
+    limit: 1,
+    leaseMs: 1_000
+  });
+  clock.value += 1_001;
+  const [uncertain] = store.listCoordinationMailboxRecovery({
+    workerId: "restart-scanner",
+    limit: 10
+  });
+  assert.equal(uncertain.mailboxItem.state, "LEASED");
+  assert.equal(uncertain.mailboxItem.attemptCount, 1);
+  const abandoned = store.abandonCoordinationMailboxRecovery({
+    mailboxItemId: leased.mailboxItemId,
+    expectedState: "LEASED",
+    expectedAttemptCount: 1,
+    reason: "recovery_outcome_unverified"
+  });
+  assert.equal(abandoned.duplicate, false);
+  assert.equal(abandoned.mailboxItem.state, "DEAD");
+  assert.equal(abandoned.mailboxItem.lastError, "recovery_outcome_unverified");
+  assert.equal(abandoned.workRequest.state, "DEGRADED_PENDING_OPERATOR");
+  assert.deepEqual(store.listCoordinationMailboxRecovery({
+    workerId: "after-abandon",
+    limit: 10
+  }), []);
+
+  const orphanWork = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "agent-orphan-work",
+    originalZulipMessageId: 901,
+    jarvisSessionId: "jarvis-recovery-session"
+  }));
+  const orphanAgent = store.createAgentSession({
+    hermesSessionId: "agent-orphan-session",
+    workRequestId: orphanWork.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "reviewer",
+    triggerPrincipalId: `jarvis:${orphanWork.topicContext.topicContextId}`,
+    reason: "Agent orphan recovery test",
+    budget: { turns: 1 }
+  });
+  const agentCall = store.prepareCoordinationDispatch(coordinationDispatch({
+    sourceId: "agent-orphan-work",
+    originalZulipMessageId: 901,
+    callSourceId: "recovery-agent-call",
+    objectiveId: "objective-recovery-agent",
+    invocationOrigin: "AGENT",
+    callerPrincipalId: `agent:${orphanAgent.agentSession.agentSessionId}`,
+    agentSessionId: orphanAgent.agentSession.agentSessionId,
+    agentActivationId: orphanAgent.activation.agentActivationId,
+    forceNewConversation: true,
+    jarvisSessionId: "jarvis-recovery-session"
+  }));
+  const agentTarget = {
+    platform: "zulip",
+    streamId: 42,
+    topic: "Build",
+    sourceMessageId: 901
+  };
+  store.registerExecutionIntent({
+    sourceType: "coordination-call",
+    sourceId: agentCall.codexCall.codexCallId,
+    objectiveId: agentCall.codexCall.objectiveId,
+    projectId: "project-1",
+    backend: "app-server",
+    text: "Recover Agent work",
+    targetSnapshot: agentTarget,
+    topicBinding: { streamId: 42, topic: "Build", actorUserId: 3 }
+  });
+  store.bindBackendObjective({
+    objectiveId: agentCall.codexCall.objectiveId,
+    backend: "app-server",
+    threadId: "thread-recovery-agent"
+  });
+  const submission = store.prepareTurnSubmission({
+    sourceType: "coordination-call",
+    sourceId: agentCall.codexCall.codexCallId,
+    objectiveId: agentCall.codexCall.objectiveId,
+    text: "Recover Agent work",
+    targetSnapshot: agentTarget,
+    leaseOwner: "test"
+  });
+  store.acknowledgeTurnSubmission({
+    submissionId: submission.submission.submissionId,
+    turnId: "turn-recovery-agent"
+  });
+  store.recordCodexCallSubmission({
+    codexCallId: agentCall.codexCall.codexCallId,
+    objectiveId: agentCall.codexCall.objectiveId,
+    status: "accepted",
+    threadId: "thread-recovery-agent",
+    turnId: "turn-recovery-agent"
+  });
+  store.completeTurn({
+    objectiveId: agentCall.codexCall.objectiveId,
+    turnId: "turn-recovery-agent",
+    rawText: "Recovered Agent result",
+    itemIds: ["item-recovery-agent"],
+    sourceType: "app-server",
+    sourceId: "completion-recovery-agent",
+    renderer() {
+      throw new Error("Agent completion must not render a Zulip delivery");
+    }
+  });
+  const [agentRecovery] = store.listCoordinationMailboxRecovery({
+    workerId: "agent-recovery-scanner",
+    limit: 10
+  });
+  assert.equal(agentRecovery.mailboxItem.targetKind, "AGENT");
+  assert.equal(agentRecovery.mailboxItem.targetId, orphanAgent.agentSession.agentSessionId);
+  assert.equal(agentRecovery.callerHermesSessionId, "agent-orphan-session");
+  assert.equal(agentRecovery.parentHermesSessionId, "jarvis-recovery-session");
+  assert.equal(agentRecovery.agentRole, "reviewer");
+  const [claimedAgentRecovery] = store.claimCoordinationMailbox({
+    targetKind: "AGENT",
+    targetId: orphanAgent.agentSession.agentSessionId,
+    mailboxItemId: agentRecovery.mailboxItem.mailboxItemId,
+    workerId: "crashed-agent-recovery-worker",
+    limit: 1,
+    leaseMs: 1_000
+  });
+  clock.value += 1_001;
+  const transferred = store.abandonCoordinationMailboxRecovery({
+    mailboxItemId: claimedAgentRecovery.mailboxItemId,
+    expectedState: "LEASED",
+    expectedAttemptCount: 1,
+    reason: "recovery_outcome_unverified"
+  });
+  assert.equal(transferred.mailboxItem.state, "DEAD");
+  assert.equal(transferred.mailboxItem.lastError, "orphaned:recovery_outcome_unverified");
+  assert.equal(transferred.workRequest.state, "RUNNING");
+  assert.equal(transferred.workRequest.statusReason, "caller_review");
+  const statusAfterOrphan = store.readWorkStatus(orphanWork.workRequest.workRequestId);
+  assert.equal(statusAfterOrphan.agents[0].state, "FAILED_ORPHANED");
+  const [orphanNotice] = store.listCoordinationMailboxRecovery({
+    workerId: "orphan-notice-recovery",
+    limit: 10
+  });
+  assert.equal(orphanNotice.mailboxItem.targetKind, "JARVIS");
+  assert.equal(orphanNotice.mailboxItem.itemType, "ORPHAN_RECOVERY_NOTICE");
+  assert.equal(orphanNotice.callerHermesSessionId, "jarvis-recovery-session");
+  assert.deepEqual(orphanNotice.mailboxItem.payload.recoveryOptions, [
+    "reactivate_same_agent",
+    "create_replacement_agent",
+    "cancel_work"
+  ]);
+  assert.deepEqual(orphanNotice.mailboxItem.payload.protectedResultRef, {
+    kind: "coordination_mailbox",
+    mailboxItemId: claimedAgentRecovery.mailboxItemId,
+    codexCallId: agentCall.codexCall.codexCallId
+  });
+  assert.equal(JSON.stringify(orphanNotice.mailboxItem.payload).includes("Recovered Agent result"), false);
+});
+
+test("Hermes restart recovery orphans only pre-start active Agent activations", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "restart-agent-work",
+    originalZulipMessageId: 902,
+    jarvisSessionId: "jarvis-restart-session"
+  }));
+  const agent = store.createAgentSession({
+    hermesSessionId: "agent-before-restart",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "worker",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Restart recovery test",
+    budget: { turns: 1 }
+  });
+
+  assert.deepEqual(store.listCoordinationAgentRestartRecovery({
+    startedBefore: START_MS,
+    limit: 10
+  }), []);
+  const [candidate] = store.listCoordinationAgentRestartRecovery({
+    startedBefore: START_MS + 1,
+    limit: 10
+  });
+  assert.equal(candidate.agentSessionId, agent.agentSession.agentSessionId);
+  assert.equal(candidate.hermesSessionId, "agent-before-restart");
+  assert.equal(candidate.agentActivationId, agent.activation.agentActivationId);
+  assert.equal(candidate.agentState, "RUNNING");
+  assert.equal(candidate.parentHermesSessionId, null);
+  assert.equal(candidate.jarvisSessionId, "jarvis-restart-session");
+
+  const orphaned = store.orphanCoordinationAgentRestart({
+    agentSessionId: candidate.agentSessionId,
+    agentActivationId: candidate.agentActivationId,
+    expectedState: candidate.agentState,
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  });
+  assert.equal(orphaned.duplicate, false);
+  assert.equal(orphaned.agentSession.state, "FAILED_ORPHANED");
+  assert.equal(orphaned.workRequest.state, "RUNNING");
+  assert.equal(orphaned.workRequest.statusReason, "caller_review");
+  assert.equal(orphaned.mailboxItem.targetKind, "JARVIS");
+  assert.equal(orphaned.mailboxItem.itemType, "ORPHAN_RECOVERY_NOTICE");
+  assert.equal(orphaned.mailboxItem.payload.failedHermesSessionId, "agent-before-restart");
+  assert.deepEqual(orphaned.mailboxItem.payload.protectedResultRef, {
+    kind: "agent_activation",
+    agentActivationId: agent.activation.agentActivationId
+  });
+  assert.equal(store.orphanCoordinationAgentRestart({
+    agentSessionId: candidate.agentSessionId,
+    agentActivationId: candidate.agentActivationId,
+    expectedState: candidate.agentState,
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  }).duplicate, true);
+  assert.throws(() => store.orphanCoordinationAgentRestart({
+    agentSessionId: candidate.agentSessionId,
+    agentActivationId: "activation-stale",
+    expectedState: candidate.agentState,
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  }), (error) => assertCode(error, "AGENT_RECOVERY_CONFLICT"));
+  assert.deepEqual(store.listCoordinationAgentRestartRecovery({
+    startedBefore: START_MS + 1,
+    limit: 10
+  }), []);
+});
+
+test("Hermes restart recovery CAS preserves an Agent that reported after the scan", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "restart-cas-work",
+    originalZulipMessageId: 903,
+    jarvisSessionId: "jarvis-restart-cas"
+  }));
+  const agent = store.createAgentSession({
+    hermesSessionId: "agent-restart-cas",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "worker",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "CAS recovery test",
+    budget: { turns: 1 }
+  });
+  const [candidate] = store.listCoordinationAgentRestartRecovery({
+    startedBefore: START_MS + 1,
+    limit: 10
+  });
+  store.reportHermesAgentStop({
+    sourceId: "restart-cas-report",
+    childHermesSessionId: "agent-restart-cas",
+    parentHermesSessionId: "jarvis-restart-cas",
+    childStatus: "completed",
+    summary: "Completed before orphan transition",
+    durationMs: 10
+  });
+
+  assert.throws(() => store.orphanCoordinationAgentRestart({
+    agentSessionId: candidate.agentSessionId,
+    agentActivationId: candidate.agentActivationId,
+    expectedState: candidate.agentState,
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  }), (error) => assertCode(error, "AGENT_RECOVERY_CONFLICT"));
+  assert.equal(store.readWorkStatus(work.workRequest.workRequestId).agents[0].state, "REPORTED");
+});
+
+test("Hermes restart orphan notice targets the exact parent Agent", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "restart-nested-work",
+    originalZulipMessageId: 904,
+    jarvisSessionId: "jarvis-restart-nested"
+  }));
+  const parent = store.createAgentSession({
+    hermesSessionId: "restart-parent-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "lead",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Supervise nested recovery",
+    budget: { turns: 2 }
+  });
+  const child = store.createAgentSession({
+    hermesSessionId: "restart-child-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: parent.agentSession.agentSessionId,
+    role: "worker",
+    triggerPrincipalId: `agent:${parent.agentSession.agentSessionId}`,
+    reason: "Nested recovery target",
+    budget: { turns: 1 }
+  });
+  const orphaned = store.orphanCoordinationAgentRestart({
+    agentSessionId: child.agentSession.agentSessionId,
+    agentActivationId: child.activation.agentActivationId,
+    expectedState: "RUNNING",
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  });
+
+  assert.equal(orphaned.mailboxItem.targetKind, "AGENT");
+  assert.equal(orphaned.mailboxItem.targetId, parent.agentSession.agentSessionId);
+  assert.equal(orphaned.workRequest.supervisorPrincipalId, `agent:${parent.agentSession.agentSessionId}`);
+});
+
+test("Hermes restart orphan without a live supervisor degrades to operator", (t) => {
+  const { store } = databaseFixture(t);
+  const work = store.ensureCoordinationWorkRequest(coordinationDispatch({
+    sourceId: "restart-operator-work",
+    originalZulipMessageId: 905,
+    jarvisSessionId: null
+  }));
+  const agent = store.createAgentSession({
+    hermesSessionId: "restart-operator-agent",
+    workRequestId: work.workRequest.workRequestId,
+    parentAgentSessionId: null,
+    role: "worker",
+    triggerPrincipalId: `jarvis:${work.topicContext.topicContextId}`,
+    reason: "Operator fallback test",
+    budget: { turns: 1 }
+  });
+  const orphaned = store.orphanCoordinationAgentRestart({
+    agentSessionId: agent.agentSession.agentSessionId,
+    agentActivationId: agent.activation.agentActivationId,
+    expectedState: "RUNNING",
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  });
+
+  assert.equal(orphaned.mailboxItem, null);
+  assert.equal(orphaned.workRequest.state, "DEGRADED_PENDING_OPERATOR");
+  assert.equal(orphaned.workRequest.statusReason, "orphan_supervisor_unavailable");
+  store.readWorkStatus(work.workRequest.workRequestId);
+  assert.equal(store.orphanCoordinationAgentRestart({
+    agentSessionId: agent.agentSession.agentSessionId,
+    agentActivationId: agent.activation.agentActivationId,
+    expectedState: "RUNNING",
+    startedBefore: START_MS + 1,
+    reason: "hermes_restart_outcome_unverified"
+  }).duplicate, true);
+});
+
+test("authority delegation narrows scope and write leases require ordered fenced acquisition", (t) => {
+  const { store } = databaseFixture(t);
+  const topic = store.ensureTopicContext({
+    streamId: 42,
+    topic: "Build",
+    projectId: "project-1",
+    sourceType: "test",
+    sourceId: "topic-authority"
+  }).topicContext;
+  const authority = store.createAuthorityEnvelope({
+    grantorPrincipalId: "boss:3",
+    granteePrincipalId: "jarvis:topic",
+    topicContextId: topic.topicContextId,
+    projectId: "project-1",
+    operationClasses: ["file_change"],
+    resourcePatterns: ["src/"],
+    pathScope: ["/project/src"],
+    networkScope: [],
+    riskCeiling: 1,
+    canDelegate: true,
+    maxDelegationDepth: 1,
+    maxUses: 2,
+    validFrom: START_MS - 1,
+    expiresAt: START_MS + 10_000,
+    policyRevision: 1
+  });
+  assert.equal(store.evaluateAuthorization({
+    authorizationContextId: authority.authorizationContextId,
+    principalId: "jarvis:topic",
+    topicContextId: topic.topicContextId,
+    projectId: "project-1",
+    operationClass: "file_change",
+    path: "/project/src/a.js",
+    riskLevel: 1,
+    policyRevision: 1
+  }).decision, "JARVIS_DECIDE");
+  assert.equal(store.evaluateAuthorization({
+    authorizationContextId: authority.authorizationContextId,
+    principalId: "jarvis:topic",
+    topicContextId: topic.topicContextId,
+    projectId: "project-1",
+    operationClass: "file_change",
+    path: "/other/a.js",
+    riskLevel: 1,
+    policyRevision: 1
+  }).decision, "DENY");
+
+  assert.throws(() => store.acquireCoordinationWriteLeases({
+    ownerActivationId: "activation-a",
+    leaseMs: 1_000,
+    resources: [
+      { resourceType: "path", resourceId: "z" },
+      { resourceType: "path", resourceId: "a" }
+    ]
+  }), (error) => assertCode(error, "RESOURCE_LEASE_ORDER_INVALID"));
+  const acquired = store.acquireCoordinationWriteLeases({
+    ownerActivationId: "activation-a",
+    leaseMs: 1_000,
+    resources: [
+      { resourceType: "path", resourceId: "a" },
+      { resourceType: "path", resourceId: "z" }
+    ]
+  });
+  assert.equal(acquired.acquired, true);
+  assert.deepEqual(acquired.leases.map((lease) => lease.fencingToken), [1, 1]);
+  assert.equal(store.acquireCoordinationWriteLeases({
+    ownerActivationId: "activation-b",
+    leaseMs: 1_000,
+    resources: [{ resourceType: "path", resourceId: "a" }]
+  }).reason, "RESOURCE_BUSY");
+  assert.equal(store.releaseCoordinationWriteLeases({
+    ownerActivationId: "activation-a",
+    leases: acquired.leases.map(({ resourceType, resourceId, leaseToken }) => ({ resourceType, resourceId, leaseToken }))
+  }).released, 2);
 });

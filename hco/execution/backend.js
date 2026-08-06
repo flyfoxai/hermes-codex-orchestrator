@@ -1,3 +1,5 @@
+import { normalizeFileExchangeCapability } from "../file-exchange/contracts.js";
+
 const METHODS = Object.freeze([
   "startObjective",
   "startTurn",
@@ -41,5 +43,15 @@ export function validateExecutionBackend(backend) {
   ) {
     throw executionBackendError("EXECUTION_BACKEND_INVALID", "Execution backend is invalid.");
   }
+  try {
+    normalizeFileExchangeCapability(capabilities.fileExchange);
+  } catch {
+    throw executionBackendError("EXECUTION_BACKEND_INVALID", "Execution backend is invalid.");
+  }
   return backend;
+}
+
+export function executionFileExchangeCapability(backend) {
+  validateExecutionBackend(backend);
+  return normalizeFileExchangeCapability(backend.getCapabilities().fileExchange);
 }

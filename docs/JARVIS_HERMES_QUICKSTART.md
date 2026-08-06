@@ -4,6 +4,16 @@
 
 这份说明给仍在使用旧 Runner/tmux 的 Jarvis 主 Hermes 使用。目标是让 Hermes 知道如何通过本机 Runner 把任务交给 Codex，并正确处理 Zulip、飞书、Hermes 原生对话和多项目目录。新安装应运行 `scripts/install-hermes-codex-bridge.sh` 并以 [Option C 设计](superpowers/specs/2026-07-16-hermes-codex-option-c-design.md)和[实施审核](reviews/OPTION_C_IMPLEMENTATION_REVIEW.md)为准。
 
+如果当前部署走 Option C，不要使用本文的 `http://127.0.0.1:8731` Runner API 创建任务。Option C 的项目模型参数写在仓库外 `~/.hco/hco.json` 的 `projects[].threadOptions` 中，并通过本地 Unix socket 查询当前 Codex 源：
+
+```sh
+curl --unix-socket /Users/hula/.hco/hco.sock \
+  -H "Authorization: Bearer $(cat /Users/hula/.hco/hco.bearer)" \
+  "http://localhost/v1/models?includeHidden=true&limit=100"
+```
+
+用返回的 `result.models[].id` 设置 `threadOptions.model`，用同一模型的 `supportedReasoningEfforts` 设置 `threadOptions.modelReasoningEffort`。完整 Option C 使用步骤见 [CHANNEL_TOPIC_MANAGEMENT.md](CHANNEL_TOPIC_MANAGEMENT.md) 和 [OPERATIONS.md](OPERATIONS.md)。
+
 ## 当前本机安装状态
 
 仓库位置：

@@ -2,7 +2,10 @@ const DEFAULT_SUPPORTED_MAJORS = Object.freeze([1]);
 const DEFAULT_KNOWN_CAPABILITIES = Object.freeze([
   "signed_context",
   "message_binding",
-  "nonce_replay"
+  "nonce_replay",
+  "artifact_manifest",
+  "project_local_exchange_v1",
+  "zulip_zform_v1"
 ]);
 
 function contractError(code, message) {

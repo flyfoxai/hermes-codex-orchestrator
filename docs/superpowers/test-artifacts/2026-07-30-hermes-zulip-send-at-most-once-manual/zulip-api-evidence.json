@@ -1,0 +1,41 @@
+{
+  "captured_at_utc": "2026-07-30T06:10:00Z",
+  "stream_id": 5,
+  "stream": "量化交易stockProfits",
+  "topic": "hermes-v019-pc03-send-once-20260730-134602",
+  "messages": [
+    {
+      "id": 715,
+      "sender": "boss",
+      "timestamp_unix": 1785390436,
+      "timestamp_utc": "2026-07-30T05:47:16Z",
+      "content": "@**Jarvis PM** 我需要收集一个测试选择。请让我在“选项 A”“选项 B”“取消”三个选项中选择；这只是交互测试，不执行项目操作。",
+      "rendered_html": "<p><span class=\"user-mention\" data-user-id=\"9\">@Jarvis PM</span> 我需要收集一个测试选择。请让我在“选项 A”“选项 B”“取消”三个选项中选择；这只是交互测试，不执行项目操作。</p>"
+    },
+    {
+      "id": 716,
+      "sender": "Jarvis PM",
+      "timestamp_unix": 1785390499,
+      "timestamp_utc": "2026-07-30T05:48:19Z",
+      "content": "⚠️ The model provider failed after retries. I kept raw provider details out of chat; check gateway logs for diagnostics.",
+      "rendered_html": "<p><span aria-label=\"warning\" class=\"emoji emoji-26a0\" role=\"img\" title=\"warning\">:warning:</span> The model provider failed after retries. I kept raw provider details out of chat; check gateway logs for diagnostics.</p>"
+    },
+    {
+      "id": 717,
+      "sender": "Jarvis PM",
+      "timestamp_unix": 1785390499,
+      "timestamp_utc": "2026-07-30T05:48:19Z",
+      "content": "⚠️ The model provider failed after retries. I kept raw provider details out of chat; check gateway logs for diagnostics.",
+      "rendered_html": "<p><span aria-label=\"warning\" class=\"emoji emoji-26a0\" role=\"img\" title=\"warning\">:warning:</span> The model provider failed after retries. I kept raw provider details out of chat; check gateway logs for diagnostics.</p>"
+    }
+  ],
+  "duplicate_comparison": {
+    "message_ids": [716, 717],
+    "same_sender": true,
+    "same_timestamp": true,
+    "same_content": true,
+    "same_rendered_html": true,
+    "independent_persisted_messages": true
+  },
+  "secrets_omitted": true
+}

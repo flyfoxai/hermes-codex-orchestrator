@@ -106,9 +106,13 @@ test("valid capability arrays allow empty input and preserve filtered deduplicat
     negotiateBridge({
       protocolVersion: 1,
       pluginVersion: "0.3.0",
-      capabilities: ["unknown", "signed_context", "signed_context"]
+      capabilities: ["unknown", "signed_context", "artifact_manifest", "project_local_exchange_v1", "signed_context"]
     }),
-    { protocolVersion: 1, peerPluginVersion: "0.3.0", capabilities: ["signed_context"] }
+    {
+      protocolVersion: 1,
+      peerPluginVersion: "0.3.0",
+      capabilities: ["signed_context", "artifact_manifest", "project_local_exchange_v1"]
+    }
   );
 });
 

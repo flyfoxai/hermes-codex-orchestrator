@@ -1,0 +1,57 @@
+{
+  "session_id": "49901f40-3d94-4a7d-a95e-9f0d0af35cb2",
+  "response": "{\"verdict\":\"APPROVE\",\"blockingIssues\":[],\"nonBlockingSuggestions\":[],\"finalRationale\":\"All test suites pass, security and routing semantics are correctly implemented without G-01B issues, and previous feedback regarding HERMES_HOME permissions and AMBIGUOUS_SOURCE propagation has been properly addressed.\"}",
+  "stats": {
+    "models": {
+      "gemini-3.1-pro-preview": {
+        "api": {
+          "totalRequests": 1,
+          "totalErrors": 0,
+          "totalLatencyMs": 10013
+        },
+        "tokens": {
+          "input": 11994,
+          "prompt": 11994,
+          "candidates": 61,
+          "total": 12763,
+          "cached": 0,
+          "thoughts": 708,
+          "tool": 0
+        },
+        "roles": {
+          "main": {
+            "totalRequests": 1,
+            "totalErrors": 0,
+            "totalLatencyMs": 10013,
+            "tokens": {
+              "input": 11994,
+              "prompt": 11994,
+              "candidates": 61,
+              "total": 12763,
+              "cached": 0,
+              "thoughts": 708,
+              "tool": 0
+            }
+          }
+        }
+      }
+    },
+    "tools": {
+      "totalCalls": 0,
+      "totalSuccess": 0,
+      "totalFail": 0,
+      "totalDurationMs": 0,
+      "totalDecisions": {
+        "accept": 0,
+        "reject": 0,
+        "modify": 0,
+        "auto_accept": 0
+      },
+      "byName": {}
+    },
+    "files": {
+      "totalLinesAdded": 0,
+      "totalLinesRemoved": 0
+    }
+  }
+}

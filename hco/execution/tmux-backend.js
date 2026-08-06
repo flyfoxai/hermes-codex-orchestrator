@@ -1,4 +1,5 @@
 import { executionBackendError, validateExecutionBackend } from "./backend.js";
+import { UNSUPPORTED_FILE_EXCHANGE_CAPABILITY } from "../file-exchange/contracts.js";
 
 const EXECUTOR_METHODS = Object.freeze([
   "startObjective",
@@ -38,7 +39,8 @@ export function createTmuxBackend({ executor } = {}) {
       return Object.freeze({
         backend: "tmux",
         durableThreadContinuity: false,
-        reverseInteractions: false
+        reverseInteractions: false,
+        fileExchange: UNSUPPORTED_FILE_EXCHANGE_CAPABILITY
       });
     }
   }));

@@ -1,0 +1,43 @@
+{
+  "captured_at_local": "2026-07-30T14:10:00+08:00",
+  "topic": "hermes-v019-pc03-send-once-20260730-134602",
+  "request_message_id": 715,
+  "agent_session": "20260730_134716_7072c567",
+  "gateway_counts": {
+    "inbound_messages": 1,
+    "agent_turn_context": 1,
+    "provider_attempt_failures": 3,
+    "clarify_response_intercepts": 0,
+    "clarify_tool_completed": 0,
+    "response_ready": 1,
+    "zulip_send_log": 1
+  },
+  "hco_counts_for_message_ids_715_to_717": {
+    "work_requests": 0,
+    "codex_calls": 0,
+    "inbound_intents": 0
+  },
+  "provider_outcome": {
+    "http_status": 502,
+    "attempts": 3,
+    "prompt_generated": false,
+    "failure_messages": [716, 717],
+    "duplicate_failure_message_count": 2
+  },
+  "pc03_race": {
+    "status": "NOT_RUN_BLOCKED",
+    "reason": "Provider failed before clarify prompt generation",
+    "second_tab_created": false,
+    "choice_clicks": 0
+  },
+  "evaluation": {
+    "failure_alert_at_most_once": "FAIL",
+    "strict_pc03_double_click": "NOT_RUN_BLOCKED",
+    "overall_manual_retest": "FAIL"
+  },
+  "screenshot": {
+    "filename": "pc03-send-once-provider-failure-20260730-134602_2026-07-30T06-07-11-177Z.png",
+    "sha256": "3dc8494108b6062c111b4684c6f86196af7c22ae24b4354a9b7723f9ea035558"
+  },
+  "secrets_and_raw_payloads_omitted": true
+}

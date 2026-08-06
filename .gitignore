@@ -23,3 +23,9 @@ config/*state*.json
 *.p12
 *.crt
 *.csr
+
+# Python bytecode — must not be committed
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

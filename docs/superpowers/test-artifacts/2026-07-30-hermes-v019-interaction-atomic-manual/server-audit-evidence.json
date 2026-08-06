@@ -1,0 +1,38 @@
+{
+  "captured_at_local": "2026-07-30T10:37:00+08:00",
+  "topic": "hermes-v019-pc03-atomic-20260730-100608",
+  "clarify_id": "64062259af",
+  "agent_session": "20260730_101300_66014a3f",
+  "browser_clicks": [
+    {
+      "choice": "选项 A",
+      "client": "tab-1",
+      "started_at_local": "2026-07-30T10:19:37.7733308+08:00"
+    },
+    {
+      "choice": "选项 B",
+      "client": "tab-2",
+      "started_at_local": "2026-07-30T10:19:38.0807905+08:00"
+    }
+  ],
+  "server_first_choice": "选项 B",
+  "server_recorded_at": "2026-07-30 10:19:38 CST",
+  "gateway_counts": {
+    "clarify_response_intercepts": 2,
+    "agent_turn_context": 1,
+    "clarify_tool_completed": 1,
+    "response_ready": 1,
+    "zulip_send_log": 1
+  },
+  "hco_counts_for_message_ids_708_to_714": {
+    "work_requests": 0,
+    "codex_calls": 0,
+    "inbound_intents": 0
+  },
+  "provider_outcome": {
+    "winner_continuation_completed_normally": false,
+    "failure_messages": [713, 714],
+    "duplicate_failure_message_count": 2
+  },
+  "secrets_and_raw_payloads_omitted": true
+}

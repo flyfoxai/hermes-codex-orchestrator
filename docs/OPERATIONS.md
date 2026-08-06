@@ -244,6 +244,46 @@ launchctl bootstrap "$DOMAIN" "$DELIVERY_PLIST"
 
 HCO 必须先于 delivery 可用。需要同时冷启动时，先 bootstrap HCO，确认其 socket 和 `/v1/compatibility` 正常，再 bootstrap delivery。日志默认位于 `~/Library/Application Support/HermesCodexBridge/logs/`，诊断和工单中不得粘贴 bearer、HMAC key、Zulip API key 或完整环境变量。
 
+### 话题协调、interaction 与重启恢复
+
+- channel route 是项目和 canonical cwd 的唯一权威；topic 只隔离上下文。不得通过 topic 文本、Agent 请求或模型输出覆盖 project/cwd。
+- Direct Zulip Codex 调用的完成消息进入原 topic outbox。Jarvis 和 Agent 调用的原始结果只进入准确 caller mailbox；由 Agent 报告父 Agent、Agent 报告 Jarvis、Jarvis 汇总给 Boss。
+- 普通短 interaction 使用单条 `action_prompt` 原生按钮。回答成功结算后，只有已取得 prompt 的 Zulip message ID 才会排队删除；重复点击不会产生第二次 Codex answer。
+- `response_uncertain`、连接丢失和 orphan interaction 都进入 `STATUS_UNVERIFIED`。此状态表示“后端结果无法证明”，不是 `running` 的同义词。系统不会重发回答；Jarvis/Agent 收到 durable `STATUS_NOTICE`，Direct Zulip 收到同 topic durable notice，之后必须以 App Server reconciliation 结果推进。
+- Hermes Agent terminal report 先落到 `$HERMES_HOME/hco-agent-report-spool/`，目录要求当前用户所有、非 symlink 且不允许 group/other 权限；记录使用原子 replace 和 fsync。不要手工编辑或复制 spool 文件，同一 source 内容不一致会作为幂等冲突保留并告警。
+- Hermes 启动后只扫描启动 cutoff 之前的非终态 Agent activation。恢复使用 CAS 和准确 activation ID；可验证父 Agent时通知父 Agent，否则通知 topic Jarvis，再失败进入 `DEGRADED_PENDING_OPERATOR`。仅恢复订阅或重放相同通知不会直接向 Zulip发送原始 Codex 结果。
+- mailbox worker 使用 lease token 和续租。达到有界重试上限、caller session 不可恢复或 scope 不一致时，记录失败原因并走孤儿监督转移；不得直接 ACK 丢弃或跨 topic 唤醒相似 session。
+
+升级前创建、没有 `objective_scopes` 的 legacy objective 不会自动归属当前 topic。continuation/status/cancel 返回 `OBJECTIVE_TOPIC_MIGRATION_REQUIRED`；只有项目 maintainer/admin 可在唯一精确匹配的旧 topic 使用 `/codex thread bind <objectiveId> <threadId>` 建立 scope 并恢复 thread。先核对 durable 历史绑定和 App Server thread，不要按 topic 名称猜测。
+
+查询当前 Codex 源提供的模型和推理深度：
+
+```sh
+curl --unix-socket /Users/hula/.hco/hco.sock \
+  -H "Authorization: Bearer $(cat /Users/hula/.hco/hco.bearer)" \
+  "http://localhost/v1/models?includeHidden=true&limit=100"
+```
+
+响应位于 `result.models`。常用字段包括 `id`、`displayName`、`hidden`、`supportedReasoningEfforts`、`defaultReasoningEffort`、`serviceTiers` 和 `isDefault`。`result.cached` 表示来自 HCO TTL 缓存，`result.stale` 表示 Codex App Server 当前不可用但有旧缓存可用，`result.sourceStatus` 为 `unavailable` 时不要据此更新生产配置。首次查询没有缓存且源不可用时，接口返回 `503 MODEL_CATALOG_UNAVAILABLE`，这通常表示 Codex App Server 尚未连接、Codex 登录或账号源不可用。
+
+### Artifact 协议检查
+
+`artifact_manifest` 使用项目配置中的 canonical `cwd` 作为文件根目录。不要直接编辑数据库中的 artifact 状态，也不要把缺失的 input 当作可选输入。required output 未验证通过时，submission 应停在 `reconciliation_needed`，且不应出现最终 outbox delivery；补齐文件后通过正常 completion reconciliation 重试。
+
+可用只读 SQLite 查询检查最近的文件契约：
+
+```sh
+sqlite3 -readonly "$HCO_DATABASE_PATH" <<'SQL'
+.headers on
+.mode column
+SELECT submission_id, direction, artifact_id, state, observed_bytes
+FROM artifact_contracts
+ORDER BY created_at_ms DESC, direction, artifact_id;
+SQL
+```
+
+状态含义为 `declared`、`verified`、`missing`、`mismatch` 和 `invalid`。诊断时同时检查声明路径所在项目 `cwd`、文件类型、大小和 SHA-256，但不要在工单或聊天中粘贴敏感文件内容。当前 delivery sidecar 只发送 outbox 文本 `content`，不会把 artifact 自动上传到 Zulip；完整协议见 [ARTIFACT_PROTOCOL.md](ARTIFACT_PROTOCOL.md)。
+
 升级使用与首次安装相同的命令重新运行安装器。它先持有每用户锁，完成三层兼容检查，创建完整的不可变版本目录，再原子切换 `plugins/hermes-codex-bridge` symlink。旧 release 在提交前不会删除；遇到非 symlink 的现有插件目录会保留原目录并拒绝安装。
 
 部署变更开始后的失败或信号会触发自动回滚：停止本次启动的 bridge 服务，恢复配置、`.env`、plist、插件 symlink 和原先的服务加载状态。若输出包含 `rollback verification failed`，不要继续启动 delivery；保留现场并按诊断中的非敏感路径人工恢复。
@@ -255,10 +295,51 @@ HCO 必须先于 delivery 可用。需要同时冷启动时，先 bootstrap HCO�
 ```sh
 /bin/bash test/install-hermes-codex-bridge.test.sh
 PYTHONDONTWRITEBYTECODE=1 \
-  /Users/hula/Projects/hermesAgent/.venv/bin/python3 \
+  /Users/hula/Projects/hermesAgent/venv/bin/python3 \
   -m pytest -q test/hermes_plugin_contract_test.py
 launchctl print "gui/$(id -u)/com.hermes.codex-bridge-hco"
 launchctl print "gui/$(id -u)/com.hermes.codex-bridge-delivery"
 ```
 
 验证默认与 `codex-bridge` profile 仍只暴露 bridge 所需工具，`hermes-general` 在 bridge 两个服务都关闭时仍能用于普通对话，并确认有效 `ZULIP_CONTEXT_DEPTH=0`。
+
+## HCO Fix2 后续强化：部署证据、路由审计与链路诊断
+
+安装器成功提交后会在 installer root 写入 `deployment-manifest.json`。该文件权限应为 `0600`，只包含 release、gateway PID/attestation、服务状态和 route semantic hash；不包含 token、HMAC、CWD、消息正文或 route 配置正文。若 manifest 缺失或状态不是 `COMMITTED`，不要把文件已切换视为部署完成。
+
+本地未映射 route 的脱敏审计写入 Hermes home 下的 `hermes-codex-bridge-route-audit.jsonl`，权限必须为 `0600`，文件不得是 symlink、hardlink 或其他用户所有。按 message ID 查询：
+
+```sh
+python3 scripts/query-hermes-route-audit.py \
+  --source-message-id 542 \
+  --json
+```
+
+查询返回 `UNIQUE` 才表示唯一审计命中；`NOT_FOUND`、`AMBIGUOUS`、`UNTRUSTED` 都不能当作审计通过。工具会跳过并计数 NUL 或 malformed 行，不会回显坏行。审计文件达到大小上限时，本地终止决策会 fail closed；本轮不实现复杂后台轮转器，建议在确认路径和 owner-only 权限后采用系统级轮转，并在轮转前保留工单关联。
+
+按 Zulip source message ID 汇总 HCO 只读链路：
+
+```sh
+python3 scripts/trace-zulip-message.py \
+  --database "$HCO_DATABASE_PATH" \
+  --source-message-id 542 \
+  --audit-file "$HOME/.hermes/hermes-codex-bridge-route-audit.jsonl" \
+  --json
+```
+
+该工具以 SQLite read-only URI 打开数据库，只输出层级状态和安全 ID。未映射 route 的预期是 gateway audit 命中、HCO 层无适用业务记录；PROJECT route 应显示 inbound/objective/submission/outbox 的实际停止层；显式 HERMES route 的普通消息归 Hermes，而显式 `/codex` 命令应进入 HCO 并返回 `ROUTE_HERMES_OWNED`，不能用“没有项目 objective”误判为丢消息。
+
+部署后自动冒烟默认只做 preflight/dry-run。只有明确的 `--send` 授权、隔离测试 topic、唯一 RUN_ID、只读 instruction 和 route/PID/attestation 稳定时才允许发送真实 Zulip 消息；`BridgeUncertainError` 不得自动重试。旧 release manifest、临时 staging 目录和测试结果应在确认没有回滚或审计需要后由运维手工清理，禁止脚本按模糊路径批量删除。
+
+只读部署后检查使用：
+
+```sh
+python3 scripts/hco-post-deploy-smoke.py \
+  --hco-config "$HCO_CONFIG_PATH" \
+  --output-json /tmp/hco-post-deploy-smoke.json \
+  --output-markdown /tmp/hco-post-deploy-smoke.md
+```
+
+该命令不会发送 Zulip 消息，也不会写 HCO 业务数据。它核对 deployment manifest、stable symlink、release hash、gateway attestation/PID、部署时服务状态以及当前 route snapshot 的完整性、时效、generation 和 semantic hash。服务清单是部署提交时证据，实时探测仅覆盖 attested gateway PID；HCO 和 delivery 的实时状态仍以 `launchctl print` 为准。需要检查用例前置条件时可传入 `--unmapped-stream-id`、`--project-stream-id`、`--hermes-stream-id`；缺少显式 HERMES 隔离 stream 会报告 `BLOCKED_PRECONDITION`，不能记为端到端通过。
+
+`scripts/hco-fix2-automated-acceptance.sh` 默认跳过 Zulip API 发送。设置 `HCO_CONFIG_PATH` 后它会先运行上述只读 preflight；只有 preflight 全部通过且获得真实发送授权后才能显式运行 `--send`，否则记录 `BLOCKED_PREFLIGHT_REQUIRED` 并拒绝发送。可用 `HCO_SMOKE_INSTALL_ROOT`、`HCO_SMOKE_STABLE_LINK`、`HCO_SMOKE_ATTESTATION_FILE` 和三类 `HCO_SMOKE_*_STREAM_ID` 环境变量指定经过批准的运行态证据和测试 stream。直接调用 `scripts/hco-fix2-api-acceptance.py` 同样必须提供 `--send`，防止误发。
