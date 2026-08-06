@@ -24,7 +24,7 @@ ZULIP_ALLOWED_USERS=user8@zulip.dounetwork.duckdns.org
 
 - profile secret scope 授权判定：boss `True`；`intruder@example.invalid` `False`。
 - Hermes Zulip 授权回归：`7 passed, 248 deselected`。
-- provider smoke check：`iotwq / gpt-5.6-sol`、`codex_responses` 返回 `PROVIDER_HEALTH_OK`。
+- provider smoke check：使用与 launchd Gateway 相同的 Python 3.11 运行环境调用 `iotwq / gpt-5.6-sol`、`codex_responses`，返回 `PROVIDER_HEALTH_OK_311`。
 - Gateway 已重启并轮换 PID：旧 `11518`，当前 `77126`。
 - HCO PID `11484`、delivery PID `11635` 未改变。
 - 当前 Zulip ingress 在 Gateway 启动日志中成功认证。
