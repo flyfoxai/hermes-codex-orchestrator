@@ -1,0 +1,45 @@
+{
+  "evidence_type": "sanitized_server_read_only_audit",
+  "run_id": "20260806-210322-2cpi",
+  "source_message_id": 739,
+  "service_host": "devmac",
+  "baseline": {
+    "hermes_commit": "4d5fd2152323580355ce3433159760eb23939450",
+    "orchestrator_commit": "47d7fc9455ab0bcfb1907ff2519d394bebf7c794",
+    "gateway_pid": 11518,
+    "hco_pid": 11484,
+    "delivery_pid": 11635,
+    "delivery_release": "hermes-codex-bridge-1.0.0-dc7ea2133aa0"
+  },
+  "gateway": {
+    "received_by_poller": true,
+    "accepted_business_inbound_count": 0,
+    "authorization_rejection_count": 1,
+    "authorization_rejection": {
+      "timestamp": "2026-08-06T21:17:53.237+08:00",
+      "level": "WARNING",
+      "logger": "gateway.run",
+      "message": "Unauthorized user: user8@zulip.dounetwork.duckdns.org (boss) on zulip"
+    },
+    "provider_invoked": false,
+    "actual_model": null,
+    "response_ready_count": 0,
+    "zulip_final_send_count": 0
+  },
+  "hco_matching_rows": {
+    "event_journal": 0,
+    "inbound_intents": 0,
+    "work_requests": 0,
+    "codex_calls": 0,
+    "turn_submissions": 0,
+    "zulip_outbox": 0,
+    "pending_interactions": 0
+  },
+  "matching_rules": {
+    "source_ids": ["739", "zulip:739"],
+    "run_id": "20260806-210322-2cpi",
+    "original_zulip_message_id": 739,
+    "acknowledged_zulip_message_id": 739
+  },
+  "conclusion": "The website message reached the Zulip poller but was rejected by the Gateway authorization check before Hermes/HCO business ingestion. No objective, turn submission, work request, Codex call, pending interaction, outbox item, provider invocation, or Jarvis reply was created for this run."
+}
