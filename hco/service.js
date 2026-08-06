@@ -333,6 +333,20 @@ function composeSemanticInput(semantic, { includeArtifacts = true } = {}) {
   ).join("\n\n");
 }
 
+function strictReadOnlyTask({ invocationOrigin, text, taskContract }) {
+  if (invocationOrigin !== "JARVIS") return false;
+  const contract = isPlainObject(taskContract) ? taskContract : {};
+  const fields = [
+    text,
+    contract.instruction,
+    ...(Array.isArray(contract.constraints) ? contract.constraints : []),
+    ...(Array.isArray(contract.acceptanceCriteria) ? contract.acceptanceCriteria : []),
+    ...(Array.isArray(contract.reminders) ? contract.reminders : [])
+  ];
+  const normalized = fields.filter((value) => typeof value === "string").join("\n").toLowerCase();
+  return /只读|read[- ]only|no[ -]write(?:s|ing)?|without[ -]writes?/u.test(normalized);
+}
+
 function publicDispatch(projectId, result, coordination = null) {
   const output = {
     schemaVersion: 1,
@@ -586,8 +600,14 @@ export function createHcoService({
     artifactMode,
     artifacts,
     codexCallId,
-    coordinatedSource
+    coordinatedSource,
+    readOnly = false
   }) {
+    const threadOptions = {
+      ...project.threadOptions,
+      ...(readOnly ? { approvalPolicy: "never", sandbox: "read-only" } : {}),
+      cwd: project.cwd
+    };
     return {
       sourceType: coordinatedSource ? "coordination-call" : "zulip-message",
       sourceId: coordinatedSource ? codexCallId : String(binding.sourceMessageId),
@@ -598,7 +618,7 @@ export function createHcoService({
       targetSnapshot: {
         platform: "zulip", streamId: binding.streamId, topic: binding.topic, sourceMessageId: binding.sourceMessageId
       },
-      threadOptions: { ...project.threadOptions, cwd: project.cwd },
+      threadOptions,
       topicBinding: { streamId: binding.streamId, topic: binding.topic, actorUserId: binding.senderId },
       ...(artifactMode === undefined ? {} : { artifactMode }),
       ...(artifacts === undefined ? {} : { artifacts, artifactBaseDir: project.cwd })
@@ -762,7 +782,8 @@ export function createHcoService({
       const options = executionOptions({
         binding, project, objectiveId, text: executionText, artifactMode, artifacts: executionArtifacts,
         codexCallId: coordination.codexCall.codexCallId,
-        coordinatedSource: caller !== null
+        coordinatedSource: caller !== null,
+        readOnly: strictReadOnlyTask({ invocationOrigin, text, taskContract })
       });
       if (allowTopicAuto) options.topicModeAction = "AUTO";
       resultPromise = continuing

@@ -1066,6 +1066,32 @@ test("exact and semantic dispatch select objectives lazily and build only regist
   assert.equal(Object.hasOwn(fixture.calls.accept[1], "role"), false);
 });
 
+test("strict read-only Jarvis dispatches use non-interactive read-only execution", async (t) => {
+  const fixture = serviceFixture(t);
+  const result = await fixture.service.handleBridgeEvent(fixture.event({
+    kind: "SEMANTIC", sourceMessageId: 123, senderId: 3,
+    body: {
+      type: "DISPATCH",
+      instruction: "检查框架安装情况和当前版本，只做只读检查。",
+      constraints: ["全程只读，不创建或修改文件。"],
+      acceptanceCriteria: ["报告真实版本和下一步工作。"],
+      reminders: [],
+      objective: { mode: "NEW" },
+      topicModeAction: null
+    }
+  }));
+
+  assert.equal(result.action, "dispatch");
+  assert.deepEqual(fixture.calls.accept.at(-1).threadOptions, {
+    model: "gpt-5",
+    modelReasoningEffort: "high",
+    baseInstructions: "Use tests.",
+    approvalPolicy: "never",
+    sandbox: "read-only",
+    cwd: "/canonical/alpha"
+  });
+});
+
 test("semantic dispatch stages caller artifacts into a project-local exchange before execution", async (t) => {
   const projectDirectory = mkdtempSync(path.join(tmpdir(), "hco-artifact-project-"));
   mkdirSync(path.join(projectDirectory, "docs"));

@@ -1,0 +1,63 @@
+{
+  "evidence_type": "sanitized_server_read_only_audit",
+  "run_id": "20260807-010234-iyr8",
+  "checked_at": "2026-08-07T01:48:13+08:00",
+  "source_message_id": 740,
+  "service_host": "devmac",
+  "baseline": {
+    "hermes_commit": "4d5fd2152323580355ce3433159760eb23939450",
+    "orchestrator_commit": "f331167bbc8ae79153dbf4688d318cecc5e11c49",
+    "gateway_pid": 79807,
+    "hco_pid": 11484,
+    "delivery_pid": 11635,
+    "delivery_release": "hermes-codex-bridge-1.0.0-dc7ea2133aa0"
+  },
+  "gateway": {
+    "accepted_business_inbound_count": 1,
+    "session_id": "20260807_013853_5d5b9651",
+    "actual_provider": "custom",
+    "actual_model": "gpt-5.6-sol",
+    "provider_api_call_count": 3,
+    "hco_dispatch_count": 1,
+    "response_ready_count": 1,
+    "zulip_final_send_count": 1,
+    "authorization_rejection_count": 0,
+    "provider_error_403_count": 0,
+    "provider_error_502_count": 0,
+    "provider_retry_or_failure_count": 0
+  },
+  "hco_matching_rows": {
+    "event_journal": 1,
+    "inbound_intents": 1,
+    "work_requests": 1,
+    "objectives": 1,
+    "codex_calls": 1,
+    "turn_submissions": 1,
+    "zulip_outbox": 0,
+    "pending_interactions": 0
+  },
+  "hco_state": {
+    "work_request_id": "work-request-dc9a0024-fe01-47f7-9bc9-354b4c7cdc39",
+    "work_request_state": "WAITING_CODEX",
+    "work_request_status_reason": "codex_running",
+    "objective_id": "objective-64a869f1-b49f-4746-9c72-a8d548613efb",
+    "objective_state": "created",
+    "objective_execution_status": "reconciliation_needed",
+    "backend": "app-server",
+    "backend_objective_started": true,
+    "app_server_thread_id": "019fd828-b719-7610-95ec-ea759c23de3a",
+    "codex_call_id": "codex-call-bb439eec-64b7-4209-b737-622152bb5624",
+    "codex_call_state": "RUNNING",
+    "turn_submission_id": "submission-5eaf3262-eeb8-4caf-8065-f101a7405022",
+    "turn_id": "019fd828-b837-7003-84c5-10e6e5a97616",
+    "turn_submission_state": "reconciliation_needed",
+    "reconciliation_required": true
+  },
+  "matching_rules": {
+    "source_ids": ["740", "zulip:740"],
+    "run_id": "20260807-010234-iyr8",
+    "original_zulip_message_id": 740,
+    "reply_zulip_message_id": 741
+  },
+  "conclusion": "Authorization and real Zulip ingestion succeeded exactly once, with the required model and no matching provider error. HCO created one work chain, but execution entered reconciliation_needed and did not produce a completed result. The single Zulip reply was only a submitted/running acknowledgement, so INGRESS-01 failed its 180-second final-result requirement."
+}

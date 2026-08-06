@@ -1,0 +1,38 @@
+{
+  "evidence_type": "sanitized_zulip_api_readback",
+  "run_id": "20260807-010234-iyr8",
+  "checked_at": "2026-08-07T01:48:13+08:00",
+  "stream_id": 5,
+  "display_recipient": "量化交易stockProfits",
+  "topic": "hermes-v020-browser-INGRESS-01-20260807-010234-iyr8",
+  "messages": [
+    {
+      "id": 740,
+      "sender_id": 8,
+      "sender_full_name": "boss",
+      "sender_email": "user8@zulip.dounetwork.duckdns.org",
+      "timestamp": 1786037933,
+      "sent_at": "2026-08-07T01:38:53+08:00",
+      "client": "website",
+      "plain_text_summary": "@Jarvis PM 请检查现在框架的安装情况、当前版本和下一步工作。只做只读检查。测试标识：20260807-010234-iyr8",
+      "rendered_html": "<p><span class=\"user-mention\" data-user-id=\"9\">@Jarvis PM</span> 请检查现在框架的安装情况、当前版本和下一步工作。只做只读检查。测试标识：20260807-010234-iyr8</p>"
+    },
+    {
+      "id": 741,
+      "sender_id": 9,
+      "sender_full_name": "Jarvis PM",
+      "sender_email": "JarvisPM-bot@zulip.dounetwork.duckdns.org",
+      "timestamp": 1786037985,
+      "sent_at": "2026-08-07T01:39:45+08:00",
+      "client": "ZulipPython",
+      "plain_text_summary": "已提交严格只读检查；工作请求 work-request-dc9a0024-fe01-47f7-9bc9-354b4c7cdc39；任务 objective-64a869f1-b49f-4746-9c72-a8d548613efb；当前已提交、正在执行，尚无结果证据，不对安装或版本下结论。",
+      "rendered_html": "<p>已提交<strong>严格只读检查</strong>，未执行安装、升级、修复或文件修改。</p>\n<ul>\n<li>项目：<code>stockprofits</code></li>\n<li>检查范围：框架安装、当前版本、依赖状态、Git 状态、只读 smoke test、后续工作证据</li>\n<li>测试标识：<code>20260807-010234-iyr8</code></li>\n<li>工作请求：<code>work-request-dc9a0024-fe01-47f7-9bc9-354b4c7cdc39</code></li>\n<li>任务 ID：<code>objective-64a869f1-b49f-4746-9c72-a8d548613efb</code></li>\n<li>当前状态：已提交、正在执行；尚无结果证据，因此暂不对安装或版本下结论。</li>\n</ul>"
+    }
+  ],
+  "native_mention_proven": true,
+  "matching_source_message_ids": [740],
+  "reply_message_ids": [741],
+  "reply_count": 1,
+  "reply_is_completed_result": false,
+  "later_reply_after_acceptance_window": false
+}
