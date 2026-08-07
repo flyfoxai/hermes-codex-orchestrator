@@ -1,0 +1,34 @@
+{
+  "run_id": "20260807-080733-r5k2",
+  "gateway_log": {
+    "inbound": 1,
+    "profile": "codex-bridge",
+    "profile_config_hash": "131602a2ebaf2703",
+    "response_ready": 1,
+    "response_time_seconds": 44.9,
+    "zulip_send": 1,
+    "source_message_id": 742,
+    "reply_message_id": 743
+  },
+  "backend_work_ids": {
+    "work_request_id": "work-request-83a3dadb-de5d-4f2e-a91e-ef4de2a74613",
+    "objective_id": "objective-fffbfcc3-3382-48b7-84a4-0bd02f8f4470"
+  },
+  "state_db_check": {
+    "database": "/Users/hula/.hermes/profiles/codex-bridge/state.db",
+    "matching_session_rows": 0,
+    "matching_message_rows": 0,
+    "note": "No matching rows were exposed by this profile database query; this is an evidence gap, not a claim that backend work did not exist."
+  },
+  "error_scan": {
+    "matching_403": 0,
+    "matching_502": 0,
+    "duplicate_response_ready": 0,
+    "duplicate_zulip_send": 0
+  },
+  "runtime_process_snapshot": {
+    "gateway_pids": [1525, 1533, 79807],
+    "hco_pid": 571,
+    "delivery_pid": 11635
+  }
+}

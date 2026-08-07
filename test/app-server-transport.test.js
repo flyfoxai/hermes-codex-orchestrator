@@ -231,6 +231,20 @@ test("rejects an oversized unterminated frame before further buffering", async (
   assert.equal(terminal.message, "App Server transport frame exceeds the configured limit.");
 });
 
+test("accepts a multi-MiB App Server tool result within the default frame limit", async () => {
+  const { messages, readable, transport } = createHarness();
+  const output = "x".repeat(2 * 1024 * 1024);
+  const frame = `${JSON.stringify({ method: "item/completed", params: { output } })}\n`;
+  assert.equal(Buffer.byteLength(frame, "utf8") > 1024 * 1024, true);
+  assert.equal(Buffer.byteLength(frame, "utf8") <= DEFAULT_MAX_FRAME_BYTES, true);
+
+  readable.end(frame);
+  const [terminal] = await once(transport, "terminal");
+  assert.equal(terminal.code, "APP_SERVER_TRANSPORT_EOF");
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].params.output.length, output.length);
+});
+
 test("serializes a plain JSON object as compact JSON followed by LF", async () => {
   const readable = new PassThrough();
   const writable = new PassThrough();

@@ -1,0 +1,30 @@
+{
+  "evidence_type": "sanitized_zulip_ui_and_api_readback",
+  "run_id": "20260807-080733-r5k2",
+  "stream_id": 5,
+  "topic": "hermes-v020-browser-INGRESS-01-20260807-080733-r5k2",
+  "messages": [
+    {
+      "id": 742,
+      "sender_full_name": "boss",
+      "sent_at": "2026-08-07T08:20:11+08:00",
+      "client": "website",
+      "plain_text_summary": "@Jarvis PM 请检查现在框架的安装情况、当前版本和下一步工作。只做只读检查。测试标识：20260807-080733-r5k2",
+      "rendered_html_excerpt": "<p><span class=\"user-mention\" data-user-id=\"9\"><span class=\"mention-content-wrapper\">@Jarvis PM</span></span> 请检查现在框架的安装情况、当前版本和下一步工作。只做只读检查。测试标识：20260807-080733-r5k2</p>"
+    },
+    {
+      "id": 743,
+      "sender_full_name": "Jarvis PM",
+      "sent_at": "2026-08-07T08:20:56+08:00",
+      "client": "ZulipPython",
+      "plain_text_summary": "已启动严格只读审计；当前状态已提交执行，尚未取得最终检查证据。",
+      "rendered_html_capture": "Observed in the Zulip page DOM; complete HTML was not exported to this artifact."
+    }
+  ],
+  "native_mention_proven": true,
+  "matching_source_message_ids": [742],
+  "reply_message_ids": [743],
+  "reply_count": 1,
+  "reply_is_completed_result": false,
+  "later_reply_after_acceptance_window": false
+}

@@ -2,7 +2,9 @@ import { EventEmitter } from "node:events";
 import { TextDecoder } from "node:util";
 import { isInteger, isSafeNumber, parse, stringify } from "lossless-json";
 
-export const DEFAULT_MAX_FRAME_BYTES = 1024 * 1024;
+// App Server tool results can legitimately include multi-MiB bounded command
+// output. Keep a finite transport cap without terminating those valid turns.
+export const DEFAULT_MAX_FRAME_BYTES = 8 * 1024 * 1024;
 
 const MIN_INT64 = -(2n ** 63n);
 const MAX_INT64 = (2n ** 63n) - 1n;
